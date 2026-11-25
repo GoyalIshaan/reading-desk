@@ -25,6 +25,8 @@ final class Room: ObservableObject {
     @Published private(set) var queue: [BrowserTab] = []
     @Published private(set) var index = 0
     @Published private(set) var categoryID = Category.otherID
+    /// Kept in case the shelf gets deleted while we're reading it.
+    private(set) var shelfName = ""
     @Published private(set) var companion: Companion = UserDefaults.standard.string(forKey: "companion")
         .flatMap(Companion.init(rawValue:)) ?? .chatGPT
 
@@ -212,12 +214,13 @@ final class Room: ObservableObject {
         return false
     }
 
-    func start(_ tabs: [BrowserTab], at first: BrowserTab, in categoryID: String) {
+    func start(_ tabs: [BrowserTab], at first: BrowserTab, in categoryID: String, named shelfName: String) {
         let next = tabs.filter { $0.readableURL != nil }
         guard let index = next.firstIndex(of: first) else { return }
         let canKeepPage = current == first && !asleep
         asleep = false
         self.categoryID = categoryID
+        self.shelfName = shelfName
         queue = next
         if canKeepPage { self.index = index }
         else { go(to: index) }
@@ -329,6 +332,12 @@ struct DeskView: View {
     @State private var dockFlashTask: Task<Void, Never>?
     @State private var dockMonitor: Any?
     @State private var bridge: DeskBridge?
+    /// Only one Claude sort runs at a time.
+    @State private var organizing = false
+    /// "shelfID|url" pairs already sent to auto-sort, so leftovers aren't re-sent.
+    /// Saved across launches; keyed per shelf so a triaged tab can still be sub-sorted.
+    @State private var autoSortTried = Set(UserDefaults.standard.stringArray(forKey: "autoSortTried.v1") ?? [])
+    @State private var autoSortFailures: [String: (count: Int, until: Date)] = [:]
 
     private var dockVisible: Bool { dockHover || dockFlash || showingQueue || showingContents }
     private var titleBarHeight: CGFloat { fullscreen ? 0 : 28 }
@@ -456,12 +465,15 @@ struct DeskView: View {
                 showingContents = true
             }
         }
+        .onChange(of: library.tabs) { _, _ in autoSortIfNeeded() }
+        .onChange(of: library.autoSortShelves) { _, _ in autoSortIfNeeded() }
         .onReceive(NotificationCenter.default.publisher(for: .openPalette)) { _ in
             withAnimation(.easeOut(duration: 0.14)) { paletteOpen.toggle() }
         }
         .onReceive(Timer.publish(every: 45, on: .main, in: .common).autoconnect()) { _ in
             // Keep the library in step with Helium while it's on screen.
             if !reading && library.loaded && NSApp.isActive { library.refresh() }
+            autoSortIfNeeded()  // retry shelves whose backoff has expired
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in fullscreen = true }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in fullscreen = false }
@@ -477,6 +489,7 @@ struct DeskView: View {
         case .allShelves: showShelf(nil)
         case .refresh: library.refresh()
         case .editShelves: editingShelves = true
+        case .organize: organizeShelf()
         case .toggleFullscreen: fullscreenOnOpen.toggle()
         case .toggleCloseInHelium: closeInHelium.toggle()
         case .toggleResume: resumeOnLaunch.toggle()
@@ -578,8 +591,78 @@ struct DeskView: View {
         }
     }
 
+    /// ⇧⌘P → "Sort this shelf…": sorts the shelf on screen, or the one being read.
+    private func organizeShelf() {
+        guard !organizing else { return showToast("Claude is still sorting a shelf…") }
+        let id = reading ? room.categoryID : selectedCategory
+        guard let id, let shelf = library.category(withID: id) else {
+            return showToast("Open a shelf first, then sort it.")
+        }
+        organizing = true
+        showToast("Claude is sorting \(shelf.name)…", for: nil)
+        bridge?.flush()
+        Task {
+            let outcome = await ShelfAgent.organize(shelfID: id)
+            organizing = false
+            showToast(outcome.message, for: 5)
+            autoSortIfNeeded()
+        }
+    }
+
+    /// After a refresh, send new tabs on auto-sort shelves to Claude, one shelf at a time
+    /// and at most 25 tabs per run. Unsorted is triaged into any shelf; other
+    /// shelves are sorted into their sub-shelves. A shelf that keeps failing backs off
+    /// (10 min, 20 min) and gives up after 3 tries.
+    private func autoSortIfNeeded() {
+        let maxNewShelves = 2, maxFailures = 3, backoff: TimeInterval = 600, batchSize = 25
+        guard !organizing, !library.sample, !library.autoSortShelves.isEmpty else { return }
+        let groups = library.grouped()
+        for entry in library.tree.flattened() where library.autoSortShelves.contains(entry.category.id) {
+            let shelf = entry.category
+            let failure = autoSortFailures[shelf.id]
+            if let failure, failure.count >= maxFailures || failure.until > .now { continue }
+            guard shelf.isOther || !library.tree.children(of: shelf.id).isEmpty else { continue }
+            // In Unsorted, skip tabs the user pinned there on purpose.
+            let candidates = (groups[shelf.id] ?? []).filter {
+                !shelf.isOther || (library.assignments[$0.address] == nil && library.siteRules[$0.site] == nil)
+            }
+            let fresh = Array(candidates.map(\.address)
+                .filter { !autoSortTried.contains("\(shelf.id)|\($0)") }
+                .prefix(batchSize))
+            guard !fresh.isEmpty else { continue }
+            markTried(shelf.id, fresh, tried: true)
+            organizing = true
+            bridge?.flush()
+            Task {
+                let outcome = await ShelfAgent.organize(shelfID: shelf.id, maxNew: shelf.isOther ? 0 : maxNewShelves,
+                                                        urls: fresh)
+                organizing = false
+                if outcome.succeeded {
+                    autoSortFailures[shelf.id] = nil
+                    if outcome.filedAny { showToast(outcome.message, for: 4) }
+                } else {
+                    let count = (failure?.count ?? 0) + 1
+                    autoSortFailures[shelf.id] = (count, .now.addingTimeInterval(backoff * Double(count)))
+                    markTried(shelf.id, fresh, tried: false)  // let them be retried after the backoff
+                    showToast(count >= maxFailures ? "Auto-sort for \(shelf.name) is off until you reopen the app: \(outcome.message)"
+                                         : "Auto-sort for \(shelf.name) paused: \(outcome.message)", for: 6)
+                }
+                autoSortIfNeeded()  // next shelf, if any
+            }
+            return
+        }
+    }
+
+    private func markTried(_ shelfID: String, _ urls: [String], tried: Bool) {
+        let keys = urls.map { "\(shelfID)|\($0)" }
+        if tried { autoSortTried.formUnion(keys) } else { autoSortTried.subtract(keys) }
+        if autoSortTried.count > 5000 { autoSortTried = Set(keys) }  // crude cap so the saved list can't grow forever
+        UserDefaults.standard.set(Array(autoSortTried), forKey: "autoSortTried.v1")
+    }
+
     private func open(_ categoryID: String, _ tab: BrowserTab?, _ origin: CGRect?) {
-        let tabs = library.tabs.filter { library.category(for: $0).id == categoryID }
+        // Includes sub-shelves, in the same order as the library page.
+        let tabs = library.orderedTabs(in: categoryID)
         guard let first = tab ?? tabs.first(where: { $0.readableURL != nil }) else { return }
         guard first.readableURL != nil else {
             if !library.sample {
@@ -591,7 +674,7 @@ struct DeskView: View {
             return
         }
         sleepTask?.cancel()
-        room.start(tabs, at: first, in: categoryID)
+        room.start(tabs, at: first, in: categoryID, named: library.pathName(of: categoryID))
         saveSession()
         if room.companion != .notes { _ = room.chat(for: room.companion) }
         previews.paused = true
@@ -663,11 +746,13 @@ struct DeskView: View {
         }
     }
 
-    private func showToast(_ message: String) {
+    /// Pass `seconds: nil` to keep the toast up until the next one replaces it.
+    private func showToast(_ message: String, for seconds: Double? = 2.2) {
         toastTask?.cancel()
         withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) { toast = message }
+        guard let seconds else { return }
         toastTask = Task {
-            try? await Task.sleep(for: .seconds(2.2))
+            try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.25)) { toast = nil }
         }
@@ -690,7 +775,7 @@ struct DeskView: View {
                 HStack(spacing: 0) {
                     readerPane
                         .frame(width: CGFloat(width * fraction))
-                        .overlay(alignment: .bottom) { dock(category).padding(.bottom, 18) }
+                        .overlay(alignment: .bottom) { dock().padding(.bottom, 18) }
                         .opacity(revealed ? 1 : 0)
                     divider(fraction: fraction, width: width, minimum: minimum, maximum: maximum)
                         .opacity(revealed ? 1 : 0)
@@ -818,8 +903,10 @@ struct DeskView: View {
 
     // MARK: Floating dock
 
-    private func dock(_ category: Category) -> some View {
-        ReaderDock(page: room.reader, paper: room.paper, url: room.currentURL, shelf: category.name,
+    private func dock() -> some View {
+        // Fall back to the saved name if the shelf was deleted while reading.
+        let shelf = library.category(withID: room.categoryID) == nil ? room.shelfName : library.pathName(of: room.categoryID)
+        return ReaderDock(page: room.reader, paper: room.paper, url: room.currentURL, shelf: shelf,
                    index: room.index, count: room.queue.count,
                    closeInHelium: closeInHelium, isPaper: room.isPaper,
                    saved: room.current.map(library.isSaved) ?? false,

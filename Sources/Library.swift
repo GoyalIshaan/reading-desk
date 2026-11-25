@@ -15,14 +15,68 @@ struct Category: Codable, Identifiable, Hashable {
     /// agent filed there and quietly goes away once they're all read, unless you keep it.
     var madeByAgent: Bool?
 
-    var isAgentMade: Bool { madeByAgent == true }
-
     static let otherID = "other"
     static let laterID = "later"
-    var isOther: Bool { id == Self.otherID }
-    var isLater: Bool { id == Self.laterID }
-    /// Built-in shelves that can be renamed but never deleted.
-    var isBuiltIn: Bool { isOther || isLater }
+
+    /// What kind of shelf this is. Saved data stays as before (a magic id or the
+    /// `madeByAgent` flag); everything that depends on the kind switches over this,
+    /// so adding a kind makes the compiler point at every decision it affects.
+    enum Role: Equatable {
+        /// The catch-all. Always last, triaged by Claude rather than sorted into sub-shelves.
+        case unsorted
+        /// Pages saved for later. Wins filing and outlives the Helium tab.
+        case readLater
+        case user
+        /// Made by an agent; goes away once its tabs are read, unless kept.
+        case agent
+    }
+
+    var role: Role {
+        switch id {
+        case Self.otherID: .unsorted
+        case Self.laterID: .readLater
+        default: madeByAgent == true ? .agent : .user
+        }
+    }
+
+    /// How "Sort with Claude" treats this shelf.
+    enum SortMode: Equatable {
+        /// Move each tab to whichever other shelf fits; never create shelves.
+        case triage
+        /// File tabs into this shelf's sub-shelves, creating a few if needed.
+        case intoSubShelves
+        /// Nothing to sort into.
+        case unavailable
+    }
+
+    /// Built-in shelves can be renamed but never deleted, nested, reordered or matched by rules.
+    var isBuiltIn: Bool {
+        switch role {
+        case .unsorted, .readLater: true
+        case .user, .agent: false
+        }
+    }
+
+    var sortMode: SortMode {
+        switch role {
+        case .unsorted: .triage
+        case .readLater: .unavailable
+        case .user, .agent: .intoSubShelves
+        }
+    }
+
+    /// Can be the target of a site rule or a stored "Move to shelf" pick. Read later only
+    /// holds pages actually saved to it (which outlive their tabs), so a rule can't point there.
+    var acceptsRules: Bool {
+        switch role {
+        case .readLater: false
+        case .unsorted, .user, .agent: true
+        }
+    }
+
+    var isOther: Bool { role == .unsorted }
+    var isLater: Bool { role == .readLater }
+    var isAgentMade: Bool { role == .agent }
 
     static let later = Category(id: laterID, name: "Read later", symbol: "bookmark", hue: 0.08)
 
@@ -306,15 +360,16 @@ final class Library: ObservableObject {
     @Published private(set) var finishedToday: Int
     /// Shelves where Claude files new tabs into sub-shelves.
     @Published private(set) var autoSortShelves: Set<String>
-    @Published var updating = false
+    @Published private(set) var updating = false
     @Published var error: String?
-    @Published var loaded = false
+    @Published private(set) var loaded = false
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var rawCount = 0
     @Published var sample = ProcessInfo.processInfo.arguments.contains("--sample")
     /// Pages saved to Read later, newest first. They outlive their Helium tabs.
-    @Published private(set) var later: [SavedSource]
-    private var laterAddresses: Set<String> { Set(later.map(\.address)) }
+    @Published private(set) var later: [SavedSource] { didSet { laterAddresses = Set(later.map(\.address)) } }
+    /// Cached: `category(for:)` checks it for every tab on every render.
+    private var laterAddresses: Set<String> = []
     /// Agent shelves made this session, with when: they get a grace period to be filled.
     private var agentShelvesMade: [String: Date] = [:]
     /// Helium tabs this app already closed, so a later Done doesn't try again.
@@ -342,7 +397,9 @@ final class Library: ObservableObject {
         let sanitized = ShelfTree.sanitized(loadedCategories)
         categories = sanitized
         tree = ShelfTree(sanitized)
-        later = store.data(forKey: "readLater.v1").flatMap { try? JSONDecoder().decode([SavedSource].self, from: $0) } ?? []
+        let saved = store.data(forKey: "readLater.v1").flatMap { try? JSONDecoder().decode([SavedSource].self, from: $0) } ?? []
+        later = saved
+        laterAddresses = Set(saved.map(\.address))  // didSet doesn't run during init
 
         if let saved = store.dictionary(forKey: "assignments.v2") as? [String: String] {
             assignments = saved
@@ -357,6 +414,11 @@ final class Library: ObservableObject {
 
         let today = Self.dayStamp()
         finishedToday = store.string(forKey: "finished.day") == today ? store.integer(forKey: "finished.count") : 0
+
+        // Older builds could point a rule at Read later, which then showed pages there that weren't saved.
+        let ruleless = Set(sanitized.filter { !$0.acceptsRules }.map(\.id))
+        assignments = assignments.filter { !ruleless.contains($0.value) }
+        siteRules = siteRules.filter { !ruleless.contains($0.value) }
     }
 
     // MARK: Tabs
@@ -499,19 +561,26 @@ final class Library: ObservableObject {
     }
 
     /// Assign by raw URL, for the bridge (no BrowserTab needed).
-    func assign(address: String, to id: String?) {
-        if id == Category.laterID, let tab = tabs.first(where: { $0.address == address }) {
-            return saveForLater(tab, closeInHelium: false)
+    /// Read later is the exception: it saves the page instead of storing a pick, and needs an open tab.
+    @discardableResult
+    func assign(address: String, to id: String?) -> Bool {
+        if let id, category(withID: id)?.acceptsRules == false {
+            guard id == Category.laterID, let tab = tabs.first(where: { $0.address == address }) else { return false }
+            saveForLater(tab, closeInHelium: false)
+            return true
         }
         assignments[address] = id
         defaults.set(assignments, forKey: "assignments.v2")
+        return true
     }
 
-    func fileSite(_ site: String, to id: String) {
+    @discardableResult
+    func fileSite(_ site: String, to id: String) -> Bool {
         let site = site.lowercased()
-        guard !site.isEmpty else { return }
+        guard !site.isEmpty, category(withID: id)?.acceptsRules == true else { return false }
         siteRules[site] = id
         defaults.set(siteRules, forKey: "siteRules.v2")
+        return true
     }
 
     /// Return a shelf with this name, creating one if there isn't yet. Used by agents through
@@ -613,7 +682,7 @@ final class Library: ObservableObject {
 
     /// "Always file this site here" — wins over shelf rules, loses to a manual pick.
     func fileSite(of tab: BrowserTab, in id: String) {
-        guard !tab.site.isEmpty else { return }
+        guard !tab.site.isEmpty, category(withID: id)?.acceptsRules == true else { return }
         siteRules[tab.site] = id
         assignments[tab.address] = nil
         defaults.set(siteRules, forKey: "siteRules.v2")

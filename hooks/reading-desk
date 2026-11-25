@@ -152,11 +152,11 @@ def cmd_tabs(a):
     width = max(len(where(t)) for t in tabs)
     for t in tabs:
         mark = "*" if t.get("active") else " "
-        pin = {"tab": "·", "site": "#", "auto": " "}[t["assignedBy"]]
+        pin = {"tab": "·", "site": "#", "later": "+", "auto": " "}.get(t["assignedBy"], " ")
         print(f"{mark}{pin} {where(t):<{width}}  {t['title'][:70]}")
         print(f"     {' ':<{width}}  {t['url']}")
     print(f"\n{len(tabs)} tab(s). Source: {s.get('source')} · updated {s.get('updated')}")
-    print("Legend: * active in Helium · ·=filed by tab · #=filed by site")
+    print("Legend: * active in Helium · ·=filed by tab · #=filed by site · +=saved to Read later")
 
 
 def cmd_shelves(a):

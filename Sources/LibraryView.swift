@@ -503,7 +503,7 @@ struct TabCard: View {
                 }
                 if !tab.site.isEmpty {
                     Menu("Always file \(tab.site) in…") {
-                        ShelfMenuItems(tree: shelves, parent: nil, current: nil) { fileSite($0) }
+                        ShelfMenuItems(tree: shelves, parent: nil, current: nil, rulesOnly: true) { fileSite($0) }
                     }
                 }
                 Divider()
@@ -532,17 +532,19 @@ private struct ShelfMenuItems: View {
     let tree: ShelfTree
     let parent: String?
     let current: String?
+    /// Hide shelves that can't take a rule (Read later), for "Always file … in".
+    var rulesOnly = false
     let pick: (String) -> Void
 
     var body: some View {
-        ForEach(tree.children(of: parent)) { shelf in
+        ForEach(tree.children(of: parent).filter { !rulesOnly || $0.acceptsRules }) { shelf in
             if tree.children(of: shelf.id).isEmpty {
                 item(shelf)
             } else {
                 Menu {
                     item(shelf)
                     Divider()
-                    ShelfMenuItems(tree: tree, parent: shelf.id, current: current, pick: pick)
+                    ShelfMenuItems(tree: tree, parent: shelf.id, current: current, rulesOnly: rulesOnly, pick: pick)
                 } label: {
                     if let current, tree.isInside(current, shelf.id) || current == shelf.id {
                         Label(shelf.name, systemImage: "checkmark")
@@ -914,21 +916,22 @@ private struct ShelfForm: View {
                 TextField("Shelf name", text: $name)
                     .textFieldStyle(.plain)
                     .font(Theme.serif(36))
-                if category.isOther {
+                switch category.role {
+                case .unsorted:
                     Text("Anything that doesn’t match another shelf lands here. It always comes last.")
                         .font(Theme.sans(13)).foregroundStyle(Theme.ink3)
                     autoSortField(label: "Move new tabs to the shelf that fits",
                                   hint: "Tabs no rule catches go to Claude, which moves each one to whichever shelf fits what the page is about. Tabs that fit nowhere stay here. Needs Claude Code.")
-                } else if category.isAgentMade {
+                case .agent:
                     VStack(alignment: .leading, spacing: 10) {
                         Text("An agent made this shelf and filed tabs onto it. It goes away by itself once those tabs are read. Keep it to make it one of your shelves, with its own rules.")
                             .font(Theme.sans(13)).foregroundStyle(Theme.ink3).fixedSize(horizontal: false, vertical: true)
                         Button("Keep this shelf") { library.keep(category.id) }.buttonStyle(DeskButtonStyle(.outline))
                     }
-                } else if category.isLater {
+                case .readLater:
                     Text("Pages you save with Read later (the bookmark on a card or in the reader, or right-click a page). They stay here after their Helium tab closes, until you mark them done.")
                         .font(Theme.sans(13)).foregroundStyle(Theme.ink3).fixedSize(horizontal: false, vertical: true)
-                } else {
+                case .user:
                     field("Inside", hint: "Sub-shelves are checked before the shelf they sit in, so a tab lands on the deepest shelf that matches.") {
                         Picker("Inside", selection: parentBinding) {
                             Text("None (top level)").tag("")

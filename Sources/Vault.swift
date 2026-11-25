@@ -96,7 +96,29 @@ final class Vault: ObservableObject {
     @Published private(set) var attachments: [String] = []
     @Published private(set) var selection: Note?
     @Published var text = ""
-    @Published private(set) var status = ""
+    /// Where the open note is in its save cycle. Was a free-form string the UI compared against.
+    enum SaveState: Equatable {
+        /// No note open.
+        case none
+        case saved
+        /// Typed since the last save; an autosave is pending.
+        case editing
+        case saving
+        /// The last write failed (see `error`); the text is still in memory.
+        case unsaved
+
+        var label: String {
+            switch self {
+            case .none: ""
+            case .saved: "Saved"
+            case .editing: "Editing…"
+            case .saving: "Saving…"
+            case .unsaved: "Unsaved"
+            }
+        }
+    }
+
+    @Published private(set) var status: SaveState = .none
     @Published private(set) var error: String?
     @Published private(set) var busy = false
     @Published var showPicker = true
@@ -150,7 +172,7 @@ final class Vault: ObservableObject {
             selection = nil
             text = ""
             savedText = ""
-            status = ""
+            status = .none
             error = nil
             preview = false
             showPicker = true
@@ -196,7 +218,7 @@ final class Vault: ObservableObject {
             text = content
             savedText = content
             selection = note
-            status = "Saved"
+            status = .saved
             error = nil
             showPicker = false
         } catch { self.error = error.localizedDescription }
@@ -242,8 +264,12 @@ final class Vault: ObservableObject {
     /// leaves the note open in live preview, ready for the caret to land under it.
     func capture(_ block: String, from tab: BrowserTab) async -> Bool {
         guard root != nil else { return false }
+        // A rescan runs every time the app comes forward. `create` and `open` skip while
+        // it's busy, which used to drop the highlight; wait for it instead.
+        await settle()
         if notes.isEmpty { await refresh() }
         var note = sourceNote(for: tab)
+        await settle()
         if note == nil {
             await create(String(tab.displayTitle.prefix(120)), source: tab)
             note = selection
@@ -262,9 +288,14 @@ final class Vault: ObservableObject {
         return true
     }
 
+    /// Waits (up to ~10 s) for whatever holds `busy` to finish.
+    private func settle() async {
+        for _ in 0..<250 where busy { try? await Task.sleep(for: .milliseconds(40)) }
+    }
+
     func edit(_ value: String) {
         text = value
-        status = "Editing…"
+        status = .editing
         autosave?.cancel()
         autosave = Task { [weak self] in
             do {
@@ -284,23 +315,23 @@ final class Vault: ObservableObject {
             if await saveTask.value == false { return false }
         }
         guard let note = selection, isDirty else {
-            if selection != nil { status = "Saved" }
+            if selection != nil { status = .saved }
             return true
         }
         let value = text
         let baseline = savedText
-        status = "Saving…"
+        status = .saving
         let task = Task {
             defer { saveTask = nil }
             do {
                 try await files.write(value, replacing: baseline, at: note.url)
                 savedText = value
-                status = isDirty ? "Editing…" : "Saved"
+                status = isDirty ? .editing : .saved
                 error = nil
                 return true
             } catch {
                 self.error = error.localizedDescription
-                status = "Unsaved"
+                status = .unsaved
                 return false
             }
         }

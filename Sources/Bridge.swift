@@ -77,7 +77,7 @@ final class DeskBridge {
                 "id": tab.id, "title": tab.displayTitle, "url": tab.address, "site": tab.site,
                 "category": category.id, "categoryName": category.name,
                 "categoryPath": library.pathName(of: category.id),
-                "assignedBy": manual ? "tab" : bySite ? "site" : "auto",
+                "assignedBy": library.isSaved(tab) ? "later" : manual ? "tab" : bySite ? "site" : "auto",
                 "active": tab.active,
             ]
         }
@@ -132,12 +132,14 @@ final class DeskBridge {
         case "assign":
             guard let url = command["url"] as? String else { return record(op, "error", "missing url") }
             guard let id = categoryID() else { return record(op, "error", "unknown category") }
-            library.assign(address: url, to: id)
+            guard library.assign(address: url, to: id) else {
+                return record(op, "error", "\(id) only takes pages saved to it, and \(url) isn't an open tab")
+            }
             record(op, "ok", "\(url) → \(id)")
         case "assignsite":
             guard let site = command["site"] as? String else { return record(op, "error", "missing site") }
             guard let id = categoryID() else { return record(op, "error", "unknown category") }
-            library.fileSite(site, to: id)
+            guard library.fileSite(site, to: id) else { return record(op, "error", "\(id) can't have site rules") }
             record(op, "ok", "\(site) → \(id)")
         case "auto":
             guard let url = command["url"] as? String else { return record(op, "error", "missing url") }
@@ -171,18 +173,29 @@ final class DeskBridge {
 /// Runs `reading-desk organize` (bundled with the app) to have Claude file a shelf's
 /// tabs into sub-shelves. The script applies its changes through the bridge.
 enum ShelfAgent {
-    struct Outcome {
-        let succeeded: Bool
-        /// Last line the script printed; shown as a toast.
-        let message: String
-        /// The script only prints "Filed …" when it actually moved something.
-        var filedAny: Bool { succeeded && message.hasPrefix("Filed ") }
+    /// What a sorting run did. Each case carries the line to show as a toast.
+    enum Outcome: Equatable {
+        /// Tabs moved. (The script only prints "Filed …" when it actually moved something.)
+        case filed(String)
+        /// Ran fine but left everything where it was.
+        case unchanged(String)
+        case failed(String)
+
+        /// Parses the script's last stdout line; the "Filed " prefix is the contract with the CLI.
+        static func succeeded(_ line: String?) -> Outcome {
+            guard let line else { return .unchanged("Sorting finished.") }
+            return line.hasPrefix("Filed ") ? .filed(line) : .unchanged(line)
+        }
+
+        var message: String {
+            switch self { case .filed(let text), .unchanged(let text), .failed(let text): text }
+        }
     }
 
     /// `urls` limits the run to those tabs; `maxNew` caps new sub-shelves (nil = script default).
     static func organize(shelfID: String, maxNew: Int? = nil, urls: [String] = []) async -> Outcome {
         guard let script = Bundle.main.url(forResource: "reading-desk", withExtension: nil) else {
-            return Outcome(succeeded: false, message: "The sorting script is missing. Rebuild Reading Desk.")
+            return .failed("The sorting script is missing. Rebuild Reading Desk.")
         }
         return await Task.detached(priority: .userInitiated) { () -> Outcome in
             let process = Process()
@@ -200,23 +213,109 @@ enum ShelfAgent {
             process.standardOutput = output
             process.standardError = errors
             do { try process.run() } catch {
-                return Outcome(succeeded: false, message: "Couldn’t start the sorter: \(error.localizedDescription)")
+                return .failed("Couldn’t start the sorter: \(error.localizedDescription)")
             }
             // The script itself gives up after 5 min.
             let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
             DispatchQueue.global().asyncAfter(deadline: .now() + 330, execute: timeout)
             defer { timeout.cancel() }
+            // Drain stderr on its own thread: reading the pipes one after the other deadlocks
+            // once the script fills the stderr pipe buffer (64 KB) while stdout is still open.
+            let errData = DrainedPipe(errors)
             let out = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            let err = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let err = String(decoding: errData.wait(), as: UTF8.self)
             process.waitUntilExit()
             func lastLine(_ text: String) -> String? {
                 text.split(whereSeparator: \.isNewline).last.map(String.init)
             }
-            if process.terminationStatus == 0 { return Outcome(succeeded: true, message: lastLine(out) ?? "Sorting finished.") }
-            if process.terminationReason == .uncaughtSignal {
-                return Outcome(succeeded: false, message: "Sorting took too long and was stopped.")
-            }
-            return Outcome(succeeded: false, message: lastLine(err) ?? "Sorting failed.")
+            if process.terminationStatus == 0 { return .succeeded(lastLine(out)) }
+            if process.terminationReason == .uncaughtSignal { return .failed("Sorting took too long and was stopped.") }
+            return .failed(lastLine(err) ?? "Sorting failed.")
         }.value
+    }
+}
+
+/// Reads a pipe to the end on a background thread.
+private final class DrainedPipe: @unchecked Sendable {
+    private var data = Data()
+    private let done = DispatchSemaphore(value: 0)
+
+    init(_ pipe: Pipe) {
+        let handle = pipe.fileHandleForReading
+        DispatchQueue.global(qos: .utility).async { [self] in
+            data = handle.readDataToEndOfFile()
+            done.signal()
+        }
+    }
+
+    func wait() -> Data {
+        done.wait()
+        return data
+    }
+}
+
+/// Claude sorting, as states instead of a Bool and a tuple: at most one run at a time,
+/// and each auto-sort shelf is either fine, backing off after failures, or stopped.
+struct SortSchedule {
+    enum Job: Equatable {
+        /// ⇧⌘P → "Sort this shelf with Claude".
+        case manual(shelfID: String)
+        /// After a refresh: only these new tabs.
+        case auto(shelfID: String, urls: [String])
+
+        var shelfID: String {
+            switch self { case .manual(let id), .auto(let id, _): id }
+        }
+    }
+
+    /// Absent from `health` means healthy.
+    enum Health: Equatable {
+        case backingOff(failures: Int, until: Date)
+        /// Too many failures in a row; stays off until the app restarts.
+        case stopped
+    }
+
+    static let maxFailures = 3
+    static let backoff: TimeInterval = 600
+
+    private(set) var running: Job?
+    private var health: [String: Health] = [:]
+
+    var isBusy: Bool { running != nil }
+
+    func mayAutoSort(_ shelfID: String, at now: Date = .now) -> Bool {
+        switch health[shelfID] {
+        case nil: true
+        case .backingOff(_, let until): until <= now
+        case .stopped: false
+        }
+    }
+
+    /// Claims the single slot. Returns false if something is already running.
+    mutating func begin(_ job: Job) -> Bool {
+        guard running == nil else { return false }
+        running = job
+        return true
+    }
+
+    /// Ends the running job and returns it, along with the shelf's new health for auto jobs that failed.
+    mutating func finish(_ outcome: ShelfAgent.Outcome, at now: Date = .now) -> (job: Job, health: Health?)? {
+        guard let job = running else { return nil }
+        running = nil
+        guard case .auto(let id, _) = job else { return (job, nil) }
+        if case .failed = outcome {
+            let failures: Int = switch health[id] {
+            case nil: 1
+            case .backingOff(let count, _): count + 1
+            case .stopped: Self.maxFailures
+            }
+            let next: Health = failures >= Self.maxFailures
+                ? .stopped
+                : .backingOff(failures: failures, until: now.addingTimeInterval(Self.backoff * Double(failures)))
+            health[id] = next
+            return (job, next)
+        }
+        health[id] = nil
+        return (job, nil)
     }
 }

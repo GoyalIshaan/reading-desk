@@ -20,6 +20,19 @@ enum Companion: String, CaseIterable, Identifiable {
     }
 }
 
+/// A PDF open in PDFKit, and how it got there.
+struct OpenPaper {
+    enum Origin: Equatable {
+        /// Opened as a PDF (a card, or the arXiv switch): stays until you leave it.
+        case opened
+        /// A web page turned out to be a PDF, so navigating the page elsewhere closes it.
+        case followsWeb
+    }
+
+    let reader: PaperReader
+    let origin: Origin
+}
+
 @MainActor
 final class Room: ObservableObject {
     @Published private(set) var queue: [BrowserTab] = []
@@ -32,7 +45,7 @@ final class Room: ObservableObject {
 
     let reader = WebPage(captures: true)
     /// Set while the source is a PDF, which reads in PDFKit instead of the web view.
-    @Published private(set) var paper: PaperReader?
+    @Published private var pdf: OpenPaper?
     /// The passage selected on the page right now, if any.
     @Published var excerpt: Excerpt?
     private var chats: [Companion: WebPage] = [:]
@@ -44,8 +57,8 @@ final class Room: ObservableObject {
     private var asleep = false
     /// PDFs PDFKit couldn't open; they stay in the web view.
     private var pdfFailed: Set<URL> = []
-    /// The paper came from a web page turning out to be a PDF, so leaving that page closes it.
-    private var paperFollowsWeb = false
+    /// The PDF being read, if any, and whether it closes when the web page moves on.
+    var paper: PaperReader? { pdf?.reader }
     private var cancellables: Set<AnyCancellable> = []
 
     /// What the right-click menu asks for; DeskView carries it out.
@@ -67,7 +80,7 @@ final class Room: ObservableObject {
             .sink { [weak self] url in
                 guard let self, let url else { return }
                 self.excerpt = nil
-                if self.paperFollowsWeb, let paper = self.paper, url.removingFragment != paper.url { self.paper = nil }
+                if let pdf = self.pdf, pdf.origin == .followsWeb, url.removingFragment != pdf.reader.url { self.pdf = nil }
             }
             .store(in: &cancellables)
     }
@@ -101,7 +114,7 @@ final class Room: ObservableObject {
         if url.looksLikePDF && !pdfFailed.contains(url.removingFragment) {
             openPaper(url, followsWeb: false)
         } else {
-            paper = nil
+            pdf = nil
             reader.load(url)
         }
     }
@@ -114,14 +127,14 @@ final class Room: ObservableObject {
         }
         paper.view.onSelectionMoved = { [weak self] rect in self?.excerpt?.rect = rect }
         paper.view.extraMenuItems = { [weak self] in self?.menuItems() ?? [] }
-        paperFollowsWeb = followsWeb
+
         excerpt = nil
-        self.paper = paper
+        pdf = OpenPaper(reader: paper, origin: followsWeb ? .followsWeb : .opened)
         Task {
             await paper.load()
             guard paper.failure != nil, self.paper === paper else { return }
             pdfFailed.insert(paper.url)
-            self.paper = nil
+            pdf = nil
             if !followsWeb { reader.load(url) }
         }
     }
@@ -148,7 +161,7 @@ final class Room: ObservableObject {
         guard let target = arxivSwitch else { return }
         if target.pdf { openPaper(target.url, followsWeb: false) }
         else {
-            paper = nil
+            pdf = nil
             excerpt = nil
             if reader.state.url.flatMap(SourceKey.arxivID) == nil || reader.state.url?.path.hasPrefix("/pdf") == true {
                 reader.load(target.url)
@@ -279,7 +292,7 @@ final class Room: ObservableObject {
         guard !asleep else { return }
         asleep = true
         excerpt = nil
-        paper = nil
+        pdf = nil
         for page in chats.values { page.view.stopLoading() }
         chats = [:]
         chatOrder = []
@@ -296,6 +309,30 @@ final class Room: ObservableObject {
     }
 }
 
+/// Where the window is between the library and the reading room. Each step
+/// carries the id of the transition that started it.
+enum DockPopover: Equatable { case queue, contents }
+
+extension Binding where Value == DockPopover? {
+    /// A Bool view of one case: true while it's the open popover. Setting false closes it
+    /// only if it's still the open one, so a late dismissal can't close its replacement.
+    func showing(_ which: DockPopover) -> Binding<Bool> {
+        Binding<Bool>(get: { wrappedValue == which },
+                      set: { show in
+                          if show { wrappedValue = which } else if wrappedValue == which { wrappedValue = nil }
+                      })
+    }
+}
+
+enum RoomPhase: Equatable {
+    case library
+    /// Mounted but still transparent; fades in on the next frame.
+    case arriving(Int)
+    case reading(Int)
+    /// Fading out; unmounts when the fade ends.
+    case leaving(Int)
+}
+
 struct DeskView: View {
     @ObservedObject var library: Library
     @ObservedObject var room: Room
@@ -308,22 +345,22 @@ struct DeskView: View {
     @AppStorage("readerFraction") private var readerFraction = 0.62
     @AppStorage("resumeOnLaunch") private var resumeOnLaunch = true
     @State private var resumed = false
-    @State private var showingContents = false
+    /// At most one dock popover is open; opening one closes the other.
+    @State private var popover: DockPopover?
     @State private var sleepTask: Task<Void, Never>?
     @State private var draggedFraction: Double?
     @State private var dividerHovered = false
     @State private var selectedCategory: String?
-    @State private var reading = false
+    /// Library ↔ reader. `reading` and `revealed` are read off this, so they can't disagree.
+    @State private var phase: RoomPhase = .library
     @State private var enteredFullScreen = false
     @State private var fullscreen = false
-    @State private var showingQueue = false
     @State private var toast: String?
     @State private var paletteOpen = false
     @State private var editingShelves = false
     @State private var toastTask: Task<Void, Never>?
-    /// Drives the library → reader transition: false while the room is still arriving.
-    @State private var revealed = false
     @State private var openTask: Task<Void, Never>?
+    /// Source of ids for `phase`, so a late step of an old transition can't act on a newer one.
     @State private var transition = 0
     @State private var windowSize: CGSize = .zero
     /// The floating dock at the bottom of the page: hidden until the pointer comes near.
@@ -332,14 +369,17 @@ struct DeskView: View {
     @State private var dockFlashTask: Task<Void, Never>?
     @State private var dockMonitor: Any?
     @State private var bridge: DeskBridge?
-    /// Only one Claude sort runs at a time.
-    @State private var organizing = false
+    /// Only one Claude sort runs at a time; shelves that keep failing back off.
+    @State private var sorting = SortSchedule()
     /// "shelfID|url" pairs already sent to auto-sort, so leftovers aren't re-sent.
     /// Saved across launches; keyed per shelf so a triaged tab can still be sub-sorted.
     @State private var autoSortTried = Set(UserDefaults.standard.stringArray(forKey: "autoSortTried.v1") ?? [])
-    @State private var autoSortFailures: [String: (count: Int, until: Date)] = [:]
 
-    private var dockVisible: Bool { dockHover || dockFlash || showingQueue || showingContents }
+    /// The room is on screen (arriving, open, or fading out).
+    private var reading: Bool { phase != .library }
+    /// The room is fully faded in.
+    private var revealed: Bool { if case .reading = phase { true } else { false } }
+    private var dockVisible: Bool { dockHover || dockFlash || popover != nil }
     private var titleBarHeight: CGFloat { fullscreen ? 0 : 28 }
 
     /// Where the reading pane sits (for the dock's hover zone).
@@ -462,7 +502,7 @@ struct DeskView: View {
             case .bibtex: copyBibTeX()
             case .contents:
                 flashDock()
-                showingContents = true
+                popover = .contents
             }
         }
         .onChange(of: library.tabs) { _, _ in autoSortIfNeeded() }
@@ -593,20 +633,15 @@ struct DeskView: View {
 
     /// ⇧⌘P → "Sort this shelf…": sorts the shelf on screen, or the one being read.
     private func organizeShelf() {
-        guard !organizing else { return showToast("Claude is still sorting a shelf…") }
+        guard !sorting.isBusy else { return showToast("Claude is still sorting a shelf…") }
         let id = reading ? room.categoryID : selectedCategory
         guard let id, let shelf = library.category(withID: id) else {
             return showToast("Open a shelf first, then sort it.")
         }
-        organizing = true
-        showToast("Claude is sorting \(shelf.name)…", for: nil)
-        bridge?.flush()
-        Task {
-            let outcome = await ShelfAgent.organize(shelfID: id)
-            organizing = false
-            showToast(outcome.message, for: 5)
-            autoSortIfNeeded()
+        guard shelf.sortMode != .unavailable else {
+            return showToast("\(shelf.name) can’t hold sub-shelves, so there’s nothing to sort it into.")
         }
+        run(.manual(shelfID: id), name: shelf.name)
     }
 
     /// After a refresh, send new tabs on auto-sort shelves to Claude, one shelf at a time
@@ -614,42 +649,54 @@ struct DeskView: View {
     /// shelves are sorted into their sub-shelves. A shelf that keeps failing backs off
     /// (10 min, 20 min) and gives up after 3 tries.
     private func autoSortIfNeeded() {
-        let maxNewShelves = 2, maxFailures = 3, backoff: TimeInterval = 600, batchSize = 25
-        guard !organizing, !library.sample, !library.autoSortShelves.isEmpty else { return }
+        let batchSize = 25
+        guard !sorting.isBusy, !library.sample, !library.autoSortShelves.isEmpty else { return }
         let groups = library.grouped()
         for entry in library.tree.flattened() where library.autoSortShelves.contains(entry.category.id) {
             let shelf = entry.category
-            let failure = autoSortFailures[shelf.id]
-            if let failure, failure.count >= maxFailures || failure.until > .now { continue }
-            guard shelf.isOther || !library.tree.children(of: shelf.id).isEmpty else { continue }
-            // In Unsorted, skip tabs the user pinned there on purpose.
+            guard sorting.mayAutoSort(shelf.id) else { continue }
+            let triage: Bool
+            switch shelf.sortMode {
+            case .unavailable: continue
+            case .triage: triage = true
+            case .intoSubShelves:
+                guard !library.tree.children(of: shelf.id).isEmpty else { continue }
+                triage = false
+            }
+            // When triaging, skip tabs the user pinned there on purpose.
             let candidates = (groups[shelf.id] ?? []).filter {
-                !shelf.isOther || (library.assignments[$0.address] == nil && library.siteRules[$0.site] == nil)
+                !triage || (library.assignments[$0.address] == nil && library.siteRules[$0.site] == nil)
             }
             let fresh = Array(candidates.map(\.address)
                 .filter { !autoSortTried.contains("\(shelf.id)|\($0)") }
                 .prefix(batchSize))
             guard !fresh.isEmpty else { continue }
             markTried(shelf.id, fresh, tried: true)
-            organizing = true
-            bridge?.flush()
-            Task {
-                let outcome = await ShelfAgent.organize(shelfID: shelf.id, maxNew: shelf.isOther ? 0 : maxNewShelves,
-                                                        urls: fresh)
-                organizing = false
-                if outcome.succeeded {
-                    autoSortFailures[shelf.id] = nil
-                    if outcome.filedAny { showToast(outcome.message, for: 4) }
-                } else {
-                    let count = (failure?.count ?? 0) + 1
-                    autoSortFailures[shelf.id] = (count, .now.addingTimeInterval(backoff * Double(count)))
-                    markTried(shelf.id, fresh, tried: false)  // let them be retried after the backoff
-                    showToast(count >= maxFailures ? "Auto-sort for \(shelf.name) is off until you reopen the app: \(outcome.message)"
-                                         : "Auto-sort for \(shelf.name) paused: \(outcome.message)", for: 6)
-                }
-                autoSortIfNeeded()  // next shelf, if any
+            return run(.auto(shelfID: shelf.id, urls: fresh), name: shelf.name, maxNew: triage ? 0 : 2)
+        }
+    }
+
+    private func run(_ job: SortSchedule.Job, name: String, maxNew: Int? = nil) {
+        guard sorting.begin(job) else { return }
+        if case .manual = job { showToast("Claude is sorting \(name)…", for: nil) }
+        bridge?.flush()
+        Task {
+            let urls: [String] = if case .auto(_, let urls) = job { urls } else { [] }
+            let outcome = await ShelfAgent.organize(shelfID: job.shelfID, maxNew: maxNew, urls: urls)
+            guard let (job, health) = sorting.finish(outcome) else { return }
+            switch (job, outcome, health) {
+            case (.manual, _, _):
+                showToast(outcome.message, for: 5)
+            case (.auto, .filed(let message), _):
+                showToast(message, for: 4)
+            case (.auto, .unchanged, _):
+                break
+            case (.auto(let id, let urls), .failed(let message), let health):
+                markTried(id, urls, tried: false)  // let them be retried after the backoff
+                showToast(health == .stopped ? "Auto-sort for \(name) is off until you reopen the app: \(message)"
+                                             : "Auto-sort for \(name) paused: \(message)", for: 6)
             }
-            return
+            autoSortIfNeeded()  // next shelf, if any
         }
     }
 
@@ -685,20 +732,18 @@ struct DeskView: View {
         //    cover sits exactly where the card was.
         var instant = Transaction()
         instant.disablesAnimations = true
-        withTransaction(instant) {
-            revealed = false
-            reading = true
-        }
+        withTransaction(instant) { phase = .arriving(id) }
         // 2. Next frame: a short crossfade. (A cover that grew into the page looked
         //    nice in theory but stuttered while the page loaded underneath it.)
         DispatchQueue.main.async {
-            withAnimation(.easeOut(duration: 0.18)) { revealed = true }
+            guard phase == .arriving(id) else { return }  // closed again before the first frame
+            withAnimation(.easeOut(duration: 0.18)) { phase = .reading(id) }
         }
         // 3. Once the page has had a moment to load, go full screen if that's the setting.
         openTask?.cancel()
         openTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(560))
-            guard !Task.isCancelled, transition == id else { return }
+            guard !Task.isCancelled, phase == .reading(id) else { return }
             if fullscreenOnOpen, let window = NSApp.keyWindow, !window.styleMask.contains(.fullScreen) {
                 enteredFullScreen = true
                 window.toggleFullScreen(nil)
@@ -712,13 +757,13 @@ struct DeskView: View {
         openTask?.cancel()
         transition += 1
         let id = transition
-        withAnimation(.easeOut(duration: 0.16)) { revealed = false }
+        withAnimation(.easeOut(duration: 0.16)) { phase = .leaving(id) }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(170))
-            guard transition == id else { return }
+            guard phase == .leaving(id) else { return }
             var instant = Transaction()
             instant.disablesAnimations = true
-            withTransaction(instant) { reading = false }
+            withTransaction(instant) { phase = .library }
         }
         previews.paused = false
         sleepTask?.cancel()
@@ -841,7 +886,7 @@ struct DeskView: View {
             ShortcutButton("Ask about this", "a", [.command, .shift]) { ask(room.lastChat) }
             ShortcutButton("Read later", "l", [.command, .shift]) { readLater() }
             ShortcutButton("Copy BibTeX", "b", [.command, .shift]) { copyBibTeX() }
-            ShortcutButton("Contents", "o", [.command, .shift]) { showingContents.toggle(); flashDock() }
+            ShortcutButton("Contents", "o", [.command, .shift]) { popover = popover == .contents ? nil : .contents; flashDock() }
             ShortcutButton("Back to library", "[", [.command, .shift]) { closeRoom() }
             ShortcutButton("Previous tab", .leftArrow, [.command, .option]) { room.go(to: room.index - 1) }
             ShortcutButton("Next tab", .rightArrow, [.command, .option]) { room.go(to: room.index + 1) }
@@ -911,7 +956,7 @@ struct DeskView: View {
                    closeInHelium: closeInHelium, isPaper: room.isPaper,
                    saved: room.current.map(library.isSaved) ?? false,
                    arxivSwitch: room.arxivSwitch?.pdf,
-                   showingQueue: $showingQueue, showingContents: $showingContents,
+                   showingQueue: $popover.showing(.queue), showingContents: $popover.showing(.contents),
                    back: { closeRoom() },
                    previous: { room.go(to: room.index - 1) },
                    next: { room.go(to: room.index + 1) },
@@ -924,7 +969,7 @@ struct DeskView: View {
                    bibtex: copyBibTeX,
                    switchArxiv: { room.switchArxiv() },
                    queue: { AnyView(queuePopover) },
-                   contents: { AnyView(ContentsList(room: room) { showingContents = false }) })
+                   contents: { AnyView(ContentsList(room: room) { popover = nil }) })
             .opacity(dockVisible ? 1 : 0)
             .offset(y: dockVisible ? 0 : 10)
             .allowsHitTesting(dockVisible)
@@ -972,7 +1017,7 @@ struct DeskView: View {
                     ForEach(Array(room.queue.enumerated()), id: \.element.id) { index, tab in
                         Button {
                             room.go(to: index)
-                            showingQueue = false
+                            popover = nil
                         } label: {
                             HStack(alignment: .top, spacing: 12) {
                                 Group {

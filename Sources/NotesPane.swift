@@ -58,8 +58,8 @@ struct NotesPane: View {
                         MarkdownEditor(text: vault.text) { vault.edit($0) }
                             .id(note.id)
                     }
-                    if vault.isDirty || vault.status != "Saved" {
-                        Text(vault.status).font(Theme.mono(10)).foregroundStyle(Theme.ink4)
+                    if vault.isDirty || vault.status != .saved {
+                        Text(vault.status.label).font(Theme.mono(10)).foregroundStyle(Theme.ink4)
                             .padding(.horizontal, 14).padding(.vertical, 10)
                             .accessibilityIdentifier("save-status")
                     }

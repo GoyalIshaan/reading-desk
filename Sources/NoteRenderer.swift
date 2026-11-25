@@ -9,8 +9,13 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
     let view: WKWebView
     weak var vault: Vault?
     private let scheme = DeskScheme()
-    private var ready = false
-    private var pending: [String: Any]?
+    /// The page loads note.html, then says "ready". Until then the latest render waits here.
+    private enum Page {
+        case loading(pending: [String: Any]?)
+        case ready
+    }
+    private var page: Page = .loading(pending: nil)
+    private var ready: Bool { if case .ready = page { true } else { false } }
     private var shown: (path: String, text: String)?
     /// Set after a highlight: once the note re-renders, put the caret on the last line.
     private var caretToEnd = false
@@ -42,10 +47,13 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
             "markdown": text, "path": note.path, "keepScroll": keep,
             "attachments": vault?.attachments ?? [],
         ]
-        if ready {
+        switch page {
+        case .ready:
             call("deskRender", payload)
             placeCaretIfAsked()
-        } else { pending = payload }
+        case .loading:
+            page = .loading(pending: payload)
+        }
     }
 
     /// Asks for the caret at the end of the note on its next render (or now, if it's already shown).
@@ -84,12 +92,12 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
         case "log":
             NSLog("ReadingDesk notes JS: \(body["message"] ?? "")")
         case "ready":
-            ready = true
-            if let pending {
-                call("deskRender", pending)
+            let waiting: [String: Any]? = if case .loading(let pending) = page { pending } else { nil }
+            page = .ready
+            if let waiting {
+                call("deskRender", waiting)
                 placeCaretIfAsked()
             }
-            pending = nil
         case "open":
             guard let target = body["target"] as? String, let vault else { return }
             if let note = vault.resolve(target) { Task { await vault.open(note) } }
@@ -148,8 +156,9 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        ready = false
-        if let shown { pending = ["markdown": shown.text, "path": shown.path, "keepScroll": false, "attachments": vault?.attachments ?? []] }
+        page = .loading(pending: shown.map {
+            ["markdown": $0.text, "path": $0.path, "keepScroll": false, "attachments": vault?.attachments ?? []]
+        })
         webView.load(URLRequest(url: URL(string: "desk://app/note.html")!))
     }
 }

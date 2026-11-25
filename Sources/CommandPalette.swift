@@ -37,8 +37,8 @@ struct CommandPalette: View {
             case .allShelves: ("Show all shelves", "square.grid.2x2", "everything back library")
             case .refresh: ("Refresh Helium tabs", "arrow.clockwise", "reload import update")
             case .editShelves: ("Edit shelves and filing rules", "books.vertical", "manage categories autofiling")
-            case .organize: ("Sort this shelf into sub-shelves with Claude", "wand.and.stars",
-                             "agent ai organize file categorize subshelves nested auto")
+            case .organize: ("Sort this shelf with Claude", "wand.and.stars",
+                             "agent ai organize file categorize subshelves nested auto triage")
             case .toggleFullscreen: ("Enter full screen when reading", "arrow.up.left.and.arrow.down.right", "fullscreen settings reading options")
             case .toggleCloseInHelium: ("Close Helium tabs when marked done", "xmark.circle", "keep tabs open settings reading options")
             }

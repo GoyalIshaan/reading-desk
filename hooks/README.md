@@ -60,8 +60,18 @@ reading-desk apply plan.json
 
 `organize` sorts one shelf's tabs into sub-shelves by topic. It needs
 [Claude Code](https://claude.com/claude-code) installed and signed in. The app
-runs the same command from ⇧⌘P → **Sort this shelf into sub-shelves with
-Claude**, on the shelf you're viewing or reading.
+runs the same command from ⇧⌘P → **Sort this shelf with Claude**, on the
+shelf you're viewing or reading.
+
+On **Everything else**, `organize` triages instead:
+
+- **Which tabs:** only tabs that landed there because no rule matched
+  (`assignedBy: "auto"`). Tabs you pinned there stay.
+- **Where they can go:** every other shelf, at any depth, by full path. Each
+  shelf's title words and first few sites are shown to Claude as hints.
+- **No new shelves:** `--max-new` is forced to 0.
+- **Unclear tabs stay:** Claude is told to judge what each page is, not words in
+  its title, and to leave a tab where it is when no shelf clearly fits.
 
 What it does, in order:
 
@@ -85,7 +95,9 @@ What it does, in order:
    how many tabs actually moved.
 
 `--max-new 0` makes it use only sub-shelves you already created. Their title
-words are shown to Claude as hints of what each one covers.
+words are shown to Claude as hints of what each one covers. If two shelves
+normalize to the same path (for example "AI/ML" and "AI › ML"), neither is
+offered, and the command says which one to rename.
 
 Options:
 
@@ -99,7 +111,9 @@ Tabs are filed with per-tab assignments, so they stay put. New tabs land on the
 shelf itself until you sort again, unless the shelf has **Sort new tabs into
 sub-shelves automatically** turned on in the app's shelf editor. Then the app
 runs `organize --max-new 2 --url <each new tab>` for it after each refresh that
-brings new tabs.
+brings new tabs. On Everything else, the switch is **Move new tabs to the shelf
+that fits**, and the app passes `--max-new 0`. Each run sends at most 25 tabs,
+and the app remembers which tabs it already sent to each shelf, across restarts.
 `state.json` shows the setting as `autoSort` on each shelf.
 
 ## Raw protocol (no CLI needed)

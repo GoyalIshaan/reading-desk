@@ -813,6 +813,8 @@ private struct ShelfForm: View {
                 if category.isOther {
                     Text("Anything that doesn’t match another shelf lands here. It always comes last.")
                         .font(Theme.sans(13)).foregroundStyle(Theme.ink3)
+                    autoSortField(label: "Move new tabs to the shelf that fits",
+                                  hint: "Tabs no rule catches go to Claude, which moves each one to whichever shelf fits what the page is about. Tabs that fit nowhere stay here. Needs Claude Code.")
                 } else {
                     field("Inside", hint: "Sub-shelves are checked before the shelf they sit in, so a tab lands on the deepest shelf that matches.") {
                         Picker("Inside", selection: parentBinding) {
@@ -823,14 +825,9 @@ private struct ShelfForm: View {
                         }
                         .pickerStyle(.menu).labelsHidden().fixedSize()
                     }
-                    field("Sort with Claude", hint: "When new tabs land directly on this shelf, Claude reads what each is about and files it into a sub-shelf. It prefers the sub-shelves you made and adds at most 2 new ones per run. Needs Claude Code.") {
-                        Toggle("Sort new tabs into sub-shelves automatically", isOn: Binding(
-                            get: { library.autoSortShelves.contains(category.id) },
-                            set: { library.setAutoSort(category.id, $0) }))
-                            .toggleStyle(.switch).controlSize(.small)
-                            .font(Theme.sans(12.5)).foregroundStyle(Theme.ink2)
-                            .disabled(library.tree.children(of: category.id).isEmpty && !library.autoSortShelves.contains(category.id))
-                    }
+                    autoSortField(label: "Sort new tabs into sub-shelves automatically",
+                                  hint: "When new tabs land directly on this shelf, Claude reads what each is about and files it into a sub-shelf. It prefers the sub-shelves you made and adds at most 2 new ones per run. Needs Claude Code.")
+                        .disabled(library.tree.children(of: category.id).isEmpty && !library.autoSortShelves.contains(category.id))
                     field("Sites", hint: "arxiv.org matches the site and its subdomains · docs. matches hosts starting with it · /blog/ matches anywhere in the address") {
                         TextField("arxiv.org, docs., /blog/", text: $sites, axis: .vertical).lineLimit(2...6).modifier(FieldBox())
                     }
@@ -879,6 +876,15 @@ private struct ShelfForm: View {
         }
         .onChange(of: sites) { _, value in library.update(category.id) { $0.domains = Self.list(value) } }
         .onChange(of: keywords) { _, value in library.update(category.id) { $0.keywords = Self.list(value) } }
+    }
+
+    private func autoSortField(label: String, hint: String) -> some View {
+        field("Sort with Claude", hint: hint) {
+            Toggle(label, isOn: Binding(get: { library.autoSortShelves.contains(category.id) },
+                                        set: { library.setAutoSort(category.id, $0) }))
+                .toggleStyle(.switch).controlSize(.small)
+                .font(Theme.sans(12.5)).foregroundStyle(Theme.ink2)
+        }
     }
 
     private func field<Content: View>(_ label: String, hint: String, @ViewBuilder content: () -> Content) -> some View {

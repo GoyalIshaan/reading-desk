@@ -512,7 +512,7 @@ final class Library: ObservableObject {
     }
 
     func setAutoSort(_ id: String, _ on: Bool) {
-        guard id != Category.otherID, category(withID: id) != nil || !on else { return }
+        guard category(withID: id) != nil || !on else { return }
         if on { autoSortShelves.insert(id) } else { autoSortShelves.remove(id) }
         defaults.set(Array(autoSortShelves), forKey: "autoSort.v1")
     }

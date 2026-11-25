@@ -128,8 +128,9 @@ struct DeskView: View {
     @State private var bridge: DeskBridge?
     /// Only one Claude sort runs at a time.
     @State private var organizing = false
-    /// URLs already sent to auto-sort this session, so leftovers aren't re-sent.
-    @State private var autoSortTried: Set<String> = []
+    /// "shelfID|url" pairs already sent to auto-sort, so leftovers aren't re-sent.
+    /// Saved across launches; keyed per shelf so a triaged tab can still be sub-sorted.
+    @State private var autoSortTried = Set(UserDefaults.standard.stringArray(forKey: "autoSortTried.v1") ?? [])
     @State private var autoSortFailures: [String: (count: Int, until: Date)] = [:]
 
     private var dockVisible: Bool { dockHover || dockFlash || showingQueue }
@@ -266,7 +267,7 @@ struct DeskView: View {
     private func organizeShelf() {
         guard !organizing else { return showToast("Claude is still sorting a shelf…") }
         let id = reading ? room.categoryID : selectedCategory
-        guard let id, let shelf = library.category(withID: id), !shelf.isOther else {
+        guard let id, let shelf = library.category(withID: id) else {
             return showToast("Open a shelf first, then sort it.")
         }
         organizing = true
@@ -280,23 +281,33 @@ struct DeskView: View {
         }
     }
 
-    /// After a refresh, send new tabs on auto-sort shelves to Claude, one shelf at a time.
-    /// A shelf that keeps failing backs off (10 min, 20 min) and gives up after 3 tries.
+    /// After a refresh, send new tabs on auto-sort shelves to Claude, one shelf at a time
+    /// and at most 25 tabs per run. Everything else is triaged into any shelf; other
+    /// shelves are sorted into their sub-shelves. A shelf that keeps failing backs off
+    /// (10 min, 20 min) and gives up after 3 tries.
     private func autoSortIfNeeded() {
-        let maxNewShelves = 2, maxFailures = 3, backoff: TimeInterval = 600
+        let maxNewShelves = 2, maxFailures = 3, backoff: TimeInterval = 600, batchSize = 25
         guard !organizing, !library.sample, !library.autoSortShelves.isEmpty else { return }
         let groups = library.grouped()
         for entry in library.tree.flattened() where library.autoSortShelves.contains(entry.category.id) {
             let shelf = entry.category
             let failure = autoSortFailures[shelf.id]
             if let failure, failure.count >= maxFailures || failure.until > .now { continue }
-            let fresh = (groups[shelf.id] ?? []).map(\.address).filter { !autoSortTried.contains($0) }
-            guard !shelf.isOther, !library.tree.children(of: shelf.id).isEmpty, !fresh.isEmpty else { continue }
-            autoSortTried.formUnion(fresh)
+            guard shelf.isOther || !library.tree.children(of: shelf.id).isEmpty else { continue }
+            // In Everything else, skip tabs the user pinned there on purpose.
+            let candidates = (groups[shelf.id] ?? []).filter {
+                !shelf.isOther || (library.assignments[$0.address] == nil && library.siteRules[$0.site] == nil)
+            }
+            let fresh = Array(candidates.map(\.address)
+                .filter { !autoSortTried.contains("\(shelf.id)|\($0)") }
+                .prefix(batchSize))
+            guard !fresh.isEmpty else { continue }
+            markTried(shelf.id, fresh, tried: true)
             organizing = true
             bridge?.flush()
             Task {
-                let outcome = await ShelfAgent.organize(shelfID: shelf.id, maxNew: maxNewShelves, urls: fresh)
+                let outcome = await ShelfAgent.organize(shelfID: shelf.id, maxNew: shelf.isOther ? 0 : maxNewShelves,
+                                                        urls: fresh)
                 organizing = false
                 if outcome.succeeded {
                     autoSortFailures[shelf.id] = nil
@@ -304,7 +315,7 @@ struct DeskView: View {
                 } else {
                     let count = (failure?.count ?? 0) + 1
                     autoSortFailures[shelf.id] = (count, .now.addingTimeInterval(backoff * Double(count)))
-                    autoSortTried.subtract(fresh)
+                    markTried(shelf.id, fresh, tried: false)  // let them be retried after the backoff
                     showToast(count >= maxFailures ? "Auto-sort for \(shelf.name) is off until you reopen the app: \(outcome.message)"
                                          : "Auto-sort for \(shelf.name) paused: \(outcome.message)", for: 6)
                 }
@@ -312,6 +323,13 @@ struct DeskView: View {
             }
             return
         }
+    }
+
+    private func markTried(_ shelfID: String, _ urls: [String], tried: Bool) {
+        let keys = urls.map { "\(shelfID)|\($0)" }
+        if tried { autoSortTried.formUnion(keys) } else { autoSortTried.subtract(keys) }
+        if autoSortTried.count > 5000 { autoSortTried = Set(keys) }  // crude cap so the saved list can't grow forever
+        UserDefaults.standard.set(Array(autoSortTried), forKey: "autoSortTried.v1")
     }
 
     private func open(_ categoryID: String, _ tab: BrowserTab?, _ origin: CGRect?) {

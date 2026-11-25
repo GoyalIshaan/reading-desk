@@ -19,9 +19,12 @@ final class DeskBridge {
     private let stateURL: URL
     private let commandsDir: URL
     private var cancellable: AnyCancellable?
+    private var watcher: DispatchSourceFileSystemObject?
     private var timer: Timer?
     private var writeScheduled = false
     private var log: [[String: Any]] = []
+    private let writeQueue = DispatchQueue(label: "dev.readingdesk.bridge.write", qos: .utility)
+    private static let iso = ISO8601DateFormatter()
 
     init(library: Library) {
         self.library = library
@@ -32,22 +35,39 @@ final class DeskBridge {
         try? FileManager.default.createDirectory(at: commandsDir, withIntermediateDirectories: true)
     }
 
+    deinit {
+        watcher?.cancel()
+        timer?.invalidate()
+    }
+
     func start() {
         // Re-export whenever the app's data changes (debounced).
         cancellable = library.objectWillChange.sink { [weak self] in self?.scheduleWrite() }
         processCommands()
         writeState()
-        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.processCommands() }
+        // Watch commands/ via kqueue for instant pickup with zero 1 Hz idle polling.
+        let fd = open(commandsDir.path, O_EVTONLY)
+        if fd >= 0 {
+            let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename], queue: .main)
+            source.setEventHandler { [weak self] in
+                MainActor.assumeIsolated { self?.processCommands() }
+            }
+            source.setCancelHandler { close(fd) }
+            source.resume()
+            watcher = source
+        } else {
+            let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.processCommands() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.timer = timer
         }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
     }
 
     // MARK: Snapshot
 
     /// Write state.json right away, skipping the debounce. Call before running the sorter.
-    func flush() { writeState() }
+    func flush() { writeState(sync: true) }
 
     private func scheduleWrite() {
         guard !writeScheduled else { return }
@@ -59,7 +79,7 @@ final class DeskBridge {
         }
     }
 
-    private func writeState() {
+    private func writeState(sync: Bool = false) {
         // Parents come before their children.
         let categories = library.tree.flattened().map { row -> [String: Any] in
             let category = row.category
@@ -82,7 +102,7 @@ final class DeskBridge {
             ]
         }
         let state: [String: Any] = [
-            "updated": ISO8601DateFormatter().string(from: .now),
+            "updated": Self.iso.string(from: .now),
             "appRunning": true,
             "source": library.sample ? "sample" : "helium",
             "tabCount": library.tabs.count,
@@ -92,8 +112,13 @@ final class DeskBridge {
             "log": Array(log.suffix(25)),
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: state, options: [.prettyPrinted, .sortedKeys]) else { return }
-        // Atomic write so a reader never sees a half-written file.
-        try? data.write(to: stateURL, options: .atomic)
+        let url = stateURL
+        // Atomic write on a serial background queue so a reader never sees a half-written file and UI stays smooth.
+        if sync {
+            writeQueue.sync { try? data.write(to: url, options: .atomic) }
+        } else {
+            writeQueue.async { try? data.write(to: url, options: .atomic) }
+        }
     }
 
     // MARK: Commands
@@ -116,7 +141,7 @@ final class DeskBridge {
     }
 
     private func record(_ op: String, _ status: String, _ detail: String? = nil) {
-        var entry: [String: Any] = ["at": ISO8601DateFormatter().string(from: .now), "op": op, "status": status]
+        var entry: [String: Any] = ["at": Self.iso.string(from: .now), "op": op, "status": status]
         if let detail { entry["detail"] = detail }
         log.append(entry)
         if log.count > 50 { log.removeFirst(log.count - 50) }

@@ -50,7 +50,7 @@ Open it normally afterward to import your Helium tabs.
 - Cards can show a preview image, site icon, description, and estimated reading time. Some papers and PDFs show a first-page preview. Login-gated sites can show a plain cover.
 - Hover a card for actions. **Move to shelf** files that tab once. **Always file … in…** creates a rule for the site.
 - Top-level shelves are checked in order. A tab goes into the first one that matches a site rule or title keyword. Move a shelf earlier to give its rules priority. Inside a shelf, its sub-shelves are checked before the shelf itself; see [Nested shelves](#nested-shelves).
-- Hover near the bottom of the reading pane to show the reading controls. You can move between tabs, open the shelf’s tab list, go back or forward on the site, or copy the current link.
+- Hover near the bottom of the reading pane to show the reading controls. You can move between tabs, open the shelf’s tab list, go back or forward on the site, or copy the current link. Swipe and page back stay within the current tab’s history, so they never return you to another tab, including one you marked done.
 - **Done** (**⇧⌘D**) marks the current item read and advances to the next tab. **It also closes matching Helium tabs, including duplicate tabs for that URL, by default.** If you want to keep your Helium tabs open, press **⇧⌘P** and turn off **Close Helium tabs when marked done**.
 
 ## Nested shelves
@@ -80,6 +80,10 @@ If the password field’s macOS menu offers it, right-click the field and choose
 4. Changes autosave to the Markdown file. Press **⌘E** to switch between live preview and raw Markdown. The Notes **…** menu lets you refresh the note list, choose a different vault, or open the selected note in Obsidian.
 
 Live preview supports frontmatter, callouts, wikilinks, embeds, tags, highlights, task lists, tables, code blocks, and KaTeX math. Full LaTeX and TikZ rendering uses a local TeX installation with `latex` and `dvisvgm`. The app checks `/Library/TeX/texbin` and other common install paths.
+
+**Editing** works across lines in live preview: drag, ⇧-click, ⇧+arrows or ⌘A, then cut, copy, paste or type over the selection. The lines you select show as Markdown while they’re selected. The **Format** menu works in both live preview and Markdown mode. Underline is written as `<u>text</u>`, because Markdown has no syntax for it. `---` always draws a divider, even directly under a line of text, and the notes editor leaves dashes and quotes as you type them.
+
+**Pasting an image** or a file copied in Finder saves it in your vault and embeds it. Reading Desk reads the vault’s `.obsidian/app.json`, so Obsidian’s **Settings → Files and links** choices for the attachment folder, wikilinks and link format apply here too. If you haven’t set an attachment folder, Obsidian’s default is the vault root.
 
 If the same note changes on disk while you’re editing it, Reading Desk shows a conflict and keeps your draft available to copy before you reload the file.
 
@@ -122,6 +126,9 @@ Quit while reading and Reading Desk reopens the same page at the same scroll pos
 | ⇧⌘N | Toggle between Notes and the last assistant |
 | ⇧⌘C | Copy the current page link |
 | ⌘E | Switch the Notes editor between live preview and Markdown |
+| ⌘B / ⌘I / ⌘U | Bold, italic or underline in a note |
+| ⇧⌘X / ⇧⌘H / ⇧⌘E | Strikethrough, highlight or inline code in a note |
+| ⌘K | Add a link in a note |
 
 ## Update
 

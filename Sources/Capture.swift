@@ -233,6 +233,7 @@ enum CaptureScript {
     const heads = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
     let best = null;
     for (const h of heads) {
+      if (h.offsetParent === null) continue;
       if (h.contains(node) || (h.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)) best = h;
       else break;
     }

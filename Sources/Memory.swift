@@ -2,46 +2,102 @@ import Foundation
 
 /// Small things Reading Desk remembers between launches: where you were on each
 /// page, which PDF page you were on, and what you had open when you quit.
+@MainActor
 enum ReadingMemory {
     private static let defaults = UserDefaults.standard
     private static let limit = 300
 
     // MARK: Scroll and page positions
 
+    private static var scrolls: [String: Double]?
+    private static var scrollOrder: [String]?
+    private static var pages: [String: Int]?
+    private static var pageOrder: [String]?
+    private static var dirtyScrolls = false
+    private static var dirtyPages = false
+    private static var flushWork: DispatchWorkItem?
+
     private static func key(_ url: URL) -> String { url.removingFragment.absoluteString }
 
+    private static func loadScrolls() -> [String: Double] {
+        if let scrolls { return scrolls }
+        let loaded = defaults.dictionary(forKey: "scroll.v1") as? [String: Double] ?? [:]
+        scrolls = loaded
+        scrollOrder = defaults.stringArray(forKey: "scroll.order.v1") ?? Array(loaded.keys)
+        return loaded
+    }
+
+    private static func loadPages() -> [String: Int] {
+        if let pages { return pages }
+        let loaded = defaults.dictionary(forKey: "pdfPage.v1") as? [String: Int] ?? [:]
+        pages = loaded
+        pageOrder = defaults.stringArray(forKey: "pdfPage.order.v1") ?? Array(loaded.keys)
+        return loaded
+    }
+
     static func scroll(for url: URL) -> Double? {
-        (defaults.dictionary(forKey: "scroll.v1") as? [String: Double])?[key(url)]
+        loadScrolls()[key(url)]
     }
 
     static func setScroll(_ y: Double, for url: URL) {
-        var all = defaults.dictionary(forKey: "scroll.v1") as? [String: Double] ?? [:]
-        all[key(url)] = y
-        touch(key(url), in: "scroll.order.v1", trimming: &all)
-        defaults.set(all, forKey: "scroll.v1")
+        var all = loadScrolls()
+        var order = scrollOrder ?? []
+        let k = key(url)
+        all[k] = y
+        touch(k, in: &order, trimming: &all)
+        scrolls = all
+        scrollOrder = order
+        dirtyScrolls = true
+        scheduleFlush()
     }
 
     static func page(for url: URL) -> Int? {
-        (defaults.dictionary(forKey: "pdfPage.v1") as? [String: Int])?[key(url)]
+        loadPages()[key(url)]
     }
 
     static func setPage(_ index: Int, for url: URL) {
-        var all = defaults.dictionary(forKey: "pdfPage.v1") as? [String: Int] ?? [:]
-        all[key(url)] = index
-        touch(key(url), in: "pdfPage.order.v1", trimming: &all)
-        defaults.set(all, forKey: "pdfPage.v1")
+        var all = loadPages()
+        var order = pageOrder ?? []
+        let k = key(url)
+        all[k] = index
+        touch(k, in: &order, trimming: &all)
+        pages = all
+        pageOrder = order
+        dirtyPages = true
+        scheduleFlush()
     }
 
     /// Keeps the most recently used entries so the store doesn't grow forever.
-    private static func touch<Value>(_ key: String, in orderKey: String, trimming all: inout [String: Value]) {
-        var order = defaults.stringArray(forKey: orderKey) ?? []
+    private static func touch<Value>(_ key: String, in order: inout [String], trimming all: inout [String: Value]) {
         order.removeAll { $0 == key }
         order.append(key)
         if order.count > limit {
             for stale in order.prefix(order.count - limit) { all[stale] = nil }
             order.removeFirst(order.count - limit)
         }
-        defaults.set(order, forKey: orderKey)
+    }
+
+    /// Coalesces frequent scroll/page updates so UserDefaults isn't rewritten twice a second while scrolling.
+    private static func scheduleFlush() {
+        guard flushWork == nil else { return }
+        let work = DispatchWorkItem { flush() }
+        flushWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+    }
+
+    static func flush() {
+        flushWork?.cancel()
+        flushWork = nil
+        if dirtyScrolls, let scrolls, let scrollOrder {
+            defaults.set(scrolls, forKey: "scroll.v1")
+            defaults.set(scrollOrder, forKey: "scroll.order.v1")
+            dirtyScrolls = false
+        }
+        if dirtyPages, let pages, let pageOrder {
+            defaults.set(pages, forKey: "pdfPage.v1")
+            defaults.set(pageOrder, forKey: "pdfPage.order.v1")
+            dirtyPages = false
+        }
     }
 
     // MARK: Session

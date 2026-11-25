@@ -38,8 +38,11 @@ struct SearchIndex {
 
     private struct Entry {
         let word: String
-        let trigrams: Set<String>
+        let length: Int
+        /// Sorted, unique trigrams packed as 3 × 21-bit Unicode scalars (zero String allocations).
+        let trigrams: [UInt64]
         var postings: [Posting] = []
+        var idf: Double = 0
     }
 
     private var vocabulary: [Entry] = []
@@ -61,10 +64,18 @@ struct SearchIndex {
                         vocabulary[slot].postings.append(Posting(doc: doc, field: field))
                     } else {
                         lookup[word] = vocabulary.count
-                        vocabulary.append(Entry(word: word, trigrams: Self.trigrams(word), postings: [Posting(doc: doc, field: field)]))
+                        vocabulary.append(Entry(word: word, length: word.count, trigrams: Self.trigrams(word),
+                                                postings: [Posting(doc: doc, field: field)]))
                     }
                 }
             }
+        }
+        let total = Double(documentCount)
+        for index in vocabulary.indices {
+            var docs = Set<Int>()
+            for posting in vocabulary[index].postings { docs.insert(posting.doc) }
+            let count = Double(docs.count)
+            vocabulary[index].idf = log(1 + (total - count + 0.5) / (count + 0.5))
         }
     }
 
@@ -108,22 +119,42 @@ struct SearchIndex {
         return all.filter { (joined.contains($0) || !parts.contains($0)) && seen.insert($0).inserted }
     }
 
-    static func trigrams(_ word: String) -> Set<String> {
-        let padded = Array("  " + word + " ")
-        guard padded.count >= 3 else { return [] }
-        var grams = Set<String>()
-        for start in 0...(padded.count - 3) { grams.insert(String(padded[start..<start + 3])) }
-        return grams
+    static func trigrams(_ word: String) -> [UInt64] {
+        var scalars: [UInt64] = [32, 32]
+        scalars.reserveCapacity(word.unicodeScalars.count + 3)
+        for s in word.unicodeScalars { scalars.append(UInt64(s.value & 0x1FFFFF)) }
+        scalars.append(32)
+        guard scalars.count >= 3 else { return [] }
+        var grams: [UInt64] = []
+        grams.reserveCapacity(scalars.count - 2)
+        for start in 0...(scalars.count - 3) {
+            grams.append((scalars[start] << 42) | (scalars[start + 1] << 21) | scalars[start + 2])
+        }
+        grams.sort()
+        var unique: [UInt64] = []
+        unique.reserveCapacity(grams.count)
+        for gram in grams where unique.last != gram { unique.append(gram) }
+        return unique
+    }
+
+    private static func sharedCount(_ a: [UInt64], _ b: [UInt64]) -> Int {
+        var i = 0, j = 0, count = 0
+        while i < a.count && j < b.count {
+            if a[i] == b[j] { count += 1; i += 1; j += 1 }
+            else if a[i] < b[j] { i += 1 }
+            else { j += 1 }
+        }
+        return count
     }
 
     /// How well a query word matches a vocabulary word, 0…1.
-    private static func quality(_ term: String, _ termGrams: Set<String>, _ entry: Entry) -> Double {
+    private static func quality(_ term: String, _ termLength: Int, _ termGrams: [UInt64], _ entry: Entry) -> Double {
         let word = entry.word
         if word == term { return 1 }
-        if word.hasPrefix(term) { return term.count >= 2 ? 0.85 : 0.55 }
-        if term.count >= 3 && word.contains(term) { return 0.55 }
-        guard term.count >= 4, abs(word.count - term.count) <= 3 else { return 0 }
-        let shared = Double(termGrams.intersection(entry.trigrams).count)
+        if word.hasPrefix(term) { return termLength >= 2 ? 0.85 : 0.55 }
+        if termLength >= 3 && word.contains(term) { return 0.55 }
+        guard termLength >= 4, abs(entry.length - termLength) <= 3 else { return 0 }
+        let shared = Double(sharedCount(termGrams, entry.trigrams))
         let dice = 2 * shared / Double(termGrams.count + entry.trigrams.count)
         return dice >= 0.6 ? dice * 0.7 : 0
     }
@@ -137,19 +168,18 @@ struct SearchIndex {
         var matched = [Set<String>](repeating: [], count: documentCount)
         var snippetWord = [String?](repeating: nil, count: documentCount)
         var bodyWord = [String?](repeating: nil, count: documentCount)
-        let total = Double(documentCount)
 
         for term in terms {
-            let grams = Self.trigrams(term)
+            let termLength = term.count
+            let grams = termLength >= 4 ? Self.trigrams(term) : []
             // Best contribution of this term per document, across all words and fields.
             var best = [Double](repeating: 0, count: documentCount)
             for entry in vocabulary {
-                let q = Self.quality(term, grams, entry)
+                let q = Self.quality(term, termLength, grams, entry)
                 guard q > 0 else { continue }
-                let documentsWithWord = Set(entry.postings.map(\.doc)).count
-                let idf = log(1 + (total - Double(documentsWithWord) + 0.5) / (Double(documentsWithWord) + 0.5))
+                let idfWeight = q * (0.6 + entry.idf)
                 for posting in entry.postings {
-                    let value = q * posting.field.weight * (0.6 + idf)
+                    let value = idfWeight * posting.field.weight
                     if value > best[posting.doc] { best[posting.doc] = value }
                     matched[posting.doc].insert(entry.word)
                     if posting.field == .summary && snippetWord[posting.doc] == nil { snippetWord[posting.doc] = entry.word }

@@ -292,6 +292,9 @@ function tasks(state) {
 // ---------- markdown-it setup -------------------------------------------------
 
 const md = new MarkdownIt({ html: true, linkify: true, breaks: true, typographer: false });
+// `---` is always a divider. Standard Markdown would turn the line above it into a
+// heading (the "setext" style), which isn't what anyone typing a divider means.
+md.disable('lheading');
 md.block.ruler.before('fence', 'math_block', mathBlock, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
 md.inline.ruler.after('escape', 'math_inline', mathInline);
 md.inline.ruler.before('link', 'wikilink', wikilink);
@@ -567,8 +570,9 @@ function autosize() {
 }
 
 function styleTextarea() {
-    const first = live.textarea.value.split('\n')[0];
-    const heading = /^(#{1,6})\s/.exec(first);
+    const [first, ...rest] = live.textarea.value.split('\n');
+    // A selection can widen the textarea over many lines; don't set them all as a heading.
+    const heading = !rest.length && /^(#{1,6})\s/.exec(first);
     live.textarea.className = heading ? 'ta-h' + heading[1].length
         : /^(```|~~~|\$\$|\||---\s*$)/.test(first.trim()) ? 'ta-code' : '';
 }
@@ -623,7 +627,7 @@ function layout(active, caret) {
         }
         window.scrollTo(0, scroll);
         const rect = ta.getBoundingClientRect();
-        if (rect.bottom > window.innerHeight - 40 || rect.top < 20) ta.scrollIntoView({ block: 'nearest' });
+        if (caret != null && (rect.bottom > window.innerHeight - 40 || rect.top < 20)) ta.scrollIntoView({ block: 'nearest' });
         armIdle();
     } else {
         window.scrollTo(0, scroll);
@@ -696,6 +700,9 @@ document.addEventListener('keydown', (event) => {
     } else if (key === 'y' && !event.shiftKey) {
         event.preventDefault();
         redo();
+    } else if (key === 'a' && !event.shiftKey && live.lines.length) {
+        event.preventDefault();
+        selectAll();
     }
 }, true);
 
@@ -723,6 +730,8 @@ function absorbTextarea() {
 /// Re-check which block the caret is in; re-layout if it left the current one.
 function checkCaret(force) {
     if (!live.active) return;
+    // A selection may span lines: the textarea stays wide until it collapses.
+    if (!force && live.textarea.selectionStart !== live.textarea.selectionEnd) return;
     const caret = caretOffset();
     const line = lineOf(caret);
     const want = rangeForLine(line);
@@ -752,7 +761,7 @@ function armIdle() {
 
 function goIdle() {
     const a = live.active;
-    if (!a || document.activeElement !== live.textarea) return;
+    if (!a || document.activeElement !== live.textarea || live.textarea.selectionStart !== live.textarea.selectionEnd) return;
     const text = live.lines.slice(a.start, a.end).join('\n');
     if (!text.trim()) return;
     live.preview.innerHTML = a.end - a.start === 1 && !/^\s*([#>|$`~-]|\d+[.)]|[*+]\s)/.test(text)
@@ -769,6 +778,175 @@ function moveTo(line, column) {
 }
 function flushEditLater() { if (live.editTimer != null) scheduleEdit(); }
 
+// ---------- selection across lines ----------
+// Only the lines being edited are Markdown source; the rest is rendered HTML,
+// which can't be cut or typed over. So a selection that leaves its line widens
+// the textarea over every line it touches, and the browser's own cut, copy,
+// paste and type-to-replace then work on the Markdown.
+
+/// Select the source between two offsets; `focus` is the end that moves.
+function select(anchor, focus) {
+    const from = Math.min(anchor, focus), to = Math.max(anchor, focus);
+    layout({ start: rangeForLine(lineOf(from)).start, end: rangeForLine(lineOf(to)).end }, null);
+    const base = live.offsets[live.active.start];
+    live.textarea.setSelectionRange(from - base, to - base, focus < anchor ? 'backward' : 'forward');
+}
+
+function selectAll() { select(0, live.source.length); }
+
+/// The textarea's selection as offsets into the whole note.
+function selectionEnds() {
+    const ta = live.textarea, base = live.offsets[live.active.start];
+    const backward = ta.selectionDirection === 'backward';
+    return {
+        anchor: base + (backward ? ta.selectionEnd : ta.selectionStart),
+        focus: base + (backward ? ta.selectionStart : ta.selectionEnd),
+    };
+}
+
+/// Arrow keys that have to leave the textarea. Returns true if it handled the key.
+function extendOrJump(event) {
+    const key = event.key, extend = event.shiftKey, ta = live.textarea, a = live.active;
+    if (event.altKey || event.ctrlKey || !key.startsWith('Arrow')) return false;
+    if (event.metaKey) {
+        // ⌘↑ / ⌘↓ go to the ends of the note, not of the current line.
+        if (key !== 'ArrowUp' && key !== 'ArrowDown') return false;
+        const edge = key === 'ArrowUp' ? 0 : live.source.length;
+        event.preventDefault();
+        if (extend) select(selectionEnds().anchor, edge);
+        else layout(rangeForLine(lineOf(edge)), edge);
+        return true;
+    }
+    if (!extend) return false;
+    const { anchor, focus } = selectionEnds();
+    const at = focus - live.offsets[a.start];
+    const column = at - (ta.value.lastIndexOf('\n', at - 1) + 1);
+    const lineStart = (line) => live.offsets[line] + Math.min(at === 0 ? 0 : column, live.lines[line].length);
+    let target = null;
+    if (key === 'ArrowUp' && a.start > 0 && !ta.value.slice(0, at).includes('\n')) target = lineStart(a.start - 1);
+    else if (key === 'ArrowDown' && a.end < live.lines.length && !ta.value.slice(at).includes('\n')) target = lineStart(a.end);
+    else if (key === 'ArrowLeft' && at === 0 && a.start > 0) target = live.offsets[a.start] - 1;
+    else if (key === 'ArrowRight' && at === ta.value.length && a.end < live.lines.length) target = live.offsets[a.end];
+    if (target == null) return false;
+    event.preventDefault();
+    select(anchor, target);
+    return true;
+}
+
+/// The offset within the textarea under a point. Textareas don't answer
+/// caretRangeFromPoint, so ask a see-through copy laid exactly over it.
+function textareaColumn(x, y) {
+    const ta = live.textarea, rect = ta.getBoundingClientRect(), style = getComputedStyle(ta);
+    const mirror = document.createElement('div');
+    for (const name of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight', 'letterSpacing', 'whiteSpace', 'overflowWrap', 'tabSize', 'padding', 'textIndent']) mirror.style[name] = style[name];
+    Object.assign(mirror.style, { position: 'fixed', left: rect.left + 'px', top: rect.top + 'px', width: rect.width + 'px', zIndex: '9999', color: 'transparent', userSelect: 'text' });
+    mirror.textContent = ta.value;
+    document.body.append(mirror);
+    const range = document.caretRangeFromPoint?.(x, y);
+    const column = range && range.startContainer === mirror.firstChild ? range.startOffset : ta.value.length;
+    mirror.remove();
+    return column;
+}
+
+const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+
+/// The source offset under a point anywhere in the note.
+function offsetAtPoint(x, y) {
+    const nodes = [...document.getElementById('live').children].filter((n) => n !== live.tail);
+    const node = nodes.find((n) => n.getBoundingClientRect().bottom > y);
+    if (!node) return live.source.length;
+    const editing = node === live.wrapper;
+    const start = editing ? live.active.start : Number(node.dataset.start);
+    const end = editing ? live.active.end : Number(node.dataset.end);
+    const rect = node.getBoundingClientRect();
+    if (y < rect.top) return live.offsets[start]; // in the gap above it
+    const px = clamp(x, rect.left + 1, rect.right - 1), py = clamp(y, rect.top + 1, rect.bottom - 1);
+    if (editing) return live.offsets[start] + textareaColumn(px, py);
+    return live.offsets[start] + sourceColumn(node, live.lines.slice(start, end).join('\n'), px, py);
+}
+
+let drag = null;
+let swallowClick = false;
+
+/// While a drag that began in the textarea is outside it, tint the lines it covers;
+/// the browser can't draw a selection from a textarea into the page.
+function tintDrag(y) {
+    const box = live.wrapper?.getBoundingClientRect();
+    for (const el of document.querySelectorAll('#live > .lblock')) {
+        const rect = el.getBoundingClientRect();
+        el.classList.toggle('drag-sel', y != null && !!box
+            && (y > box.bottom ? rect.top >= box.bottom - 1 && rect.top <= y : y < box.top && rect.bottom <= box.top + 1 && rect.bottom >= y));
+    }
+}
+
+document.addEventListener('mousedown', (event) => {
+    drag = null;
+    if (event.button !== 0) return;
+    const inEditor = event.target === live.textarea;
+    if (!inEditor && (event.target.closest(interactive) || !event.target.closest('#live > .lblock, .live-tail'))) return;
+    if (event.shiftKey && !inEditor && live.active) {
+        // Shift-click extends the selection to the clicked spot.
+        event.preventDefault();
+        const to = offsetAtPoint(event.clientX, event.clientY);
+        select(selectionEnds().anchor, to);
+        live.pendingClick = false;
+        swallowClick = true;
+        return;
+    }
+    drag = { inEditor, x: event.clientX, y: event.clientY, moved: false, left: false,
+        anchor: inEditor ? null : offsetAtPoint(event.clientX, event.clientY) };
+}, true);
+
+document.addEventListener('mousemove', (event) => {
+    if (!drag) return;
+    if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 4) drag.moved = true;
+    if (!drag.inEditor || !live.active) return;
+    const box = live.textarea.getBoundingClientRect();
+    const outside = event.clientY < box.top || event.clientY > box.bottom;
+    // The textarea has settled its own anchor by the time the pointer leaves it.
+    if (outside && drag.anchor == null) drag.anchor = selectionEnds().anchor;
+    drag.left = outside;
+    tintDrag(outside ? event.clientY : null);
+}, true);
+
+document.addEventListener('mouseup', (event) => {
+    const ended = drag;
+    drag = null;
+    setTimeout(() => { swallowClick = false; }, 0);
+    if (!ended) return;
+    tintDrag(null);
+    if (!ended.moved || (ended.inEditor && !ended.left)) return;
+    const to = offsetAtPoint(event.clientX, event.clientY);
+    if (to === ended.anchor) return;
+    select(ended.anchor, to);
+    live.pendingClick = false;
+    swallowClick = true;
+}, true);
+
+// ---------- called from Swift (Format menu, pasted files) ----------
+
+/// What's being edited. With `orAppend`, starts a line at the end if nothing is.
+window.deskEditorState = (orAppend) => {
+    if (!live.active) {
+        if (!orAppend) return null;
+        activateEnd();
+    }
+    return { text: live.textarea.value, start: live.textarea.selectionStart, end: live.textarea.selectionEnd };
+};
+
+window.deskReplace = (from, to, text, selectionStart, selectionEnd) => {
+    if (!live.active) return;
+    const ta = live.textarea;
+    remember('');
+    ta.focus({ preventScroll: true });
+    ta.setRangeText(text, from, to, 'end');
+    ta.setSelectionRange(selectionStart, selectionEnd);
+    ta.dispatchEvent(new Event('input'));
+};
+
+window.deskSelectAll = () => { if (live.lines.length) selectAll(); };
+window.deskSetAttachments = (list) => { attachments = list; };
+
 function wireTextarea(ta) {
     ta.addEventListener('beforeinput', (event) => {
         // Edit ▸ Undo / Redo from the menu arrive here.
@@ -776,6 +954,14 @@ function wireTextarea(ta) {
         if (event.inputType === 'historyRedo') { event.preventDefault(); redo(); return; }
         const type = event.inputType || '';
         remember(type === 'insertText' ? 'type' : type.startsWith('delete') ? 'delete' : type);
+    });
+    // ⌘V and Edit ▸ Paste are caught in Swift; the right-click menu's Paste lands here.
+    ta.addEventListener('paste', (event) => {
+        const data = event.clipboardData;
+        if (data?.files.length && !data.getData('text/plain')) {
+            event.preventDefault();
+            post({ type: 'pasteFiles' });
+        }
     });
     ta.addEventListener('input', () => {
         armIdle();
@@ -795,13 +981,15 @@ function wireTextarea(ta) {
         const column = start - (before.lastIndexOf('\n') + 1);
         const a = live.active;
         if (event.key === 'Escape') { event.preventDefault(); ta.blur(); return; }
+        if (extendOrJump(event)) return;
         if (event.metaKey || event.ctrlKey || event.altKey) return;
-        if (event.key === 'ArrowUp' && onFirstLine && !event.shiftKey && a.start > 0) {
+        // With text selected, a plain arrow collapses it; let the textarea do that.
+        if (event.key === 'ArrowUp' && onFirstLine && !event.shiftKey && start === end && a.start > 0) {
             event.preventDefault();
             moveTo(a.start - 1, column);
             return;
         }
-        if (event.key === 'ArrowDown' && onLastLine && !event.shiftKey && a.end < live.lines.length) {
+        if (event.key === 'ArrowDown' && onLastLine && !event.shiftKey && start === end && a.end < live.lines.length) {
             event.preventDefault();
             moveTo(a.end, column);
             return;
@@ -843,7 +1031,12 @@ function wireTextarea(ta) {
             event.preventDefault();
             remember('');
             const lineStart = before.lastIndexOf('\n') + 1;
-            if (event.shiftKey) {
+            if (value.slice(start, end).includes('\n')) {
+                // Indent or outdent every selected line; never replace them with a tab.
+                const block = value.slice(lineStart, end);
+                const next = event.shiftKey ? block.replace(/^(\t| {1,4})/gm, '') : block.replace(/^(?=.)/gm, '\t');
+                ta.setRangeText(next, lineStart, end, 'select');
+            } else if (event.shiftKey) {
                 const indent = /^(\t| {1,4})/.exec(value.slice(lineStart));
                 if (indent) ta.setRangeText('', lineStart, lineStart + indent[0].length, 'end');
             } else if (/^\s*([-*+]|\d+[.)])\s/.test(value.slice(lineStart))) {
@@ -874,6 +1067,9 @@ function sourceColumn(el, text, x, y) {
     const prefix = document.createRange();
     prefix.setStart(el, 0);
     prefix.setEnd(range.startContainer, range.startOffset);
+    const before = prefix.toString().trim();
+    // At the very end, take closing markers such as ** with it.
+    if (before && before === el.textContent.trim()) return text.length;
     // Skip rendered characters with no source counterpart (layout whitespace,
     // KaTeX glyphs); a miss is not a reason to stop matching.
     let j = 0;
@@ -910,6 +1106,7 @@ document.addEventListener('mousedown', (event) => {
 });
 
 document.addEventListener('click', (event) => {
+    if (swallowClick) { swallowClick = false; live.pendingClick = false; event.preventDefault(); return; }
     const box = event.target.closest('.task-list-item-checkbox');
     if (box) {
         event.preventDefault();

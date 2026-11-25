@@ -35,7 +35,7 @@ struct LibraryView: View {
         let groups = library.grouped()
         let totals = library.totals(groups)
         let ordered = library.visibleChildren(of: nil, totals: totals)
-        let shared = boilerplate
+        let shared = (images: previews.sharedImages, summaries: previews.sharedSummaries)
         let selected = selectedCategory.flatMap(library.category(withID:))
         GeometryReader { geometry in
             let available = geometry.size.width - margin * 2
@@ -267,18 +267,6 @@ struct LibraryView: View {
         }
     }
 
-    /// Images and descriptions that several tabs share are site boilerplate
-    /// (the ChatGPT banner, "Meet Gemini, Google's AI assistant…"), not about the page.
-    private var boilerplate: (images: Set<String>, summaries: Set<String>) {
-        var images: [String: Int] = [:]
-        var summaries: [String: Int] = [:]
-        for preview in previews.info.values {
-            if let image = preview.imageURL { images[image, default: 0] += 1 }
-            if let summary = preview.summary { summaries[summary, default: 0] += 1 }
-        }
-        return (Set(images.filter { $0.value > 1 }.keys), Set(summaries.filter { $0.value > 1 }.keys))
-    }
-
     private func card(_ tab: BrowserTab, width: CGFloat, shared: (images: Set<String>, summaries: Set<String>),
                       readIn: String?, labelFrom: String?) -> some View {
         let category = library.category(for: tab)
@@ -292,6 +280,7 @@ struct LibraryView: View {
                        icon: previews.icons[tab.host], width: width,
                        shelfName: shelfLabel,
                        shelves: library.tree, currentCategory: category.id,
+                       readIn: readIn, closeInHelium: closeInHelium,
                        noteCount: notes.count(for: tab.address), saved: library.isSaved(tab),
                        open: { _ in open(readIn ?? category.id, tab, nil) },
                        done: { library.finish(tab, closeInHelium: closeInHelium) },
@@ -299,6 +288,7 @@ struct LibraryView: View {
                        removeFromLater: { library.removeFromLater(tab.address) },
                        assign: { library.assign(tab, to: $0) },
                        fileSite: { library.fileSite(of: tab, in: $0) })
+            .equatable()
             .onAppear { previews.request(tab) }
     }
 
@@ -368,7 +358,7 @@ private struct ShelfWord: View {
 }
 
 /// A tab as a card: cover, source line, Garamond title, the page's own description.
-struct TabCard: View {
+struct TabCard: View, Equatable {
     let tab: BrowserTab
     let preview: PagePreview?
     let image: NSImage?
@@ -377,6 +367,8 @@ struct TabCard: View {
     let shelfName: String?
     let shelves: ShelfTree
     let currentCategory: String
+    var readIn: String? = nil
+    var closeInHelium = true
     var noteCount = 0
     var saved = false
     /// Called with the card's cover frame in window coordinates.
@@ -386,6 +378,16 @@ struct TabCard: View {
     var removeFromLater: () -> Void = {}
     let assign: (String?) -> Void
     let fileSite: (String) -> Void
+
+    static func == (lhs: TabCard, rhs: TabCard) -> Bool {
+        lhs.tab == rhs.tab && lhs.preview == rhs.preview
+            && lhs.image === rhs.image && lhs.icon === rhs.icon
+            && lhs.width == rhs.width && lhs.shelfName == rhs.shelfName
+            && lhs.currentCategory == rhs.currentCategory && lhs.readIn == rhs.readIn
+            && lhs.closeInHelium == rhs.closeInHelium
+            && lhs.noteCount == rhs.noteCount && lhs.saved == rhs.saved
+            && lhs.shelves == rhs.shelves
+    }
 
     @State private var hovered = false
 

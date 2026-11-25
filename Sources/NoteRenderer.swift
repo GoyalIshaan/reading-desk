@@ -6,7 +6,7 @@ import WebKit
 /// markdown-it + KaTeX, talking to Swift for links, embeds, tasks and LaTeX.
 @MainActor
 final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate {
-    let view: WKWebView
+    let view: NoteEditorWebView
     weak var vault: Vault?
     private let scheme = DeskScheme()
     /// The page loads note.html, then says "ready". Until then the latest render waits here.
@@ -21,12 +21,22 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private var caretToEnd = false
 
     override init() {
+        // With macOS "smart quotes and dashes" on, typing `---` saves an em dash, so no
+        // divider ever appears, and quotes in code get curled. WebKit has no per-field
+        // switch; it reads these defaults. Source mode turns the same features off.
+        UserDefaults.standard.register(defaults: [
+            "WebAutomaticDashSubstitutionEnabled": false,
+            "WebAutomaticQuoteSubstitutionEnabled": false,
+            "WebAutomaticTextReplacementEnabled": false,
+        ])
         let configuration = WKWebViewConfiguration()
         configuration.setURLSchemeHandler(scheme, forURLScheme: "desk")
         let controller = WKUserContentController()
         configuration.userContentController = controller
-        view = WKWebView(frame: .zero, configuration: configuration)
+        view = NoteEditorWebView(frame: .zero, configuration: configuration)
         super.init()
+        view.pasteAttachments = { [weak self] in self?.paste($0) }
+        view.format = { [weak self] in self?.apply($0) }
         controller.add(WeakHandler(self), name: "desk")
         view.navigationDelegate = self
         view.setValue(false, forKey: "drawsBackground")
@@ -77,6 +87,39 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     func forget() { shown = nil }
 
+    /// What the live editor has under the cursor.
+    private struct EditorState: Decodable {
+        let text: String
+        let start: Int
+        let end: Int
+    }
+
+    private func editorState(orAppend: Bool) async -> EditorState? {
+        let script = "JSON.stringify(window.deskEditorState(\(orAppend)))"
+        guard let json = try? await view.evaluateJavaScript(script) as? String else { return nil }
+        return try? JSONDecoder().decode(EditorState?.self, from: Data(json.utf8))
+    }
+
+    private func apply(_ format: TextFormat) {
+        Task {
+            guard let state = await editorState(orAppend: false) else { return }
+            let edit = format.edit(state.text, selection: NSRange(location: state.start, length: state.end - state.start))
+            call("deskReplace", edit.range.location, NSMaxRange(edit.range), edit.replacement,
+                 edit.selection.location, NSMaxRange(edit.selection))
+        }
+    }
+
+    /// Files the pasted images in the vault, then types their embeds at the cursor.
+    private func paste(_ items: [PastedAttachment]) {
+        Task {
+            guard let vault, let markdown = vault.attach(items) else { return }
+            call("deskSetAttachments", vault.attachments)
+            guard let state = await editorState(orAppend: true) else { return }
+            let caret = state.start + (markdown as NSString).length
+            call("deskReplace", state.start, state.end, markdown, caret, caret)
+        }
+    }
+
     private func call(_ function: String, _ arguments: Any...) {
         guard let data = try? JSONSerialization.data(withJSONObject: arguments, options: [.fragmentsAllowed]),
               let json = String(data: data, encoding: .utf8) else { return }
@@ -113,6 +156,8 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
             guard let text = body["text"] as? String, let vault, let note = vault.selection else { return }
             shown = (note.path, text)
             vault.edit(text)
+        case "pasteFiles":
+            if let items = PastedAttachment.read(from: .general) { paste(items) }
         case "toggleTask":
             guard let line = body["line"] as? Int else { return }
             vault?.toggleTask(atLine: line)
@@ -167,6 +212,34 @@ private extension Optional {
     func asyncMap<T>(_ transform: (Wrapped) async -> T) async -> T? {
         guard let self else { return nil }
         return await transform(self)
+    }
+}
+
+/// The notes web view, which takes over the edit commands a web page can't do alone.
+final class NoteEditorWebView: WKWebView, FormattingEditor {
+    var pasteAttachments: (([PastedAttachment]) -> Void)?
+    var format: ((TextFormat) -> Void)?
+
+    // A page can't put a pasted image into the vault, so that paste is handled here.
+    // WKWebView doesn't declare `paste:`, hence calling its version through the runtime.
+    @objc func paste(_ sender: Any?) {
+        if let items = PastedAttachment.read(from: .general) {
+            pasteAttachments?(items)
+            return
+        }
+        let selector = #selector(paste(_:))
+        guard let method = class_getInstanceMethod(WKWebView.self, selector) else { return }
+        typealias Paste = @convention(c) (AnyObject, Selector, Any?) -> Void
+        unsafeBitCast(method_getImplementation(method), to: Paste.self)(self, selector, sender)
+    }
+
+    /// Edit ▸ Select All means the whole note, not just the line being edited.
+    override func selectAll(_ sender: Any?) {
+        evaluateJavaScript("window.deskSelectAll()")
+    }
+
+    @objc func deskFormat(_ sender: Any?) {
+        if let command = TextFormat.from(sender) { format?(command) }
     }
 }
 

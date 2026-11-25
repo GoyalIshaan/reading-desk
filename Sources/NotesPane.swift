@@ -52,10 +52,10 @@ struct NotesPane: View {
                     if vault.preview {
                         NoteWebView(renderer: renderer)
                             .onAppear { renderer.show(note, text: vault.text) }
-                            .onChange(of: vault.text) { _, text in renderer.show(note, text: text) }
+                            .onChange(of: vault.documentVersion) { _, _ in renderer.show(note, text: vault.text) }
                             .onChange(of: note) { _, next in renderer.show(next, text: vault.text) }
                     } else {
-                        MarkdownEditor(text: vault.text) { vault.edit($0) }
+                        MarkdownEditor(text: vault.text, version: vault.documentVersion, attach: vault.attach) { vault.edit($0) }
                             .id(note.id)
                     }
                     if vault.isDirty || vault.status != .saved {
@@ -200,7 +200,7 @@ struct NotesPane: View {
             .overlay(Capsule().strokeBorder(Theme.rule))
             .padding(14)
 
-            if vault.busy && vault.notes.isEmpty {
+            if (vault.busy || vault.scanning) && vault.notes.isEmpty {
                 ProgressView().controlSize(.small).padding(16)
                 Spacer()
             } else if matches.isEmpty {

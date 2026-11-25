@@ -17,6 +17,8 @@ final class PaperReader: NSObject, ObservableObject {
     }
 
     let url: URL
+    /// Optional 0-based page parsed from a `#page=N` fragment on the opening URL.
+    private let requestedPage: Int?
     let view = DeskPDFView()
     @Published private(set) var loading = true
     @Published private(set) var failure: String?
@@ -31,6 +33,7 @@ final class PaperReader: NSObject, ObservableObject {
     private var destinations: [Int: PDFDestination] = [:]
 
     init(url: URL) {
+        self.requestedPage = Self.fragmentPage(in: url)
         self.url = url.removingFragment
         super.init()
         view.autoScales = true
@@ -55,42 +58,64 @@ final class PaperReader: NSObject, ObservableObject {
         observers.forEach(NotificationCenter.default.removeObserver)
     }
 
+    private struct UncheckedBox<T>: @unchecked Sendable { let value: T }
+
+    private static func fragmentPage(in url: URL) -> Int? {
+        guard let fragment = url.fragment else { return nil }
+        for part in fragment.split(separator: "&") {
+            let pair = part.split(separator: "=", maxSplits: 1)
+            if pair.count == 2, pair[0].lowercased() == "page", let n = Int(pair[1]), n >= 1 {
+                return n - 1
+            }
+        }
+        return nil
+    }
+
     func load() async {
         loading = true
         failure = nil
         defer { loading = false }
         do {
             let document: PDFDocument?
-            if url.isFileURL {
-                document = PDFDocument(url: url)
+            let targetURL = url
+            if targetURL.isFileURL {
+                document = await Task.detached(priority: .userInitiated) { UncheckedBox(value: PDFDocument(url: targetURL)) }.value.value
             } else {
-                var request = URLRequest(url: url)
+                var request = URLRequest(url: targetURL, timeoutInterval: 30)
                 request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
                                  forHTTPHeaderField: "User-Agent")
                 // Reuse the reading pane's sign-ins, so PDFs behind a login still open.
                 let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
                     .filter { cookie in
-                        guard let host = url.host?.lowercased() else { return false }
+                        guard let host = targetURL.host?.lowercased() else { return false }
                         let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
                         return host == domain || host.hasSuffix("." + domain)
                     }
                 HTTPCookie.requestHeaderFields(with: cookies).forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
                 let (data, _) = try await URLSession.shared.data(for: request)
+                try Task.checkCancellation()
                 guard data.starts(with: Array("%PDF".utf8)) || data.prefix(1024).range(of: Data("%PDF".utf8)) != nil else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
-                document = PDFDocument(data: data)
+                // Parse PDFDocument off the main thread so heavy papers don't hitch tab switching.
+                document = await Task.detached(priority: .userInitiated) { UncheckedBox(value: PDFDocument(data: data)) }.value.value
             }
+            try Task.checkCancellation()
             guard let document, document.pageCount > 0 else { throw CocoaError(.fileReadCorruptFile) }
             view.document = document
             pageCount = document.pageCount
             title = (document.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String)?.trimmed
             sections = flatten(document)
-            if let saved = ReadingMemory.page(for: url), saved > 0, let page = document.page(at: min(saved, document.pageCount - 1)) {
+            let startPage = requestedPage ?? ReadingMemory.page(for: url)
+            if let startPage, startPage > 0, let page = document.page(at: min(startPage, document.pageCount - 1)) {
                 // Wait a turn so the view has laid out before jumping.
                 DispatchQueue.main.async { [weak self] in self?.view.go(to: page) }
             }
             pageChanged()
+        } catch is CancellationError {
+            return
+        } catch let error as URLError where error.code == .cancelled {
+            return
         } catch {
             failure = error.localizedDescription
         }
@@ -199,11 +224,13 @@ final class DeskPDFView: PDFView {
         guard scrollObserver == nil, let clip = documentView?.enclosingScrollView?.contentView else { return }
         clip.postsBoundsChangedNotifications = true
         scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
-            guard let self, let selection = self.currentSelection, let page = selection.pages.first,
-                  !(selection.string?.trimmed.isEmpty ?? true) else { return }
-            let bounds = self.convert(selection.bounds(for: page), from: page)
-            let top = self.isFlipped ? bounds.minY : self.bounds.height - bounds.maxY
-            self.onSelectionMoved?(CGRect(x: bounds.minX, y: top, width: bounds.width, height: bounds.height))
+            MainActor.assumeIsolated {
+                guard let self, let selection = self.currentSelection, let page = selection.pages.first,
+                      !(selection.string?.trimmed.isEmpty ?? true) else { return }
+                let bounds = self.convert(selection.bounds(for: page), from: page)
+                let top = self.isFlipped ? bounds.minY : self.bounds.height - bounds.maxY
+                self.onSelectionMoved?(CGRect(x: bounds.minX, y: top, width: bounds.width, height: bounds.height))
+            }
         }
     }
 

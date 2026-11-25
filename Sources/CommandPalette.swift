@@ -22,6 +22,7 @@ struct CommandPalette: View {
     @State private var selection = 0
     @State private var index = SearchIndex(documents: [])
     @State private var indexedTabs: [BrowserTab] = []
+    @State private var indexTask: Task<Void, Never>?
     @State private var results: [Item] = []
     /// Set by arrow keys only. Hover changes the selection without scrolling the list.
     @State private var scrollTarget: Int?
@@ -77,8 +78,9 @@ struct CommandPalette: View {
     // MARK: Search
 
     private func rebuildIndex() {
-        indexedTabs = library.tabs
-        index = SearchIndex(documents: indexedTabs.map { tab in
+        let tabs = library.tabs
+        indexedTabs = tabs
+        let documents: [[SearchIndex.Field: String]] = tabs.map { tab in
             let preview = previews.info[tab.address]
             let path = tab.url.map { $0.path + " " + ($0.query ?? "") } ?? tab.address
             return [
@@ -89,8 +91,19 @@ struct CommandPalette: View {
                 .summary: preview?.summary ?? "",
                 .body: preview?.text ?? "",
             ]
-        })
+        }
+        // Show shelves/commands/recent tabs immediately, then build the inverted index off-thread so ⇧⌘P opens without hitching.
         runSearch(keepSelection: true)
+        indexTask?.cancel()
+        indexTask = Task {
+            let built = await Task.detached(priority: .userInitiated) { SearchIndex(documents: documents) }.value
+            guard !Task.isCancelled else { return }
+            index = built
+            indexedTabs = tabs
+            if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                runSearch(keepSelection: true)
+            }
+        }
     }
 
     /// A new query starts at the top. A refresh of the same query (tabs changed)
@@ -102,8 +115,11 @@ struct CommandPalette: View {
         let commands = Command.allCases.compactMap { command -> Item? in
             if command == .continueReading && ReadingMemory.session == nil { return nil }
             let label = command.label
-            let words = SearchIndex.words(in: label.title + " " + label.keywords)
-            guard terms.allSatisfy({ term in words.contains { $0.hasPrefix(term) } }) else { return nil }
+            if !trimmed.isEmpty {
+                guard !terms.isEmpty else { return nil }
+                let words = SearchIndex.words(in: label.title + " " + label.keywords)
+                guard terms.allSatisfy({ term in words.contains { $0.hasPrefix(term) } }) else { return nil }
+            }
             let detail: String? = switch command {
             case .toggleFullscreen: fullscreenOnOpen ? "On" : "Off"
             case .toggleCloseInHelium: closeInHelium ? "On" : "Off"
@@ -125,13 +141,14 @@ struct CommandPalette: View {
         if trimmed.isEmpty {
             results = shelves + commands + indexedTabs.prefix(40).map { Item(kind: tabItem($0)) }
         } else {
-            let matchingShelves = shelves.filter { item in
+            let matchingShelves = terms.isEmpty ? [] : shelves.filter { item in
                 guard case .shelf(_, let path, _) = item.kind else { return false }
                 let words = SearchIndex.words(in: path)
                 return terms.allSatisfy { term in words.contains { $0.hasPrefix(term) } }
             }
-            let tabs = index.search(trimmed).map { hit -> Item in
-                Item(kind: tabItem(indexedTabs[hit.index]), words: hit.words, snippet: hit.snippet)
+            let tabs = index.search(trimmed).compactMap { hit -> Item? in
+                guard indexedTabs.indices.contains(hit.index) else { return nil }
+                return Item(kind: tabItem(indexedTabs[hit.index]), words: hit.words, snippet: hit.snippet)
             }
             results = commands + Array(matchingShelves.prefix(3)) + tabs
         }
@@ -180,6 +197,8 @@ struct CommandPalette: View {
             focused = true
         }
         .onDisappear {
+            indexTask?.cancel()
+            indexTask = nil
             previews.paused = wasPaused
             if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
             keyMonitor = nil

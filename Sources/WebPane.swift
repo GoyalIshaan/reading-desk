@@ -26,6 +26,8 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     var onCapture: (([String: Any], WKWebView) -> Void)?
     /// The main frame turned out to be a PDF, which reads better in the paper reader.
     var onPDF: ((URL) -> Void)?
+    /// Called when an in-pane popup closes, so stale selection bars can be cleared.
+    var onDismissOpened: (() -> Void)?
     /// Extra items at the top of the right-click menu (Save to note, Ask…).
     var menuItems: (() -> [NSMenuItem])?
 
@@ -127,7 +129,8 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                 webView.evaluateJavaScript("(() => { const p = [...document.querySelectorAll('p, font, td')].find(e => e.innerText && e.innerText.length > 80); if (!p) return 'no paragraph; installed=' + !!window.__deskCapture; const r = document.createRange(); r.selectNodeContents(p); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); return 'selected; installed=' + !!window.__deskCapture; })()") { result, error in NSLog("RD capture: select → \(String(describing: result)) \(String(describing: error))") }
             }
         }
-        guard captures, let url = webView.url, let y = ReadingMemory.scroll(for: url), y > 40 else { return }
+        // Don't override a fragment jump (#section or #:~:text=…) with an older scroll position.
+        guard captures, let url = webView.url, url.fragment == nil, let y = ReadingMemory.scroll(for: url), y > 40 else { return }
         webView.evaluateJavaScript("window.__deskRestore && window.__deskRestore(\(Int(y)))")
     }
 
@@ -137,8 +140,11 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         // their messages arrive here too. Only the reading pane's family has this script.
         guard message.frameInfo.isMainFrame, let webView = message.webView,
               let body = message.body as? [String: Any] else { return }
-        if body["type"] as? String == "scroll", let y = body["y"] as? Double, let url = webView.url {
-            ReadingMemory.setScroll(y, for: url)
+        if body["type"] as? String == "scroll" {
+            if let y = body["y"] as? Double, let url = webView.url {
+                ReadingMemory.setScroll(y, for: url)
+            }
+            return
         }
         onCapture?(body, webView)
     }
@@ -238,6 +244,7 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         page.view.stopLoading()
         openedPages.removeAll { $0 === page }
         if openedPage === page { openedPage = openedPages.last }
+        onDismissOpened?()
     }
 
 }

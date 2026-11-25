@@ -1,5 +1,6 @@
 import AppKit
 import CryptoKit
+import ImageIO
 import PDFKit
 import WebKit
 
@@ -27,12 +28,18 @@ final class Previews: ObservableObject {
     @Published private(set) var info: [String: PagePreview] = [:]
     @Published private(set) var images: [String: NSImage] = [:]
     @Published private(set) var icons: [String: NSImage] = [:]
+    /// Images and descriptions shared by multiple tabs are site boilerplate, not about the page.
+    /// Maintained incrementally on flush so LibraryView doesn't scan every preview on each render.
+    private(set) var sharedImages: Set<String> = []
+    private(set) var sharedSummaries: Set<String> = []
 
     /// While reading, background fetching and snapshotting stop so the reader stays smooth.
     var paused = false
     private var pendingInfo: [String: PagePreview] = [:]
     private var pendingImages: [String: NSImage] = [:]
-    private var flushScheduled = false
+    private var pendingIcons: [String: NSImage] = [:]
+    private var flushTask: Task<Void, Never>?
+    private var flushFast = false
     private var requested: Set<String> = []
     private var iconRequested: Set<String> = []
     private let directory: URL
@@ -62,18 +69,29 @@ final class Previews: ObservableObject {
     func request(_ tab: BrowserTab) {
         guard let url = tab.readableURL, !url.isFileURL, !requested.contains(tab.address) else { return }
         requested.insert(tab.address)
-        let key = Self.hash(tab.address)
-        let json = directory.appendingPathComponent(key + ".json")
-        if let data = try? Data(contentsOf: json), let cached = try? JSONDecoder().decode(PagePreview.self, from: data) {
-            info[tab.address] = cached
-            if cached.hasImage, let image = NSImage(contentsOf: directory.appendingPathComponent(key + ".jpg")) {
-                images[tab.address] = image
+        let address = tab.address
+        let host = tab.host
+        let key = Self.hash(address)
+        let dir = directory
+        // Read disk cache and decode JPEG off the main thread so scrolling never hitches.
+        Task {
+            let hit = await Task.detached(priority: .userInitiated) { () -> (PagePreview, NSImage?)? in
+                let json = dir.appendingPathComponent(key + ".json")
+                guard let data = try? Data(contentsOf: json),
+                      let cached = try? JSONDecoder().decode(PagePreview.self, from: data) else { return nil }
+                let image: NSImage? = cached.hasImage ? Self.decodeImage(at: dir.appendingPathComponent(key + ".jpg")) : nil
+                return (cached, image)
+            }.value
+            if let (cached, image) = hit {
+                publish(address, info: cached, image: image, fast: true)
+                requestIcon(host: host, hint: cached.iconURL.flatMap(URL.init(string:)))
+                if cached.text == nil && !cached.isPDF {
+                    await backfillText(address: address, url: url, key: key, cached: cached)
+                }
+            } else {
+                await build(address: address, url: url, key: key)
             }
-            requestIcon(host: tab.host, hint: cached.iconURL.flatMap(URL.init(string:)))
-            if cached.text == nil && !cached.isPDF { Task { await backfillText(address: tab.address, url: url, key: key, cached: cached) } }
-            return
         }
-        Task { await build(address: tab.address, url: url, key: key) }
     }
 
     private func waitWhilePaused() async {
@@ -81,20 +99,64 @@ final class Previews: ObservableObject {
     }
 
     /// Cards update in batches rather than once per image, so the grid doesn't
-    /// re-render 145 times while previews stream in.
-    private func publish(_ address: String, info preview: PagePreview, image: NSImage?) {
+    /// re-render 145 times while previews stream in. Cache hits use a short batch
+    /// window so the library fills in almost instantly without per-card storms.
+    private func publish(_ address: String, info preview: PagePreview, image: NSImage?, fast: Bool = false) {
         pendingInfo[address] = preview
         if let image { pendingImages[address] = image }
-        guard !flushScheduled else { return }
-        flushScheduled = true
-        Task {
-            try? await Task.sleep(for: .milliseconds(300))
-            info.merge(pendingInfo) { $1 }
-            images.merge(pendingImages) { $1 }
-            pendingInfo = [:]
-            pendingImages = [:]
-            flushScheduled = false
+        scheduleFlush(fast: fast)
+    }
+
+    private func publishIcon(_ host: String, image: NSImage, fast: Bool = false) {
+        pendingIcons[host] = image
+        scheduleFlush(fast: fast)
+    }
+
+    private func scheduleFlush(fast: Bool) {
+        if fast && !flushFast {
+            flushTask?.cancel()
+            flushTask = nil
         }
+        guard flushTask == nil else { return }
+        flushFast = fast
+        let delay: Duration = fast ? .milliseconds(35) : .milliseconds(300)
+        flushTask = Task {
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            flushPending()
+        }
+    }
+
+    private func flushPending() {
+        flushTask = nil
+        flushFast = false
+        let infoChanged = !pendingInfo.isEmpty
+        if infoChanged {
+            info.merge(pendingInfo) { $1 }
+            pendingInfo = [:]
+            recomputeBoilerplate()
+        }
+        if !pendingImages.isEmpty {
+            images.merge(pendingImages) { $1 }
+            pendingImages = [:]
+        }
+        if !pendingIcons.isEmpty {
+            icons.merge(pendingIcons) { $1 }
+            pendingIcons = [:]
+        }
+    }
+
+    private func recomputeBoilerplate() {
+        var imageCounts: [String: Int] = [:]
+        var summaryCounts: [String: Int] = [:]
+        imageCounts.reserveCapacity(info.count)
+        summaryCounts.reserveCapacity(info.count)
+        for preview in info.values {
+            if let image = preview.imageURL { imageCounts[image, default: 0] += 1 }
+            if let summary = preview.summary { summaryCounts[summary, default: 0] += 1 }
+        }
+        sharedImages = Set(imageCounts.lazy.filter { $0.value > 1 }.map(\.key))
+        sharedSummaries = Set(summaryCounts.lazy.filter { $0.value > 1 }.map(\.key))
     }
 
     /// Caches from before page text was kept: fetch just the HTML again for its text.
@@ -110,8 +172,12 @@ final class Previews: ObservableObject {
         }
         await fetchSlots.release()
         publish(address, info: preview, image: nil)
-        if let data = try? JSONEncoder().encode(preview) {
-            try? data.write(to: directory.appendingPathComponent(key + ".json"))
+        let dir = directory
+        let toSave = preview
+        Task.detached(priority: .utility) {
+            if let data = try? JSONEncoder().encode(toSave) {
+                try? data.write(to: dir.appendingPathComponent(key + ".json"))
+            }
         }
     }
 
@@ -153,16 +219,23 @@ final class Previews: ObservableObject {
         }
 
         if preview.text == nil { preview.text = "" }
+        let dir = directory
+        let scaledResult: (NSImage, Data)? = if let cover {
+            await Task.detached(priority: .utility) { Self.downscale(cover, width: 760) }.value
+        } else { nil }
         var published: NSImage?
-        if let cover, let (scaled, jpeg) = Self.downscale(cover, width: 760) {
-            try? jpeg.write(to: directory.appendingPathComponent(key + ".jpg"))
+        if let (scaled, jpeg) = scaledResult {
             preview.hasImage = true
             preview.aspect = scaled.size.height / max(scaled.size.width, 1)
             published = scaled
+            Task.detached(priority: .utility) { try? jpeg.write(to: dir.appendingPathComponent(key + ".jpg")) }
         }
         publish(address, info: preview, image: published)
-        if let data = try? JSONEncoder().encode(preview) {
-            try? data.write(to: directory.appendingPathComponent(key + ".json"))
+        let toSave = preview
+        Task.detached(priority: .utility) {
+            if let data = try? JSONEncoder().encode(toSave) {
+                try? data.write(to: dir.appendingPathComponent(key + ".json"))
+            }
         }
         requestIcon(host: url.host?.lowercased() ?? "", hint: preview.iconURL.flatMap(URL.init(string:)))
     }
@@ -171,35 +244,50 @@ final class Previews: ObservableObject {
         guard !host.isEmpty, !iconRequested.contains(host) else { return }
         iconRequested.insert(host)
         let file = directory.appendingPathComponent("icon-" + Self.hash(host) + ".png")
-        if let image = NSImage(contentsOf: file) {
-            icons[host] = image
-            return
-        }
         Task {
+            if let cached = await Task.detached(priority: .userInitiated, operation: { Self.decodeImage(at: file) }).value {
+                publishIcon(host, image: cached, fast: true)
+                return
+            }
             var candidates: [URL] = []
             if let hint { candidates.append(hint) }
             if let fallback = URL(string: "https://\(host)/favicon.ico") { candidates.append(fallback) }
             for candidate in candidates {
                 guard let (data, response) = try? await session.data(from: candidate),
-                      (response as? HTTPURLResponse)?.statusCode ?? 200 < 400,
-                      let image = NSImage(data: data), image.isValid,
-                      let (scaled, _) = Self.downscale(image, width: 64, format: .png) else { continue }
-                if let png = Self.encode(scaled, format: .png) { try? png.write(to: file) }
-                icons[host] = scaled
-                return
+                      (response as? HTTPURLResponse)?.statusCode ?? 200 < 400 else { continue }
+                let result = await Task.detached(priority: .utility) { () -> NSImage? in
+                    guard let image = NSImage(data: data), image.isValid,
+                          let (scaled, png) = Self.downscale(image, width: 64, format: .png) else { return nil }
+                    try? png.write(to: file)
+                    return scaled
+                }.value
+                if let scaled = result {
+                    publishIcon(host, image: scaled)
+                    return
+                }
             }
         }
     }
 
     // MARK: Parsing
 
+    nonisolated private static let metaTagRegex = try! NSRegularExpression(pattern: #"<meta\b[^>]*>"#, options: [.caseInsensitive])
+    nonisolated private static let linkTagRegex = try! NSRegularExpression(pattern: #"<link\b[^>]*>"#, options: [.caseInsensitive])
+    nonisolated private static let attrRegex = try! NSRegularExpression(pattern: #"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#)
+    nonisolated private static let numericEntityRegex = try! NSRegularExpression(pattern: "&#(x?)([0-9a-fA-F]+);")
+    nonisolated private static let titleTagRegex = try! NSRegularExpression(pattern: #"<title[^>]*>([\s\S]*?)</title>"#, options: [.caseInsensitive])
+    nonisolated private static let stripTagsRegex = try! NSRegularExpression(pattern: #"<[^>]+>"#)
+    nonisolated private static let stripBlocksRegex = try! NSRegularExpression(
+        pattern: #"<(script|style|noscript|svg|nav|header|footer|aside|form)\b[\s\S]*?</\1>"#, options: [.caseInsensitive])
+    nonisolated private static let mainBlockRegexes = ["article", "main"].map {
+        try! NSRegularExpression(pattern: "<\($0)\\b[\\s\\S]*?</\($0)>", options: [.caseInsensitive])
+    }
+
     nonisolated static func parse(_ html: String, base: URL) -> PagePreview {
         var preview = PagePreview()
         var meta: [String: String] = [:]
-        let tag = try! NSRegularExpression(pattern: #"<meta\b[^>]*>"#, options: [.caseInsensitive])
-        let link = try! NSRegularExpression(pattern: #"<link\b[^>]*>"#, options: [.caseInsensitive])
         let range = NSRange(html.startIndex..., in: html)
-        for match in tag.matches(in: html, range: range) {
+        for match in metaTagRegex.matches(in: html, range: range) {
             guard let r = Range(match.range, in: html) else { continue }
             let attributes = Self.attributes(String(html[r]))
             guard let name = (attributes["property"] ?? attributes["name"] ?? attributes["itemprop"])?.lowercased(),
@@ -207,15 +295,19 @@ final class Previews: ObservableObject {
             meta[name] = decode(content)
         }
         var icons: [(Int, String)] = []
-        for match in link.matches(in: html, range: range) {
+        for match in linkTagRegex.matches(in: html, range: range) {
             guard let r = Range(match.range, in: html) else { continue }
             let attributes = Self.attributes(String(html[r]))
             guard let rel = attributes["rel"]?.lowercased(), let href = attributes["href"] else { continue }
             if rel.contains("apple-touch-icon") { icons.append((0, href)) }
             else if rel.contains("icon") && !rel.contains("mask") { icons.append((rel.contains("shortcut") ? 2 : 1, href)) }
         }
-        let titleTag = html.range(of: #"<title[^>]*>([\s\S]*?)</title>"#, options: [.regularExpression, .caseInsensitive])
-            .map { String(html[$0]).replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression) }
+        let titleTag: String? = titleTagRegex.firstMatch(in: html, range: range)
+            .flatMap { Range($0.range(at: 1), in: html) }
+            .map { raw in
+                let s = String(html[raw])
+                return stripTagsRegex.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "")
+            }
 
         preview.title = (meta["og:title"] ?? meta["twitter:title"] ?? titleTag.map(decode))?.trimmed.nonEmpty
         preview.summary = (meta["og:description"] ?? meta["description"] ?? meta["twitter:description"])?.trimmed.nonEmpty
@@ -232,8 +324,8 @@ final class Previews: ObservableObject {
         if words.count > 150 { preview.minutes = max(1, Int((Double(words.count) / 230).rounded())) }
         // Search text comes from <article> or <main> when the page has one, so menus and
         // sidebars don't drown out what the page is about.
-        let main = ["article", "main"].lazy.compactMap { block in
-            html.range(of: "<\(block)\\b[\\s\\S]*?</\(block)>", options: [.regularExpression, .caseInsensitive]).map { String(html[$0]) }
+        let main = mainBlockRegexes.lazy.compactMap { regex -> String? in
+            regex.firstMatch(in: html, range: range).flatMap { Range($0.range, in: html) }.map { String(html[$0]) }
         }.first
         let body = main.map(plainText).flatMap { $0.count > 200 ? $0 : nil } ?? text
         preview.text = String(decode(body).split(whereSeparator: { $0.isWhitespace }).prefix(300).joined(separator: " ").prefix(2400))
@@ -241,17 +333,13 @@ final class Previews: ObservableObject {
     }
 
     nonisolated private static func plainText(_ html: String) -> String {
-        var text = html
-        for block in ["script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form"] {
-            text = text.replacingOccurrences(of: "<\(block)\\b[\\s\\S]*?</\(block)>", with: " ", options: [.regularExpression, .caseInsensitive])
-        }
-        return text.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+        let stripped = stripBlocksRegex.stringByReplacingMatches(in: html, range: NSRange(html.startIndex..., in: html), withTemplate: " ")
+        return stripTagsRegex.stringByReplacingMatches(in: stripped, range: NSRange(stripped.startIndex..., in: stripped), withTemplate: " ")
     }
 
     nonisolated private static func attributes(_ tag: String) -> [String: String] {
-        let pattern = try! NSRegularExpression(pattern: #"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#)
         var result: [String: String] = [:]
-        for match in pattern.matches(in: tag, range: NSRange(tag.startIndex..., in: tag)) {
+        for match in attrRegex.matches(in: tag, range: NSRange(tag.startIndex..., in: tag)) {
             guard let key = Range(match.range(at: 1), in: tag) else { continue }
             let value = [2, 3, 4].compactMap { Range(match.range(at: $0), in: tag) }.first.map { String(tag[$0]) } ?? ""
             result[String(tag[key]).lowercased()] = value
@@ -260,12 +348,14 @@ final class Previews: ObservableObject {
     }
 
     nonisolated private static func decode(_ string: String) -> String {
+        guard string.contains("&") else { return string }
         var result = string
         let named = ["&amp;": "&", "&quot;": "\"", "&#39;": "'", "&apos;": "'", "&lt;": "<", "&gt;": ">", "&nbsp;": " ",
                      "&mdash;": "—", "&ndash;": "–", "&hellip;": "…", "&rsquo;": "’", "&lsquo;": "‘", "&rdquo;": "”", "&ldquo;": "“"]
-        for (entity, character) in named { result = result.replacingOccurrences(of: entity, with: character) }
-        let numeric = try! NSRegularExpression(pattern: "&#(x?)([0-9a-fA-F]+);")
-        for match in numeric.matches(in: result, range: NSRange(result.startIndex..., in: result)).reversed() {
+        for (entity, character) in named where result.contains(entity) {
+            result = result.replacingOccurrences(of: entity, with: character)
+        }
+        for match in numericEntityRegex.matches(in: result, range: NSRange(result.startIndex..., in: result)).reversed() {
             guard let whole = Range(match.range, in: result), let digits = Range(match.range(at: 2), in: result) else { continue }
             let hex = match.range(at: 1).length > 0
             if let code = UInt32(result[digits], radix: hex ? 16 : 10), let scalar = Unicode.Scalar(code) {
@@ -302,13 +392,22 @@ final class Previews: ObservableObject {
     }
 
     nonisolated private static func firstPage(of url: URL, session: URLSession) async -> NSImage? {
-        guard let (data, _) = try? await session.data(from: url), data.count < 60_000_000, data.starts(with: Data("%PDF".utf8)) else { return nil }
+        guard let (data, _) = try? await session.data(from: url), data.count < 60_000_000,
+              data.starts(with: Data("%PDF".utf8)) || data.prefix(1024).range(of: Data("%PDF".utf8)) != nil else { return nil }
         return await Task.detached(priority: .utility) { () -> NSImage? in
             guard let page = PDFDocument(data: data)?.page(at: 0) else { return nil }
             let bounds = page.bounds(for: .cropBox)
             let width: CGFloat = 900
             return page.thumbnail(of: NSSize(width: width, height: width * bounds.height / max(bounds.width, 1)), for: .cropBox)
         }.value
+    }
+
+    /// Reads and pre-decodes an image off the main thread so the first draw never stalls scrolling.
+    nonisolated private static func decodeImage(at url: URL) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cg = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+        else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
     nonisolated static func pixelWidth(_ image: NSImage) -> Int {
@@ -351,6 +450,7 @@ enum Snapshotter {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { finish() }
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { finish() }
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { finish() }
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { finish() }
     }
 
     static func snapshot(_ url: URL) async -> NSImage? {
@@ -374,13 +474,15 @@ enum Snapshotter {
         let waiter = Waiter()
         view.navigationDelegate = waiter
         view.load(URLRequest(url: url, timeoutInterval: 15))
+        var timeout: Task<Void, Never>?
         await withCheckedContinuation { continuation in
             waiter.continuation = continuation
-            Task {
+            timeout = Task {
                 try? await Task.sleep(for: .seconds(16))
                 waiter.finish()
             }
         }
+        timeout?.cancel()
         try? await Task.sleep(for: .milliseconds(1400))
         let settings = WKSnapshotConfiguration()
         settings.rect = CGRect(x: 0, y: 0, width: 1280, height: 800)

@@ -144,15 +144,61 @@ struct Category: Codable, Identifiable, Hashable {
 
 /// Read-only helpers over the flat shelf list. Siblings keep the order they
 /// have in the flat array.
-struct ShelfTree {
+struct ShelfTree: Equatable {
     static let separator = " › "
 
+    private struct CompiledRules {
+        let paths: [String]
+        let prefixes: [String]
+        let hosts: [String]
+        let keywords: [String]
+
+        init(_ category: Category) {
+            var paths: [String] = []
+            var prefixes: [String] = []
+            var hosts: [String] = []
+            for raw in category.domains {
+                let rule = raw.trimmingCharacters(in: .whitespaces).lowercased()
+                guard !rule.isEmpty else { continue }
+                if rule.contains("/") { paths.append(rule) }
+                else if rule.hasSuffix(".") { prefixes.append(rule) }
+                else { hosts.append(rule.hasPrefix(".") ? String(rule.dropFirst()) : rule) }
+            }
+            self.paths = paths
+            self.prefixes = prefixes
+            self.hosts = hosts
+            self.keywords = category.keywords
+                .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+                .filter { !$0.isEmpty }
+        }
+
+        func matches(host: String, address: String, title: String) -> Bool {
+            for rule in hosts where host == rule || host.hasSuffix("." + rule) { return true }
+            for rule in prefixes where host.hasPrefix(rule) { return true }
+            for rule in paths where address.contains(rule) { return true }
+            for word in keywords where title.contains(word) { return true }
+            return false
+        }
+    }
+
+    private let categories: [Category]
     private let byID: [String: Category]
     private let kids: [String?: [Category]]
+    private let rules: [String: CompiledRules]
+
+    static func == (lhs: ShelfTree, rhs: ShelfTree) -> Bool {
+        lhs.categories == rhs.categories
+    }
 
     init(_ categories: [Category]) {
+        self.categories = categories
         byID = Dictionary(categories.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         kids = Dictionary(grouping: categories, by: \.parentID)
+        rules = Dictionary(categories.map { ($0.id, CompiledRules($0)) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    func matches(_ id: String, host: String, address: String, title: String) -> Bool {
+        rules[id]?.matches(host: host, address: address, title: title) ?? false
     }
 
     func shelf(_ id: String) -> Category? { byID[id] }
@@ -352,11 +398,11 @@ enum Helium {
 
 @MainActor
 final class Library: ObservableObject {
-    @Published var tabs: [BrowserTab] = []
-    @Published private(set) var categories: [Category] { didSet { tree = ShelfTree(categories) } }
+    @Published var tabs: [BrowserTab] = [] { didSet { filingCache = nil } }
+    @Published private(set) var categories: [Category] { didSet { tree = ShelfTree(categories); filingCache = nil } }
     private(set) var tree = ShelfTree([])
-    @Published private(set) var assignments: [String: String]
-    @Published private(set) var siteRules: [String: String]
+    @Published private(set) var assignments: [String: String] { didSet { filingCache = nil } }
+    @Published private(set) var siteRules: [String: String] { didSet { filingCache = nil } }
     @Published private(set) var finishedToday: Int
     /// Shelves where Claude files new tabs into sub-shelves.
     @Published private(set) var autoSortShelves: Set<String>
@@ -367,9 +413,16 @@ final class Library: ObservableObject {
     @Published private(set) var rawCount = 0
     @Published var sample = ProcessInfo.processInfo.arguments.contains("--sample")
     /// Pages saved to Read later, newest first. They outlive their Helium tabs.
-    @Published private(set) var later: [SavedSource] { didSet { laterAddresses = Set(later.map(\.address)) } }
+    @Published private(set) var later: [SavedSource] { didSet { laterAddresses = Set(later.map(\.address)); filingCache = nil } }
     /// Cached: `category(for:)` checks it for every tab on every render.
     private var laterAddresses: Set<String> = []
+    /// Memoized filing results so LibraryView redraws don't re-run every rule across every tab.
+    private struct FilingCache {
+        let byAddress: [String: Category]
+        let groups: [String: [BrowserTab]]
+        let totals: [String: Int]
+    }
+    private var filingCache: FilingCache?
     /// Agent shelves made this session, with when: they get a grace period to be filled.
     private var agentShelvesMade: [String: Date] = [:]
     /// Helium tabs this app already closed, so a later Done doesn't try again.
@@ -439,6 +492,8 @@ final class Library: ObservableObject {
                 refreshTask = nil
             }
             guard Helium.running else {
+                // Saved Read later pages outlive Helium, so keep them visible even when Helium is closed.
+                tabs = withSaved([])
                 error = "Open Helium to import its tabs."
                 return
             }
@@ -609,24 +664,43 @@ final class Library: ObservableObject {
     /// sub-shelves still hold tabs counts as used.
     private func pruneAgentShelves() {
         let used = totals(grouped()).filter { $0.value > 0 }
+        let pinned = Set(siteRules.values)
         // An agent makes a shelf, then files tabs onto it in a later step; don't prune in between.
         let settling = Set(agentShelvesMade.filter { Date.now.timeIntervalSince($0.value) < 600 }.keys)
         let stale = categories.filter { $0.isAgentMade && $0.domains.isEmpty && $0.keywords.isEmpty
+            && !pinned.contains($0.id) && !autoSortShelves.contains($0.id)
             && used[$0.id] == nil && !settling.contains($0.id) }
         stale.forEach { delete($0.id) }
     }
 
     var laterShelf: Category { categories.first { $0.isLater } ?? Category.later }
 
-    /// Read later wins, then manual picks and site rules. Otherwise top-level shelves are checked
-    /// in order, and sub-shelves are checked before their parent so the most specific shelf wins.
-    func category(for tab: BrowserTab) -> Category {
+    private func computeFiling() -> FilingCache {
+        if let filingCache { return filingCache }
+        var byAddress: [String: Category] = [:]
+        byAddress.reserveCapacity(tabs.count)
+        var groups: [String: [BrowserTab]] = [:]
+        for tab in tabs {
+            let category = resolveCategory(for: tab)
+            byAddress[tab.address] = category
+            groups[category.id, default: []].append(tab)
+        }
+        let totals = tree.totals(groups.mapValues(\.count))
+        let cache = FilingCache(byAddress: byAddress, groups: groups, totals: totals)
+        filingCache = cache
+        return cache
+    }
+
+    private func resolveCategory(for tab: BrowserTab) -> Category {
         if laterAddresses.contains(tab.address) { return laterShelf }
         if let id = assignments[tab.address], let manual = category(withID: id) { return manual }
         if let id = siteRules[tab.site], let site = category(withID: id) { return site }
+        let host = tab.host
+        let address = tab.address.lowercased()
+        let title = tab.title.lowercased()
         func deepest(_ shelf: Category) -> Category? {
             for child in tree.children(of: shelf.id) { if let hit = deepest(child) { return hit } }
-            return shelf.matches(tab) ? shelf : nil
+            return tree.matches(shelf.id, host: host, address: address, title: title) ? shelf : nil
         }
         for shelf in tree.children(of: nil) where !shelf.isBuiltIn {
             if let hit = deepest(shelf) { return hit }
@@ -634,13 +708,21 @@ final class Library: ObservableObject {
         return other
     }
 
+    /// Read later wins, then manual picks and site rules. Otherwise top-level shelves are checked
+    /// in order, and sub-shelves are checked before their parent so the most specific shelf wins.
+    func category(for tab: BrowserTab) -> Category {
+        if let hit = filingCache?.byAddress[tab.address] { return hit }
+        return resolveCategory(for: tab)
+    }
+
     /// Tabs filed directly on each shelf (not counting sub-shelves).
     func grouped() -> [String: [BrowserTab]] {
-        Dictionary(grouping: tabs) { category(for: $0).id }
+        computeFiling().groups
     }
 
     func totals(_ groups: [String: [BrowserTab]]) -> [String: Int] {
-        tree.totals(groups.mapValues(\.count))
+        if let filingCache { return filingCache.totals }
+        return tree.totals(groups.mapValues(\.count))
     }
 
     /// Non-empty shelves under `parent`: "Read later" first, then biggest first, "Unsorted" last.

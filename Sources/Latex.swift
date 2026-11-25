@@ -28,6 +28,23 @@ enum Latex {
         return base
     }()
 
+    /// Deduplicates concurrent compilations of the same equation so identical blocks
+    /// don't compile twice or race on the same temp directory.
+    private actor Flight {
+        private var tasks: [String: Task<Result<String, Failure>, Never>] = [:]
+
+        func run(_ key: String, work: @escaping @Sendable () -> Result<String, Failure>) async -> Result<String, Failure> {
+            if let existing = tasks[key] { return await existing.value }
+            let task = Task.detached(priority: .userInitiated, operation: work)
+            tasks[key] = task
+            let result = await task.value
+            tasks[key] = nil
+            return result
+        }
+    }
+
+    private static let flight = Flight()
+
     static func render(_ source: String, mode: Mode) async -> Result<String, Failure> {
         let key = SHA256.hash(data: Data(("v2" + mode.rawValue + "\u{0}" + source).utf8)).map { String(format: "%02x", $0) }.joined()
         let cached = cache.appendingPathComponent(key + ".svg")
@@ -35,8 +52,9 @@ enum Latex {
         guard let latex = tool("latex"), let dvisvgm = tool("dvisvgm") else {
             return .failure(Failure(message: "No TeX installation found."))
         }
-        return await Task.detached(priority: .userInitiated) { () -> Result<String, Failure> in
-            let work = FileManager.default.temporaryDirectory.appendingPathComponent("readingdesk-tex-" + key, isDirectory: true)
+        return await flight.run(key) {
+            if let svg = try? String(contentsOf: cached, encoding: .utf8) { return .success(svg) }
+            let work = FileManager.default.temporaryDirectory.appendingPathComponent("readingdesk-tex-" + UUID().uuidString, isDirectory: true)
             try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: work) }
             do {
@@ -56,7 +74,7 @@ enum Latex {
             if let start = svg.range(of: "<svg") { svg = String(svg[start.lowerBound...]) }
             try? svg.write(to: cached, atomically: true, encoding: .utf8)
             return .success(svg)
-        }.value
+        }
     }
 
     /// TikZ's default backend writes PostScript, which dvisvgm can't turn into SVG

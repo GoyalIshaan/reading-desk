@@ -18,9 +18,6 @@ private actor VaultFiles {
         }
     }
 
-    static let attachmentTypes: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "tif", "tiff",
-                                               "pdf", "mp3", "wav", "m4a", "ogg", "flac", "mp4", "mov", "webm"]
-
     func index(_ root: URL) throws -> (notes: [Note], attachments: [String]) {
         let directory = root.resolvingSymlinksInPath().standardizedFileURL
         let prefix = directory.path.hasSuffix("/") ? directory.path : directory.path + "/"
@@ -32,7 +29,7 @@ private actor VaultFiles {
         var attachments: [String] = []
         for case let url as URL in files {
             let ext = url.pathExtension.lowercased()
-            guard ext == "md" || Self.attachmentTypes.contains(ext),
+            guard ext == "md" || Attachments.types.contains(ext),
                   let values = try? url.resourceValues(forKeys: Set(keys)),
                   values.isRegularFile == true, values.isSymbolicLink != true else { continue }
             let location = url.resolvingSymlinksInPath().standardizedFileURL
@@ -95,7 +92,10 @@ final class Vault: ObservableObject {
     @Published private(set) var notes: [Note] = []
     @Published private(set) var attachments: [String] = []
     @Published private(set) var selection: Note?
-    @Published var text = ""
+    /// Plain (not @Published) so typing doesn't re-render DeskView/LibraryView/NotesPane on every keystroke.
+    /// External replacements (open, reload, capture, toggleTask) bump `documentVersion` instead.
+    var text = ""
+    @Published private(set) var documentVersion = 0
     /// Where the open note is in its save cycle. Was a free-form string the UI compared against.
     enum SaveState: Equatable {
         /// No note open.
@@ -120,7 +120,10 @@ final class Vault: ObservableObject {
 
     @Published private(set) var status: SaveState = .none
     @Published private(set) var error: String?
+    /// Blocks concurrent open/create/reload/switch-vault mutations.
     @Published private(set) var busy = false
+    /// Background vault enumeration (`refresh()`), kept separate from `busy` so a refresh never swallows a note click.
+    @Published private(set) var scanning = false
     @Published var showPicker = true
     @Published var preview = true
 
@@ -172,6 +175,7 @@ final class Vault: ObservableObject {
             selection = nil
             text = ""
             savedText = ""
+            documentVersion += 1
             status = .none
             error = nil
             preview = false
@@ -182,11 +186,12 @@ final class Vault: ObservableObject {
     }
 
     func refresh() async {
-        guard let root, !busy else { return }
-        busy = true
-        defer { busy = false }
+        guard let root, !scanning else { return }
+        scanning = true
+        defer { scanning = false }
         do {
             let results = try await files.index(root)
+            guard self.root == root else { return }
             notes = results.notes
             attachments = results.attachments
             if !isDirty { error = nil }
@@ -218,13 +223,14 @@ final class Vault: ObservableObject {
             text = content
             savedText = content
             selection = note
+            documentVersion += 1
             status = .saved
             error = nil
             showPicker = false
         } catch { self.error = error.localizedDescription }
     }
 
-    func create(_ title: String, source: BrowserTab?) async {
+    func create(_ title: String, source: BrowserTab?, openInPreview: Bool = false) async {
         guard let root, !busy else { return }
         busy = true
         defer { busy = false }
@@ -236,9 +242,27 @@ final class Vault: ObservableObject {
                 index.add(note.path, isSource: true, for: source.address)
                 if let key = SourceKey.key(for: source.address) { ReadingMemory.setNotePath(note.path, for: key) }
             }
-            preview = false
+            preview = openInPreview
             await read(note)
         } catch { self.error = error.localizedDescription }
+    }
+
+    /// Saves pasted files where this vault's Obsidian settings put attachments, and
+    /// returns the Markdown that embeds them in the open note.
+    func attach(_ items: [PastedAttachment]) -> String? {
+        guard let root, let selection else { return nil }
+        do {
+            let links = try items.map { item in
+                let saved = try Attachments.save(item, root: root, notePath: selection.path, existing: attachments)
+                if !attachments.contains(saved.path) { attachments.append(saved.path) }
+                return saved.link
+            }
+            error = nil
+            return links.joined(separator: "\n")
+        } catch {
+            self.error = "Couldn’t save the attachment. " + error.localizedDescription
+            return nil
+        }
     }
 
     func note(atPath path: String) -> Note? { notes.first { $0.path == path } }
@@ -271,7 +295,7 @@ final class Vault: ObservableObject {
         var note = sourceNote(for: tab)
         await settle()
         if note == nil {
-            await create(String(tab.displayTitle.prefix(120)), source: tab)
+            await create(String(tab.displayTitle.prefix(120)), source: tab, openInPreview: true)
             note = selection
         } else if let note, selection != note {
             await open(note)
@@ -281,6 +305,7 @@ final class Vault: ObservableObject {
         while let last = value.last, last.isWhitespace { value.removeLast() }
         value += (value.isEmpty ? "" : "\n\n") + block + "\n\n"
         edit(value)
+        documentVersion += 1
         if let key = SourceKey.key(for: tab.address) { ReadingMemory.setNotePath(note.path, for: key) }
         index.add(note.path, isSource: true, for: tab.address)
         preview = true
@@ -295,7 +320,7 @@ final class Vault: ObservableObject {
 
     func edit(_ value: String) {
         text = value
-        status = .editing
+        if status != .editing { status = .editing }
         autosave?.cancel()
         autosave = Task { [weak self] in
             do {
@@ -354,6 +379,7 @@ final class Vault: ObservableObject {
         let replaced = marker.dropLast(3) + (checked ? "[ ]" : "[x]")
         lines[line].replaceSubrange(range, with: replaced)
         edit(lines.joined(separator: "\n"))
+        documentVersion += 1
     }
 
     func resolve(_ link: String) -> Note? {

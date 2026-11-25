@@ -43,9 +43,14 @@ final class Room: ObservableObject {
     @Published private(set) var companion: Companion = UserDefaults.standard.string(forKey: "companion")
         .flatMap(Companion.init(rawValue:)) ?? .chatGPT
 
-    let reader = WebPage(captures: true)
+    /// One per source. A web view's back/forward history can't be cleared, so each source gets
+    /// its own, and no swipe or back button can lead to another tab (say, one marked done).
+    @Published private(set) var reader = WebPage(captures: true)
+    private var readerURL: AnyCancellable?
     /// Set while the source is a PDF, which reads in PDFKit instead of the web view.
     @Published private var pdf: OpenPaper?
+    /// In-flight PDF download/parse; cancelled when switching tabs or closing the room.
+    private var paperTask: Task<Void, Never>?
     /// The passage selected on the page right now, if any.
     @Published var excerpt: Excerpt?
     private var chats: [Companion: WebPage] = [:]
@@ -59,7 +64,6 @@ final class Room: ObservableObject {
     private var pdfFailed: Set<URL> = []
     /// The PDF being read, if any, and whether it closes when the web page moves on.
     var paper: PaperReader? { pdf?.reader }
-    private var cancellables: Set<AnyCancellable> = []
 
     /// What the right-click menu asks for; DeskView carries it out.
     enum Action { case save, ask(Companion), readLater, bibtex, contents }
@@ -67,22 +71,41 @@ final class Room: ObservableObject {
 
     var current: BrowserTab? { queue.indices.contains(index) ? queue[index] : nil }
 
-    init() {
+    init() { connectReader() }
+
+    private func connectReader() {
         reader.onCapture = { [weak self] message, webView in self?.handleCapture(message, from: webView) }
         reader.menuItems = { [weak self] in self?.menuItems() ?? [] }
+        reader.onDismissOpened = { [weak self] in self?.excerpt = nil }
         reader.onPDF = { [weak self] url in
             guard let self, self.paper?.url != url.removingFragment, !self.pdfFailed.contains(url.removingFragment) else { return }
             self.openPaper(url, followsWeb: true)
         }
-        reader.$state
+        readerURL = reader.$state
             .map(\.url)
             .removeDuplicates()
             .sink { [weak self] url in
                 guard let self, let url else { return }
                 self.excerpt = nil
-                if let pdf = self.pdf, pdf.origin == .followsWeb, url.removingFragment != pdf.reader.url { self.pdf = nil }
+                if let pdf = self.pdf, pdf.origin == .followsWeb, url.removingFragment != pdf.reader.url {
+                    self.paperTask?.cancel()
+                    self.paperTask = nil
+                    self.pdf = nil
+                }
             }
-            .store(in: &cancellables)
+    }
+
+    /// Swaps in a web page with no history. The old one is disconnected first, so nothing
+    /// it still has in flight can act on the source that replaces it.
+    private func resetReader() {
+        guard reader.state.url != nil else { return }  // never loaded, so already fresh
+        reader.onCapture = nil
+        reader.onPDF = nil
+        reader.onDismissOpened = nil
+        reader.menuItems = nil
+        reader.unload()
+        reader = WebPage(captures: true)
+        connectReader()
     }
 
     /// The address of what's on screen: the PDF, the page you navigated to, or the tab.
@@ -111,6 +134,9 @@ final class Room: ObservableObject {
 
     private func load(_ url: URL) {
         excerpt = nil
+        paperTask?.cancel()
+        paperTask = nil
+        resetReader()
         if url.looksLikePDF && !pdfFailed.contains(url.removingFragment) {
             openPaper(url, followsWeb: false)
         } else {
@@ -120,6 +146,7 @@ final class Room: ObservableObject {
     }
 
     func openPaper(_ url: URL, followsWeb: Bool) {
+        paperTask?.cancel()
         let paper = PaperReader(url: url)
         paper.onSelection = { [weak self, weak paper] partial in
             guard let self, let paper, self.paper === paper else { return }
@@ -130,12 +157,12 @@ final class Room: ObservableObject {
 
         excerpt = nil
         pdf = OpenPaper(reader: paper, origin: followsWeb ? .followsWeb : .opened)
-        Task {
+        paperTask = Task { [weak self] in
             await paper.load()
-            guard paper.failure != nil, self.paper === paper else { return }
-            pdfFailed.insert(paper.url)
-            pdf = nil
-            if !followsWeb { reader.load(url) }
+            guard !Task.isCancelled, let self, paper.failure != nil, self.paper === paper else { return }
+            self.pdfFailed.insert(paper.url)
+            self.pdf = nil
+            if !followsWeb { self.reader.load(url) }
         }
     }
 
@@ -161,6 +188,8 @@ final class Room: ObservableObject {
         guard let target = arxivSwitch else { return }
         if target.pdf { openPaper(target.url, followsWeb: false) }
         else {
+            paperTask?.cancel()
+            paperTask = nil
             pdf = nil
             excerpt = nil
             if reader.state.url.flatMap(SourceKey.arxivID) == nil || reader.state.url?.path.hasPrefix("/pdf") == true {
@@ -269,6 +298,13 @@ final class Room: ObservableObject {
         UserDefaults.standard.set(mode.rawValue, forKey: "companion")
     }
 
+    /// Read-only lookup for SwiftUI view rendering (never mutates state during `body`).
+    func existingChat(for mode: Companion) -> WebPage? {
+        mode == .notes ? nil : chats[mode]
+    }
+
+    /// Ensures the chat web page for `mode` is loaded, keeping at most `liveChats` live processes.
+    @discardableResult
     func chat(for mode: Companion) -> WebPage? {
         guard mode != .notes else { return nil }
         chatOrder.removeAll { $0 == mode }
@@ -291,12 +327,15 @@ final class Room: ObservableObject {
     func sleep() {
         guard !asleep else { return }
         asleep = true
+        ReadingMemory.flush()
+        paperTask?.cancel()
+        paperTask = nil
         excerpt = nil
         pdf = nil
         for page in chats.values { page.view.stopLoading() }
         chats = [:]
         chatOrder = []
-        reader.unload()
+        resetReader()
     }
 
     func toggleNotes() {
@@ -350,6 +389,7 @@ struct DeskView: View {
     @State private var sleepTask: Task<Void, Never>?
     @State private var draggedFraction: Double?
     @State private var dividerHovered = false
+    @State private var dividerCursorPushed = false
     @State private var selectedCategory: String?
     /// Library ↔ reader. `reading` and `revealed` are read off this, so they can't disagree.
     @State private var phase: RoomPhase = .library
@@ -399,11 +439,12 @@ struct DeskView: View {
             LibraryView(library: library, previews: previews, notes: vault.index, selectedCategory: $selectedCategory,
                         closeInHelium: closeInHelium, titleBarHeight: titleBarHeight, open: open)
                 .opacity(reading && revealed ? 0 : 1)
-                .allowsHitTesting(!reading)
-                .disabled(reading)
+                .allowsHitTesting(!reading && !paletteOpen)
+                .disabled(reading || paletteOpen)
                 .accessibilityHidden(reading)
             if reading, let source = room.current {
                 roomView(source)
+                    .disabled(paletteOpen)
             }
             if paletteOpen {
                 CommandPalette(library: library, previews: previews,
@@ -751,19 +792,26 @@ struct DeskView: View {
         }
     }
 
-    private func closeRoom() {
+    private func closeRoom(immediate: Bool = false) {
         if !library.sample { ReadingMemory.session = nil }
+        ReadingMemory.flush()
         room.excerpt = nil
         openTask?.cancel()
         transition += 1
         let id = transition
-        withAnimation(.easeOut(duration: 0.16)) { phase = .leaving(id) }
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(170))
-            guard phase == .leaving(id) else { return }
+        if immediate {
             var instant = Transaction()
             instant.disablesAnimations = true
             withTransaction(instant) { phase = .library }
+        } else {
+            withAnimation(.easeOut(duration: 0.16)) { phase = .leaving(id) }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(170))
+                guard phase == .leaving(id) else { return }
+                var instant = Transaction()
+                instant.disablesAnimations = true
+                withTransaction(instant) { phase = .library }
+            }
         }
         previews.paused = false
         sleepTask?.cancel()
@@ -786,7 +834,7 @@ struct DeskView: View {
             showToast("Done · \(room.queue.count) left on this shelf")
         } else {
             selectedCategory = nil
-            closeRoom()
+            closeRoom(immediate: true)
             showToast("Shelf finished.")
         }
     }
@@ -829,7 +877,7 @@ struct DeskView: View {
                         Group {
                             if room.companion == .notes {
                                 NotesPane(vault: vault, renderer: renderer, index: vault.index, source: source)
-                            } else if let page = room.chat(for: room.companion) {
+                            } else if let page = room.existingChat(for: room.companion) {
                                 BrowserPane(page: page, showsChrome: false).id(room.companion)
                             }
                         }
@@ -853,7 +901,7 @@ struct DeskView: View {
     /// The page (or PDF), with the Save / Ask bar floating over whatever you've selected.
     private var readerPane: some View {
         ZStack {
-            BrowserPane(page: room.reader, showsChrome: false)
+            BrowserPane(page: room.reader, showsChrome: false).id(ObjectIdentifier(room.reader))
             if let paper = room.paper {
                 PaperPane(paper: paper).id(ObjectIdentifier(paper))
             }
@@ -892,8 +940,16 @@ struct DeskView: View {
             ShortcutButton("Next tab", .rightArrow, [.command, .option]) { room.go(to: room.index + 1) }
             ShortcutButton("Done", "d", [.command, .shift]) { finish() }
             ShortcutButton("Toggle notes", "n", [.command, .shift]) { room.toggleNotes() }
-            ShortcutButton("Page back", "[") { room.reader.view.goBack() }
-            ShortcutButton("Page forward", "]") { room.reader.view.goForward() }
+            ShortcutButton("Page back", "[") {
+                if let active = room.reader.openedPage ?? (room.paper == nil ? room.reader : nil) {
+                    active.view.goBack()
+                }
+            }
+            ShortcutButton("Page forward", "]") {
+                if let active = room.reader.openedPage ?? (room.paper == nil ? room.reader : nil) {
+                    active.view.goForward()
+                }
+            }
             ShortcutButton("Copy link", "c", [.command, .shift]) {
                 room.copyLink()
                 showToast("Link copied")
@@ -901,6 +957,16 @@ struct DeskView: View {
             ForEach(Array(Companion.allCases.enumerated()), id: \.element) { offset, mode in
                 ShortcutButton(mode.rawValue, KeyEquivalent(Character("\(offset + 1)")), [.command, .option]) { room.choose(mode) }
             }
+        }
+    }
+
+    private func updateDividerCursor(active: Bool) {
+        if active && !dividerCursorPushed {
+            NSCursor.resizeLeftRight.push()
+            dividerCursorPushed = true
+        } else if !active && dividerCursorPushed {
+            NSCursor.pop()
+            dividerCursorPushed = false
         }
     }
 
@@ -913,14 +979,19 @@ struct DeskView: View {
             .contentShape(Rectangle())
             .onHover { inside in
                 withAnimation(.easeOut(duration: 0.12)) { dividerHovered = inside }
-                if inside { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                updateDividerCursor(active: inside || draggedFraction != nil)
             }
             .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("split"))
-                .onChanged { draggedFraction = min(max((Double($0.location.x) - 3.5) / width, minimum), maximum) }
+                .onChanged {
+                    draggedFraction = min(max((Double($0.location.x) - 3.5) / width, minimum), maximum)
+                    updateDividerCursor(active: true)
+                }
                 .onEnded { _ in
                     if let draggedFraction { readerFraction = draggedFraction }
                     draggedFraction = nil
+                    updateDividerCursor(active: dividerHovered)
                 })
+            .onDisappear { updateDividerCursor(active: false) }
             .onTapGesture(count: 2) { readerFraction = 0.62 }
             .help("Drag to resize · double-click to reset")
             .accessibilityLabel("Resize reading panes")
@@ -935,7 +1006,7 @@ struct DeskView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 0) {
                 CompanionTabs(selection: room.companion, index: vault.index, address: room.current?.address ?? "") { room.choose($0) }
-                if room.companion != .notes, let page = room.chat(for: room.companion) {
+                if room.companion != .notes, let page = room.existingChat(for: room.companion) {
                     ChatControls(page: page).padding(.top, -6)
                 }
             }
@@ -993,7 +1064,11 @@ struct DeskView: View {
         guard dockMonitor == nil else { return }
         NSApp.windows.forEach { $0.acceptsMouseMovedEvents = true }
         dockMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { event in
-            guard let content = event.window?.contentView else { return event }
+            if paletteOpen || editingShelves {
+                if dockHover { dockHover = false }
+                return event
+            }
+            guard let window = event.window, window === NSApp.mainWindow, let content = window.contentView else { return event }
             let point = event.locationInWindow
             let y = content.bounds.height - point.y
             let pane = readerRect
@@ -1133,12 +1208,13 @@ private struct ReaderDock: View {
             }
             DeskIcon(saved ? "bookmark.fill" : "bookmark", help: saved ? "On Read later" : "Read later", action: readLater)
                 .foregroundStyle(saved ? Theme.accent : Theme.ink3)
+            if full { separator }
+            // The narrow dock keeps these once there's history, so you can always get back.
+            if paper == nil && (full || page.state.back || page.state.forward) {
+                DeskIcon("arrow.uturn.left", help: "Page back (⌘[)") { page.view.goBack() }.disabled(!page.state.back)
+                DeskIcon("arrow.uturn.right", help: "Page forward (⌘])") { page.view.goForward() }.disabled(!page.state.forward)
+            }
             if full {
-                separator
-                if paper == nil {
-                    DeskIcon("arrow.uturn.left", help: "Page back (⌘[)") { page.view.goBack() }.disabled(!page.state.back)
-                    DeskIcon("arrow.uturn.right", help: "Page forward (⌘])") { page.view.goForward() }.disabled(!page.state.forward)
-                }
                 DeskIcon("link", help: "Copy link (⇧⌘C)", action: copyLink)
                 if let url {
                     DeskIcon("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
@@ -1381,6 +1457,10 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        ReadingMemory.flush()
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let vault, vault.isDirty else { return .terminateNow }
         Task {
@@ -1426,6 +1506,13 @@ struct ReadingDeskApp: App {
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                 Divider()
                 Button("Refresh Helium Tabs") { library.refresh() }.keyboardShortcut("r", modifiers: [.command, .shift])
+            }
+            // Sent down the responder chain, so they act on whichever note editor has focus.
+            CommandMenu("Format") {
+                ForEach(TextFormat.allCases) { format in
+                    Button(format.title) { format.send() }
+                        .keyboardShortcut(format.shortcut)
+                }
             }
         }
     }

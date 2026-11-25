@@ -212,6 +212,8 @@ div.math-error { display: block; padding: 10px 12px; margin: 0.6em 0; }
 /* ---------- Live preview ---------- */
 #live { min-height: 50vh; }
 .lblock { cursor: text; position: relative; }
+.lblock.drag-sel { background: rgba(var(--accent-rgb), 0.22); }
+u { text-underline-offset: 3px; }
 .lblock > *:last-child { margin-bottom: 0; }
 .lblock.gend { margin-bottom: 1em; }
 .lblock-pline > p { margin: 0; }

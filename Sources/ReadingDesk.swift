@@ -23,6 +23,8 @@ final class Room: ObservableObject {
     @Published private(set) var queue: [BrowserTab] = []
     @Published private(set) var index = 0
     @Published private(set) var categoryID = Category.otherID
+    /// Kept in case the shelf gets deleted while we're reading it.
+    private(set) var shelfName = ""
     @Published private(set) var companion: Companion = UserDefaults.standard.string(forKey: "companion")
         .flatMap(Companion.init(rawValue:)) ?? .chatGPT
 
@@ -31,11 +33,12 @@ final class Room: ObservableObject {
 
     var current: BrowserTab? { queue.indices.contains(index) ? queue[index] : nil }
 
-    func start(_ tabs: [BrowserTab], at first: BrowserTab, in categoryID: String) {
+    func start(_ tabs: [BrowserTab], at first: BrowserTab, in categoryID: String, named shelfName: String) {
         let next = tabs.filter { $0.readableURL != nil }
         guard let index = next.firstIndex(of: first) else { return }
         let canKeepPage = current == first
         self.categoryID = categoryID
+        self.shelfName = shelfName
         queue = next
         if canKeepPage { self.index = index }
         else { go(to: index) }
@@ -123,6 +126,11 @@ struct DeskView: View {
     @State private var dockFlashTask: Task<Void, Never>?
     @State private var dockMonitor: Any?
     @State private var bridge: DeskBridge?
+    /// Only one Claude sort runs at a time.
+    @State private var organizing = false
+    /// URLs already sent to auto-sort this session, so leftovers aren't re-sent.
+    @State private var autoSortTried: Set<String> = []
+    @State private var autoSortFailures: [String: (count: Int, until: Date)] = [:]
 
     private var dockVisible: Bool { dockHover || dockFlash || showingQueue }
     private var titleBarHeight: CGFloat { fullscreen ? 0 : 28 }
@@ -224,12 +232,15 @@ struct DeskView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             if !reading && library.loaded { library.refresh() }
         }
+        .onChange(of: library.tabs) { _, _ in autoSortIfNeeded() }
+        .onChange(of: library.autoSortShelves) { _, _ in autoSortIfNeeded() }
         .onReceive(NotificationCenter.default.publisher(for: .openPalette)) { _ in
             withAnimation(.easeOut(duration: 0.14)) { paletteOpen.toggle() }
         }
         .onReceive(Timer.publish(every: 45, on: .main, in: .common).autoconnect()) { _ in
             // Keep the library in step with Helium while it's on screen.
             if !reading && library.loaded && NSApp.isActive { library.refresh() }
+            autoSortIfNeeded()  // retry shelves whose backoff has expired
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in fullscreen = true }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in fullscreen = false }
@@ -245,13 +256,67 @@ struct DeskView: View {
         case .allShelves: showShelf(nil)
         case .refresh: library.refresh()
         case .editShelves: editingShelves = true
+        case .organize: organizeShelf()
         case .toggleFullscreen: fullscreenOnOpen.toggle()
         case .toggleCloseInHelium: closeInHelium.toggle()
         }
     }
 
+    /// ⇧⌘P → "Sort this shelf…": sorts the shelf on screen, or the one being read.
+    private func organizeShelf() {
+        guard !organizing else { return showToast("Claude is still sorting a shelf…") }
+        let id = reading ? room.categoryID : selectedCategory
+        guard let id, let shelf = library.category(withID: id), !shelf.isOther else {
+            return showToast("Open a shelf first, then sort it.")
+        }
+        organizing = true
+        showToast("Claude is sorting \(shelf.name)…", for: nil)
+        bridge?.flush()
+        Task {
+            let outcome = await ShelfAgent.organize(shelfID: id)
+            organizing = false
+            showToast(outcome.message, for: 5)
+            autoSortIfNeeded()
+        }
+    }
+
+    /// After a refresh, send new tabs on auto-sort shelves to Claude, one shelf at a time.
+    /// A shelf that keeps failing backs off (10 min, 20 min) and gives up after 3 tries.
+    private func autoSortIfNeeded() {
+        let maxNewShelves = 2, maxFailures = 3, backoff: TimeInterval = 600
+        guard !organizing, !library.sample, !library.autoSortShelves.isEmpty else { return }
+        let groups = library.grouped()
+        for entry in library.tree.flattened() where library.autoSortShelves.contains(entry.category.id) {
+            let shelf = entry.category
+            let failure = autoSortFailures[shelf.id]
+            if let failure, failure.count >= maxFailures || failure.until > .now { continue }
+            let fresh = (groups[shelf.id] ?? []).map(\.address).filter { !autoSortTried.contains($0) }
+            guard !shelf.isOther, !library.tree.children(of: shelf.id).isEmpty, !fresh.isEmpty else { continue }
+            autoSortTried.formUnion(fresh)
+            organizing = true
+            bridge?.flush()
+            Task {
+                let outcome = await ShelfAgent.organize(shelfID: shelf.id, maxNew: maxNewShelves, urls: fresh)
+                organizing = false
+                if outcome.succeeded {
+                    autoSortFailures[shelf.id] = nil
+                    if outcome.filedAny { showToast(outcome.message, for: 4) }
+                } else {
+                    let count = (failure?.count ?? 0) + 1
+                    autoSortFailures[shelf.id] = (count, .now.addingTimeInterval(backoff * Double(count)))
+                    autoSortTried.subtract(fresh)
+                    showToast(count >= maxFailures ? "Auto-sort for \(shelf.name) is off until you reopen the app: \(outcome.message)"
+                                         : "Auto-sort for \(shelf.name) paused: \(outcome.message)", for: 6)
+                }
+                autoSortIfNeeded()  // next shelf, if any
+            }
+            return
+        }
+    }
+
     private func open(_ categoryID: String, _ tab: BrowserTab?, _ origin: CGRect?) {
-        let tabs = library.tabs.filter { library.category(for: $0).id == categoryID }
+        // Includes sub-shelves, in the same order as the library page.
+        let tabs = library.orderedTabs(in: categoryID)
         guard let first = tab ?? tabs.first(where: { $0.readableURL != nil }) else { return }
         guard first.readableURL != nil else {
             if !library.sample {
@@ -262,7 +327,7 @@ struct DeskView: View {
             }
             return
         }
-        room.start(tabs, at: first, in: categoryID)
+        room.start(tabs, at: first, in: categoryID, named: library.pathName(of: categoryID))
         if room.companion != .notes { _ = room.chat(for: room.companion) }
         previews.paused = true
         transition += 1
@@ -334,11 +399,13 @@ struct DeskView: View {
         }
     }
 
-    private func showToast(_ message: String) {
+    /// Pass `seconds: nil` to keep the toast up until the next one replaces it.
+    private func showToast(_ message: String, for seconds: Double? = 2.2) {
         toastTask?.cancel()
         withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) { toast = message }
+        guard let seconds else { return }
         toastTask = Task {
-            try? await Task.sleep(for: .seconds(2.2))
+            try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.25)) { toast = nil }
         }
@@ -385,7 +452,7 @@ struct DeskView: View {
                 HStack(spacing: 0) {
                     BrowserPane(page: room.reader, showsChrome: false)
                         .frame(width: CGFloat(width * fraction))
-                        .overlay(alignment: .bottom) { dock(category).padding(.bottom, 18) }
+                        .overlay(alignment: .bottom) { dock().padding(.bottom, 18) }
                         .opacity(revealed ? 1 : 0)
                     divider(fraction: fraction, width: width, minimum: minimum, maximum: maximum)
                         .opacity(revealed ? 1 : 0)
@@ -479,8 +546,10 @@ struct DeskView: View {
 
     // MARK: Floating dock
 
-    private func dock(_ category: Category) -> some View {
-        ReaderDock(page: room.reader, shelf: category.name, index: room.index, count: room.queue.count,
+    private func dock() -> some View {
+        // Fall back to the saved name if the shelf was deleted while reading.
+        let shelf = library.category(withID: room.categoryID) == nil ? room.shelfName : library.pathName(of: room.categoryID)
+        return ReaderDock(page: room.reader, shelf: shelf, index: room.index, count: room.queue.count,
                    closeInHelium: closeInHelium, showingQueue: $showingQueue,
                    back: { closeRoom() },
                    previous: { room.go(to: room.index - 1) },

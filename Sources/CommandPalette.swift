@@ -30,13 +30,15 @@ struct CommandPalette: View {
     @FocusState private var focused: Bool
 
     enum Command: String, CaseIterable {
-        case allShelves, refresh, editShelves, toggleFullscreen, toggleCloseInHelium
+        case allShelves, refresh, editShelves, organize, toggleFullscreen, toggleCloseInHelium
 
         var label: (title: String, symbol: String, keywords: String) {
             switch self {
             case .allShelves: ("Show all shelves", "square.grid.2x2", "everything back library")
             case .refresh: ("Refresh Helium tabs", "arrow.clockwise", "reload import update")
             case .editShelves: ("Edit shelves and filing rules", "books.vertical", "manage categories autofiling")
+            case .organize: ("Sort this shelf into sub-shelves with Claude", "wand.and.stars",
+                             "agent ai organize file categorize subshelves nested auto")
             case .toggleFullscreen: ("Enter full screen when reading", "arrow.up.left.and.arrow.down.right", "fullscreen settings reading options")
             case .toggleCloseInHelium: ("Close Helium tabs when marked done", "xmark.circle", "keep tabs open settings reading options")
             }
@@ -44,7 +46,8 @@ struct CommandPalette: View {
     }
 
     struct Item: Identifiable {
-        enum Kind { case command(Command), shelf(Category, count: Int), tab(BrowserTab, Category) }
+        /// `path` / `shelf` hold the full shelf path, e.g. "Parent › Child".
+        enum Kind { case command(Command), shelf(Category, path: String, count: Int), tab(BrowserTab, shelf: String) }
         enum Section { case commands, shelves, tabs }
         let kind: Kind
         var words: Set<String> = []
@@ -54,7 +57,7 @@ struct CommandPalette: View {
         var id: String {
             switch kind {
             case .command(let command): "command:" + command.rawValue
-            case .shelf(let category, _): "shelf:" + category.id
+            case .shelf(let category, _, _): "shelf:" + category.id
             case .tab(let tab, _): "tab:" + tab.id
             }
         }
@@ -78,7 +81,7 @@ struct CommandPalette: View {
             return [
                 .title: tab.displayTitle,
                 .site: tab.site + " " + (preview?.siteName ?? ""),
-                .shelf: library.category(for: tab).name,
+                .shelf: library.pathName(of: library.category(for: tab).id),
                 .address: path,
                 .summary: preview?.summary ?? "",
                 .body: preview?.text ?? "",
@@ -104,22 +107,25 @@ struct CommandPalette: View {
             }
             return Item(kind: .command(command), detail: detail)
         }
-        let groups = library.grouped()
-        let shelves = library.categories.compactMap { category -> Item? in
-            let count = groups[category.id]?.count ?? 0
-            return count > 0 ? Item(kind: .shelf(category, count: count)) : nil
+        // Non-empty shelves in tree order; counts include sub-shelves.
+        let totals = library.totals(library.grouped())
+        let shelves = library.tree.flattened().compactMap { row -> Item? in
+            let count = totals[row.category.id] ?? 0
+            return count > 0 ? Item(kind: .shelf(row.category, path: library.pathName(of: row.category.id), count: count)) : nil
+        }
+        func tabItem(_ tab: BrowserTab) -> CommandPalette.Item.Kind {
+            .tab(tab, shelf: library.pathName(of: library.category(for: tab).id))
         }
         if trimmed.isEmpty {
-            results = shelves + commands + indexedTabs.prefix(40).map { Item(kind: .tab($0, library.category(for: $0))) }
+            results = shelves + commands + indexedTabs.prefix(40).map { Item(kind: tabItem($0)) }
         } else {
             let matchingShelves = shelves.filter { item in
-                guard case .shelf(let category, _) = item.kind else { return false }
-                let words = SearchIndex.words(in: category.name)
+                guard case .shelf(_, let path, _) = item.kind else { return false }
+                let words = SearchIndex.words(in: path)
                 return terms.allSatisfy { term in words.contains { $0.hasPrefix(term) } }
             }
             let tabs = index.search(trimmed).map { hit -> Item in
-                let tab = indexedTabs[hit.index]
-                return Item(kind: .tab(tab, library.category(for: tab)), words: hit.words, snippet: hit.snippet)
+                Item(kind: tabItem(indexedTabs[hit.index]), words: hit.words, snippet: hit.snippet)
             }
             results = commands + Array(matchingShelves.prefix(3)) + tabs
         }
@@ -326,7 +332,7 @@ struct CommandPalette: View {
             close()
             performCommand(command)
             return
-        case .shelf(let category, _):
+        case .shelf(let category, _, _):
             openShelf(category.id)
         case .tab(let tab, _):
             if inHelium, let url = tab.readableURL { Helium.open(url) } else { openTab(tab) }
@@ -359,15 +365,15 @@ private struct PaletteRow: View, Equatable {
                 if let detail = item.detail {
                     Text(detail).font(Theme.sans(12)).foregroundStyle(Theme.ink3)
                 }
-            case .shelf(let category, let count):
+            case .shelf(let category, let path, let count):
                 Image(systemName: category.symbol)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(selected ? Theme.accent : Theme.ink3)
                     .frame(width: 18, height: 18)
-                Text(category.name).font(Theme.sans(13.5, .medium)).foregroundStyle(Theme.ink).lineLimit(1)
+                Text(Self.shelfPath(path)).lineLimit(1).truncationMode(.head)
                 Spacer(minLength: 8)
                 Text("\(count)").font(Theme.sans(12).monospacedDigit()).foregroundStyle(Theme.ink3)
-            case .tab(let tab, let category):
+            case .tab(let tab, let shelf):
                 Favicon(icon: icon, site: tab.sourceName, size: 18)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(Self.marked(tab.displayTitle, item.words, size: 13.5, base: Theme.ink))
@@ -380,13 +386,27 @@ private struct PaletteRow: View, Equatable {
                 if tab.active {
                     Circle().fill(Theme.accent).frame(width: 5, height: 5).help("Active in Helium")
                 }
-                Text(category.name).font(Theme.sans(11.5)).foregroundStyle(Theme.ink4).lineLimit(1).fixedSize()
+                Text(shelf).font(Theme.sans(11.5)).foregroundStyle(Theme.ink4).lineLimit(1).fixedSize()
             }
         }
         .padding(.horizontal, 10)
         .frame(height: item.section == .tabs ? 46 : 34)
         .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(selected ? Theme.raised : .clear))
         .contentShape(Rectangle())
+    }
+
+    /// Shelf path with the parent levels dimmed.
+    static func shelfPath(_ path: String) -> AttributedString {
+        let parts = path.components(separatedBy: ShelfTree.separator)
+        var result = AttributedString()
+        for (index, part) in parts.enumerated() {
+            let last = index == parts.count - 1
+            var piece = AttributedString(last ? part : part + ShelfTree.separator)
+            piece.font = Theme.sans(13.5, .medium)
+            piece.foregroundColor = last ? Theme.ink : Theme.ink3
+            result += piece
+        }
+        return result
     }
 
     /// Geist text with the words the search matched brightened in the accent.

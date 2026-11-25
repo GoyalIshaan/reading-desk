@@ -49,9 +49,22 @@ Open it normally afterward to import your Helium tabs.
 - Press **⇧⌘P** to search tabs and shelves or run commands such as **Refresh Helium tabs** and **Edit shelves and filing rules**.
 - Cards can show a preview image, site icon, description, and estimated reading time. Some papers and PDFs show a first-page preview. Login-gated sites can show a plain cover.
 - Hover a card for actions. **Move to shelf** files that tab once. **Always file … in…** creates a rule for the site.
-- Shelves are checked in order. A tab goes into the first shelf that matches a site rule or title keyword. Move a shelf earlier to give its rules priority.
+- Top-level shelves are checked in order. A tab goes into the first one that matches a site rule or title keyword. Move a shelf earlier to give its rules priority. Inside a shelf, its sub-shelves are checked before the shelf itself; see [Nested shelves](#nested-shelves).
 - Hover near the bottom of the reading pane to show the reading controls. You can move between tabs, open the shelf’s tab list, go back or forward on the site, or copy the current link.
 - **Done** (**⇧⌘D**) marks the current item read and advances to the next tab. **It also closes matching Helium tabs, including duplicate tabs for that URL, by default.** If you want to keep your Helium tabs open, press **⇧⌘P** and turn off **Close Helium tabs when marked done**.
+
+## Nested shelves
+
+A shelf can hold sub-shelves, for example **AI research** containing **Pre-training**, **Post-training**, **Architecture**, and **Infra & systems**.
+
+- **Create one:** press **⇧⌘P** and open **Edit shelves and filing rules**. Select a shelf and click **New sub-shelf**, or set the **Inside** menu on any existing shelf.
+- **Browse:** the big names at the top show only top-level shelves, and their counts include every sub-shelf. Select a shelf that has sub-shelves to see them in a smaller row below. A parent's page shows a section for each sub-shelf, then **Unsorted in …** for tabs filed on the parent itself. Press **⌘[** or click the **↑** link to go up a level.
+- **Read:** **Begin reading** or **Read shelf** on a parent queues every tab inside it, in the order the page shows them.
+- **Filing:** top-level shelves are still checked in order. Within a shelf, its sub-shelves are checked first, so a tab lands on the deepest shelf that matches. **Move to shelf** and **Always file … in** can point at a shelf at any level.
+- **Reorganize:** **Earlier** and **Later** move a shelf among the shelves at its own level. Deleting a shelf moves its sub-shelves up one level. **Everything else** can't be nested or hold sub-shelves.
+- **Let Claude sort a shelf:** open the shelf, press **⇧⌘P**, and run **Sort this shelf into sub-shelves with Claude**. Claude groups the tabs filed directly on that shelf into topic sub-shelves, creating any it needs. This needs [Claude Code](https://claude.com/claude-code) installed and signed in. From Terminal, `hooks/reading-desk organize --shelf "AI research" --dry-run` shows the plan without changing anything.
+- **Sort new tabs automatically:** in **Edit shelves**, select a shelf that has sub-shelves and turn on **Sort new tabs into sub-shelves automatically**. After each refresh, only the tabs newly landed directly on that shelf go to Claude, which files each one into a sub-shelf by what it's about. It prefers your sub-shelves and adds at most 2 new ones per run. A tab Claude leaves on the shelf isn't sent again until you reopen the app. If Claude Code fails on a shelf, for example because you're signed out, that shelf pauses for 10 minutes, then 20, and stops after 3 failures until you reopen the app. Sample data (`--sample`) is never auto-sorted.
+- **From scripts:** `hooks/reading-desk ensure-shelf "Post-training" --parent "AI research"`. Anywhere the CLI takes a shelf, you can give a path such as `"AI research › Post-training"`. See the [bridge README](hooks/README.md).
 
 ## Sign in to websites and assistants
 
@@ -76,7 +89,7 @@ If the same note changes on disk while you’re editing it, Reading Desk shows a
 | --- | --- |
 | ⇧⌘P | Search tabs and shelves or run a command |
 | ⇧⌘R | Refresh Helium tabs |
-| ⌘[ | Return to all shelves from the library, or go back on the current webpage while reading |
+| ⌘[ | Go up one shelf level in the library (to all shelves from a top-level shelf), or go back on the current webpage while reading |
 | ⌘] | Go forward on the current webpage |
 | ⌘↩ | Begin reading the current shelf, or open the selected tab in Helium from the command palette |
 | ⇧⌘[ | Return to the library from the reading pane |

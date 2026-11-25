@@ -23,15 +23,6 @@ struct LibraryView: View {
         }
     }
 
-    private func shelves(_ groups: [String: [BrowserTab]]) -> [Category] {
-        library.categories
-            .filter { !(groups[$0.id]?.isEmpty ?? true) }
-            .sorted { lhs, rhs in
-                if lhs.isOther != rhs.isOther { return rhs.isOther }
-                return (groups[lhs.id]?.count ?? 0) > (groups[rhs.id]?.count ?? 0)
-            }
-    }
-
     private func readingTime(_ tabs: [BrowserTab]) -> String? {
         let minutes = tabs.compactMap { previews.info[$0.address]?.minutes }.reduce(0, +)
         guard minutes > 0 else { return nil }
@@ -40,7 +31,8 @@ struct LibraryView: View {
 
     var body: some View {
         let groups = library.grouped()
-        let ordered = shelves(groups)
+        let totals = library.totals(groups)
+        let ordered = library.visibleChildren(of: nil, totals: totals)
         let shared = boilerplate
         let selected = selectedCategory.flatMap(library.category(withID:))
         GeometryReader { geometry in
@@ -58,23 +50,38 @@ struct LibraryView: View {
                         }
                         .padding(.bottom, 8)
                     }
-                    masthead(ordered, groups: groups)
+                    masthead(ordered, totals: totals)
                         .padding(.top, 30)
                     Hairline().padding(.top, 22)
                     if library.tabs.isEmpty {
                         empty.padding(.top, 60)
                     } else if let selected {
-                        let tabs = matching(groups[selected.id] ?? [])
-                        summary(tabs, category: selected).padding(.vertical, 18)
-                        grid(tabs, columns: columns, width: columnWidth, shared: shared)
+                        let children = library.visibleChildren(of: selected.id, totals: totals)
+                        let all = matching(library.orderedTabs(in: selected.id, groups: groups, totals: totals))
+                        summary(all, category: selected).padding(.vertical, 18)
+                        if children.isEmpty {
+                            grid(all, columns: columns, width: columnWidth, shared: shared, readIn: selected.id, labelFrom: selected.id)
+                        } else {
+                            // One section per sub-shelf, then whatever is filed on the parent itself.
+                            ForEach(Array(children.enumerated()), id: \.element.id) { index, child in
+                                section(child, tabs: matching(library.orderedTabs(in: child.id, groups: groups, totals: totals)),
+                                        index: index, readIn: selected.id, columns: columns, width: columnWidth, shared: shared)
+                            }
+                            let direct = matching(groups[selected.id] ?? [])
+                            if !direct.isEmpty {
+                                section(selected, title: "Unsorted in \(selected.name)", tabs: direct, index: children.count,
+                                        readIn: selected.id, columns: columns, width: columnWidth, shared: shared)
+                            }
+                        }
                     } else if !query.isEmpty {
                         let tabs = matching(library.tabs)
                         summary(tabs, category: nil).padding(.vertical, 18)
-                        grid(tabs, columns: columns, width: columnWidth, shared: shared)
+                        grid(tabs, columns: columns, width: columnWidth, shared: shared, readIn: nil, labelFrom: nil)
                     } else {
                         summary(library.tabs, category: nil).padding(.vertical, 18)
                         ForEach(Array(ordered.enumerated()), id: \.element.id) { index, category in
-                            section(category, tabs: groups[category.id] ?? [], index: index, columns: columns, width: columnWidth, shared: shared)
+                            section(category, tabs: library.orderedTabs(in: category.id, groups: groups, totals: totals), index: index,
+                                    readIn: category.id, columns: columns, width: columnWidth, shared: shared)
                         }
                     }
                 }
@@ -93,8 +100,19 @@ struct LibraryView: View {
         }
         .background(Theme.ground)
         .background {
-            ShortcutButton("All shelves", "[") { select(nil) }
+            ShortcutButton("Up one level", "[") { goUp() }
         }
+        .onChange(of: library.categories) { old, new in
+            // If the open shelf was deleted, fall back to its parent.
+            guard let id = selectedCategory, !new.contains(where: { $0.id == id }) else { return }
+            let parent = old.first { $0.id == id }?.parentID
+            selectedCategory = parent.flatMap { parent in new.contains { $0.id == parent } ? parent : nil }
+        }
+    }
+
+    /// ⌘[ goes up one level.
+    private func goUp() {
+        select(selectedCategory.flatMap { library.category(withID: $0)?.parentID })
     }
 
     /// Where the library came from, so it's never a mystery.
@@ -125,19 +143,46 @@ struct LibraryView: View {
               : "")
     }
 
-    /// The shelf index: big Garamond words with superscript counts.
-    private func masthead(_ ordered: [Category], groups: [String: [BrowserTab]]) -> some View {
-        FlowLayout(spacing: 30, lineSpacing: 2) {
-            ShelfWord(name: "Everything", count: library.tabs.count, selected: selectedCategory == nil) { select(nil) }
-            ForEach(ordered) { category in
-                ShelfWord(name: category.name, count: groups[category.id]?.count ?? 0,
-                          selected: selectedCategory == category.id) { select(category.id) }
+    /// The shelf index: big Garamond words with superscript counts, plus a smaller
+    /// row of sub-shelves for each level of the current selection.
+    private func masthead(_ ordered: [Category], totals: [String: Int]) -> some View {
+        let path = selectedCategory.map { library.tree.path(of: $0) } ?? []
+        let rows = path.enumerated().compactMap { depth, shelf -> (parent: Category, children: [Category], selected: String?)? in
+            let children = library.visibleChildren(of: shelf.id, totals: totals)
+            guard !children.isEmpty else { return nil }
+            return (shelf, children, path.indices.contains(depth + 1) ? path[depth + 1].id : nil)
+        }
+        return VStack(alignment: .leading, spacing: 0) {
+            FlowLayout(spacing: 30, lineSpacing: 2) {
+                ShelfWord(name: "Everything", count: library.tabs.count, selected: selectedCategory == nil) { select(nil) }
+                ForEach(ordered) { category in
+                    ShelfWord(name: category.name, count: totals[category.id] ?? 0,
+                              selected: path.first?.id == category.id) { select(category.id) }
+                }
+            }
+            ForEach(Array(rows.enumerated()), id: \.element.parent.id) { level, row in
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text("in \(row.parent.name)").font(Theme.serif(14, italic: true)).foregroundStyle(Theme.ink4).fixedSize()
+                    FlowLayout(spacing: level == 0 ? 22 : 18, lineSpacing: 2) {
+                        ForEach(row.children) { child in
+                            ShelfWord(name: child.name, count: totals[child.id] ?? 0, selected: row.selected == child.id,
+                                      size: level == 0 ? 26 : 21) { select(child.id) }
+                        }
+                    }
+                }
+                .padding(.top, level == 0 ? 14 : 6)
+                .transition(.opacity)
             }
         }
     }
 
     private func summary(_ tabs: [BrowserTab], category: Category?) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 14) {
+            if let category, let parent = category.parentID.flatMap(library.category(withID:)) {
+                TextAction(title: parent.name, systemImage: "arrow.up") { select(parent.id) }
+                    .help("Up to \(library.pathName(of: parent.id)) (⌘[)")
+                Text("·").font(Theme.mono(11)).foregroundStyle(Theme.ink4)
+            }
             Text(tabs.count == 1 ? "1 tab" : "\(tabs.count) tabs")
                 .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
             if let time = readingTime(tabs) {
@@ -159,15 +204,24 @@ struct LibraryView: View {
         }
     }
 
-    private func section(_ category: Category, tabs: [BrowserTab], index: Int, columns: Int, width: CGFloat, shared: (images: Set<String>, summaries: Set<String>)) -> some View {
-        let shown = Array(tabs.prefix(columns * 2))
+    /// One shelf's tabs under a numbered heading. A `title` marks the "Unsorted in …"
+    /// section, which shows every tab and has no drill-in or Read button.
+    /// `readIn` is the shelf a card click starts reading from.
+    private func section(_ category: Category, title: String? = nil, tabs: [BrowserTab], index: Int, readIn: String,
+                         columns: Int, width: CGFloat, shared: (images: Set<String>, summaries: Set<String>)) -> some View {
+        let unsorted = title != nil
+        let shown = unsorted ? tabs : Array(tabs.prefix(columns * 2))
         return VStack(alignment: .leading, spacing: 20) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(Self.roman(index + 1)).font(Theme.serif(15, italic: true)).foregroundStyle(Theme.accent)
-                Button { select(category.id) } label: {
-                    Text(category.name).font(Theme.serif(30)).foregroundStyle(Theme.ink)
+                if let title {
+                    Text(title).font(Theme.serif(30, italic: true)).foregroundStyle(Theme.ink2)
+                } else {
+                    Button { select(category.id) } label: {
+                        Text(category.name).font(Theme.serif(30)).foregroundStyle(Theme.ink)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
                 Text("\(tabs.count)").font(Theme.mono(11)).foregroundStyle(Theme.ink3)
                 if let time = readingTime(tabs) {
                     Text("· \(time)").font(Theme.mono(11)).foregroundStyle(Theme.ink4)
@@ -177,18 +231,20 @@ struct LibraryView: View {
                     TextAction(title: "All \(tabs.count)", systemImage: "arrow.right", trailing: true) { select(category.id) }
                         .padding(.trailing, 14)
                 }
-                if tabs.contains(where: { $0.readableURL != nil }) {
+                if !unsorted, tabs.contains(where: { $0.readableURL != nil }) {
                     Button { open(category.id, nil, nil) } label: { Text("Read shelf") }
                         .buttonStyle(DeskButtonStyle(.outline))
                 }
             }
-            grid(shown, columns: columns, width: width, shared: shared)
+            grid(shown, columns: columns, width: width, shared: shared, readIn: readIn, labelFrom: category.id)
         }
         .padding(.top, index == 0 ? 8 : 44)
         .padding(.bottom, 4)
     }
 
-    private func grid(_ tabs: [BrowserTab], columns: Int, width: CGFloat, shared: (images: Set<String>, summaries: Set<String>)) -> some View {
+    /// Cards filed below `labelFrom` show their sub-shelf path. `readIn` defaults to the tab's own shelf.
+    private func grid(_ tabs: [BrowserTab], columns: Int, width: CGFloat, shared: (images: Set<String>, summaries: Set<String>),
+                      readIn: String?, labelFrom: String?) -> some View {
         Group {
             if tabs.isEmpty {
                 Text(query.isEmpty ? "Nothing on this shelf." : "No tabs match “\(query)”.")
@@ -198,7 +254,7 @@ struct LibraryView: View {
                     ForEach(0..<columns, id: \.self) { column in
                         LazyVStack(alignment: .leading, spacing: 34) {
                             ForEach(Array(tabs.enumerated()).filter { $0.offset % columns == column }, id: \.element.id) { _, tab in
-                                card(tab, width: width, shared: shared)
+                                card(tab, width: width, shared: shared, readIn: readIn, labelFrom: labelFrom)
                             }
                         }
                         .frame(width: width)
@@ -220,17 +276,20 @@ struct LibraryView: View {
         return (Set(images.filter { $0.value > 1 }.keys), Set(summaries.filter { $0.value > 1 }.keys))
     }
 
-    private func card(_ tab: BrowserTab, width: CGFloat, shared: (images: Set<String>, summaries: Set<String>)) -> some View {
+    private func card(_ tab: BrowserTab, width: CGFloat, shared: (images: Set<String>, summaries: Set<String>),
+                      readIn: String?, labelFrom: String?) -> some View {
         let category = library.category(for: tab)
+        let shelfLabel: String? = category.id == labelFrom ? nil
+            : labelFrom.map { library.tree.pathName(of: category.id, from: $0) } ?? library.pathName(of: category.id)
         var preview = previews.info[tab.address]
         var image = previews.images[tab.address]
         if let url = preview?.imageURL, shared.images.contains(url), preview?.isPDF != true { image = nil }
         if let summary = preview?.summary, shared.summaries.contains(summary) { preview?.summary = nil }
         return TabCard(tab: tab, preview: preview, image: image,
                        icon: previews.icons[tab.host], width: width,
-                       shelfName: selectedCategory == nil && !query.isEmpty ? category.name : nil,
-                       categories: library.categories, currentCategory: category.id,
-                       open: { rect in open(category.id, tab, rect) },
+                       shelfName: shelfLabel,
+                       shelves: library.tree, currentCategory: category.id,
+                       open: { rect in open(readIn ?? category.id, tab, rect) },
                        done: { library.finish(tab, closeInHelium: closeInHelium) },
                        assign: { library.assign(tab, to: $0) },
                        fileSite: { library.fileSite(of: tab, in: $0) })
@@ -268,6 +327,7 @@ private struct ShelfWord: View {
     let name: String
     let count: Int
     let selected: Bool
+    var size: CGFloat = 42
     let action: () -> Void
     @State private var hovered = false
 
@@ -275,13 +335,13 @@ private struct ShelfWord: View {
         Button(action: action) {
             HStack(alignment: .top, spacing: 3) {
                 Text(name)
-                    .font(Theme.serif(42, italic: selected))
-                    .tracking(-0.6)
+                    .font(Theme.serif(size, italic: selected))
+                    .tracking(-0.6 * size / 42)
                     .foregroundStyle(selected ? Theme.ink : hovered ? Theme.ink2 : Theme.ink3.opacity(0.7))
                 Text("\(count)")
-                    .font(Theme.mono(11, .medium))
+                    .font(Theme.mono(size < 30 ? 10 : 11, .medium))
                     .foregroundStyle(selected ? Theme.accent : Theme.ink4)
-                    .padding(.top, 9)
+                    .padding(.top, size * 9 / 42)
             }
             .contentShape(Rectangle())
         }
@@ -301,7 +361,7 @@ struct TabCard: View {
     let icon: NSImage?
     let width: CGFloat
     let shelfName: String?
-    let categories: [Category]
+    let shelves: ShelfTree
     let currentCategory: String
     /// Called with the card's cover frame in window coordinates.
     let open: (CGRect) -> Void
@@ -415,16 +475,12 @@ struct TabCard: View {
             CardAction(symbol: "checkmark", help: "Mark done") { done() }
             Menu {
                 Section("Move to shelf") {
-                    ForEach(categories) { option in
-                        Button { assign(option.id) } label: {
-                            if option.id == currentCategory { Label(option.name, systemImage: "checkmark") } else { Text(option.name) }
-                        }
-                    }
+                    ShelfMenuItems(tree: shelves, parent: nil, current: currentCategory) { assign($0) }
                     Button("Let Reading Desk decide") { assign(nil) }
                 }
                 if !tab.site.isEmpty {
                     Menu("Always file \(tab.site) in…") {
-                        ForEach(categories) { option in Button(option.name) { fileSite(option.id) } }
+                        ShelfMenuItems(tree: shelves, parent: nil, current: nil) { fileSite($0) }
                     }
                 }
                 Divider()
@@ -444,6 +500,41 @@ struct TabCard: View {
         .padding(2)
         .background(Capsule().fill(Theme.ground.opacity(0.82)))
         .overlay(Capsule().strokeBorder(Color.white.opacity(0.1)))
+    }
+}
+
+/// Shelf picker for menus. Submenu titles aren't clickable, so each submenu
+/// repeats its parent as the first item.
+private struct ShelfMenuItems: View {
+    let tree: ShelfTree
+    let parent: String?
+    let current: String?
+    let pick: (String) -> Void
+
+    var body: some View {
+        ForEach(tree.children(of: parent)) { shelf in
+            if tree.children(of: shelf.id).isEmpty {
+                item(shelf)
+            } else {
+                Menu {
+                    item(shelf)
+                    Divider()
+                    ShelfMenuItems(tree: tree, parent: shelf.id, current: current, pick: pick)
+                } label: {
+                    if let current, tree.isInside(current, shelf.id) || current == shelf.id {
+                        Label(shelf.name, systemImage: "checkmark")
+                    } else {
+                        Text(shelf.name)
+                    }
+                }
+            }
+        }
+    }
+
+    private func item(_ shelf: Category) -> some View {
+        Button { pick(shelf.id) } label: {
+            if shelf.id == current { Label(shelf.name, systemImage: "checkmark") } else { Text(shelf.name) }
+        }
     }
 }
 
@@ -581,7 +672,7 @@ struct ShelvesEditor: View {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Shelves").font(Theme.serif(34))
-                    Text("A tab is filed on the first shelf, top to bottom, whose rules match it.")
+                    Text("Top-level shelves are checked top to bottom. Inside a shelf, its sub-shelves are checked first, so a tab lands on the deepest shelf whose rules match it.")
                         .font(Theme.sans(12.5)).foregroundStyle(Theme.ink3)
                 }
                 Spacer()
@@ -610,22 +701,36 @@ struct ShelvesEditor: View {
     }
 
     private var sidebar: some View {
-        let groups = library.grouped()
+        let totals = library.totals(library.grouped())
+        // Number top-level shelves only; indent the rest.
+        var number = 0
+        let rows = library.tree.flattened().map { row -> (category: Category, depth: Int, number: Int?) in
+            if row.depth == 0 { number += 1 }
+            return (row.category, row.depth, row.depth == 0 ? number : nil)
+        }
+        let selectable = selection.flatMap(library.category(withID:)).map { !$0.isOther } ?? false
         return VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(library.categories.enumerated()), id: \.element.id) { index, category in
+                    ForEach(rows, id: \.category.id) { row in
+                        let category = row.category
                         Button { selection = category.id } label: {
                             HStack(alignment: .firstTextBaseline, spacing: 10) {
-                                Text(LibraryView.roman(index + 1)).font(Theme.serif(13, italic: true))
+                                Text(row.number.map(LibraryView.roman) ?? "").font(Theme.serif(13, italic: true))
                                     .foregroundStyle(selection == category.id ? Theme.accent : Theme.ink4)
                                     .frame(width: 24, alignment: .trailing)
-                                Text(category.name).font(Theme.serif(18))
+                                Text(category.name).font(Theme.serif(row.depth == 0 ? 18 : 16))
                                     .foregroundStyle(selection == category.id ? Theme.ink : Theme.ink2).lineLimit(1)
+                                    .padding(.leading, CGFloat(row.depth) * 14)
+                                    .overlay(alignment: .leading) {
+                                        if row.depth > 0 {
+                                            Rectangle().fill(Theme.rule).frame(width: 1).padding(.leading, CGFloat(row.depth) * 14 - 8)
+                                        }
+                                    }
                                 Spacer(minLength: 4)
-                                Text("\(groups[category.id]?.count ?? 0)").font(Theme.mono(10.5)).foregroundStyle(Theme.ink4)
+                                Text("\(totals[category.id] ?? 0)").font(Theme.mono(10.5)).foregroundStyle(Theme.ink4)
                             }
-                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .padding(.horizontal, 14).padding(.vertical, row.depth == 0 ? 8 : 6)
                             .background(selection == category.id ? Theme.surface : .clear)
                             .contentShape(Rectangle())
                         }
@@ -637,6 +742,13 @@ struct ShelvesEditor: View {
             Hairline()
             HStack {
                 TextAction(title: "New shelf", systemImage: "plus") { selection = library.addCategory() }
+                TextAction(title: "New sub-shelf", systemImage: "arrow.turn.down.right") {
+                    selection = library.addCategory(inside: selection)
+                }
+                .disabled(!selectable)
+                .opacity(selectable ? 1 : 0.4)
+                .help(selectable ? "Create a shelf inside the selected shelf" : "Select a shelf other than Everything else")
+                .padding(.leading, 10)
                 Spacer()
                 Menu {
                     Button("Restore default shelves", role: .destructive) {
@@ -677,6 +789,21 @@ private struct ShelfForm: View {
 
     private var pinned: [String] { library.siteRules.filter { $0.value == category.id }.map(\.key).sorted() }
 
+    private var siblings: [Category] {
+        library.tree.children(of: library.category(withID: category.id)?.parentID).filter { !$0.isOther }
+    }
+
+    /// Anything except itself, its own sub-shelves, or Everything else.
+    private var parentOptions: [Category] {
+        library.tree.flattened().map(\.category).filter { library.tree.canNest(category.id, under: $0.id) }
+    }
+
+    /// "" means top level (Picker tags can't be optional).
+    private var parentBinding: Binding<String> {
+        Binding(get: { library.category(withID: category.id)?.parentID ?? "" },
+                set: { library.setParent(category.id, to: $0.isEmpty ? nil : $0) })
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 26) {
@@ -687,6 +814,23 @@ private struct ShelfForm: View {
                     Text("Anything that doesn’t match another shelf lands here. It always comes last.")
                         .font(Theme.sans(13)).foregroundStyle(Theme.ink3)
                 } else {
+                    field("Inside", hint: "Sub-shelves are checked before the shelf they sit in, so a tab lands on the deepest shelf that matches.") {
+                        Picker("Inside", selection: parentBinding) {
+                            Text("None (top level)").tag("")
+                            ForEach(parentOptions) { option in
+                                Text(library.pathName(of: option.id)).tag(option.id)
+                            }
+                        }
+                        .pickerStyle(.menu).labelsHidden().fixedSize()
+                    }
+                    field("Sort with Claude", hint: "When new tabs land directly on this shelf, Claude reads what each is about and files it into a sub-shelf. It prefers the sub-shelves you made and adds at most 2 new ones per run. Needs Claude Code.") {
+                        Toggle("Sort new tabs into sub-shelves automatically", isOn: Binding(
+                            get: { library.autoSortShelves.contains(category.id) },
+                            set: { library.setAutoSort(category.id, $0) }))
+                            .toggleStyle(.switch).controlSize(.small)
+                            .font(Theme.sans(12.5)).foregroundStyle(Theme.ink2)
+                            .disabled(library.tree.children(of: category.id).isEmpty && !library.autoSortShelves.contains(category.id))
+                    }
                     field("Sites", hint: "arxiv.org matches the site and its subdomains · docs. matches hosts starting with it · /blog/ matches anywhere in the address") {
                         TextField("arxiv.org, docs., /blog/", text: $sites, axis: .vertical).lineLimit(2...6).modifier(FieldBox())
                     }
@@ -711,14 +855,19 @@ private struct ShelfForm: View {
                     HStack(spacing: 8) {
                         Button { library.move(category.id, by: -1) } label: { Label("Earlier", systemImage: "arrow.up") }
                             .buttonStyle(DeskButtonStyle(.outline))
-                            .disabled(library.categories.first?.id == category.id)
+                            .disabled(siblings.first?.id == category.id)
+                            .help("Move before the previous shelf at this level")
                         Button { library.move(category.id, by: 1) } label: { Label("Later", systemImage: "arrow.down") }
                             .buttonStyle(DeskButtonStyle(.outline))
+                            .disabled(siblings.last?.id == category.id)
+                            .help("Move after the next shelf at this level")
                         Spacer()
                         Button(role: .destructive) {
+                            let parent = library.category(withID: category.id)?.parentID
                             library.delete(category.id)
-                            select(library.categories.first?.id)
+                            select(parent ?? library.categories.first?.id)
                         } label: { Text("Delete shelf").foregroundStyle(Theme.error) }
+                            .help("Shelves inside this one move up a level")
                             .buttonStyle(.plain).font(Theme.sans(12.5, .medium))
                     }
                 }

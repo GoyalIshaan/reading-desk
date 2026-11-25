@@ -1,8 +1,7 @@
 import AppKit
 import Foundation
 
-/// A shelf that tabs are filed into. Shelves are checked in order; a tab lands
-/// on the first shelf whose sites or keywords match it, otherwise on "Other".
+/// A shelf that tabs are filed into. Shelves can be nested via `parentID`.
 struct Category: Codable, Identifiable, Hashable {
     var id: String
     var name: String
@@ -10,6 +9,8 @@ struct Category: Codable, Identifiable, Hashable {
     var hue: Double
     var domains: [String] = []
     var keywords: [String] = []
+    /// nil for top-level shelves. Optional so older saved shelves still decode.
+    var parentID: String? = nil
 
     static let otherID = "other"
     var isOther: Bool { id == Self.otherID }
@@ -73,6 +74,100 @@ struct Category: Codable, Identifiable, Hashable {
         "AI assistants": "ai", "Writing & documents": "writing", "Media": "media",
         "Communication": "communication", "Other tabs": otherID,
     ]
+}
+
+/// Read-only helpers over the flat shelf list. Siblings keep the order they
+/// have in the flat array.
+struct ShelfTree {
+    static let separator = " › "
+
+    private let byID: [String: Category]
+    private let kids: [String?: [Category]]
+
+    init(_ categories: [Category]) {
+        byID = Dictionary(categories.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        kids = Dictionary(grouping: categories, by: \.parentID)
+    }
+
+    func shelf(_ id: String) -> Category? { byID[id] }
+
+    /// Direct children in order; nil gives the top-level shelves.
+    func children(of id: String?) -> [Category] { kids[id] ?? [] }
+
+    /// Ancestors from the root down, ending with the shelf itself.
+    func path(of id: String) -> [Category] {
+        var chain: [Category] = []
+        var next: String? = id
+        while let current = next, let shelf = byID[current], !chain.contains(where: { $0.id == current }) {
+            chain.insert(shelf, at: 0)
+            next = shelf.parentID
+        }
+        return chain
+    }
+
+    /// e.g. "AI research › Post-training". Pass `from` to drop that ancestor and everything above it.
+    func pathName(of id: String, from ancestor: String? = nil) -> String {
+        var chain = path(of: id)
+        if let ancestor, let cut = chain.firstIndex(where: { $0.id == ancestor }) { chain.removeFirst(cut + 1) }
+        return chain.map(\.name).joined(separator: Self.separator)
+    }
+
+    func isInside(_ id: String, _ ancestor: String) -> Bool {
+        path(of: id).dropLast().contains { $0.id == ancestor }
+    }
+
+    /// Every shelf with its depth, parents before children.
+    func flattened() -> [(category: Category, depth: Int)] {
+        func walk(_ parent: String?, _ depth: Int) -> [(category: Category, depth: Int)] {
+            children(of: parent).flatMap { [($0, depth)] + walk($0.id, depth + 1) }
+        }
+        return walk(nil, 0)
+    }
+
+    /// No cycles, and "Everything else" can't be a parent or a child.
+    func canNest(_ id: String, under parent: String?) -> Bool {
+        guard id != Category.otherID, byID[id] != nil else { return false }
+        guard let parent else { return true }
+        return parent != id && parent != Category.otherID && byID[parent] != nil && !isInside(parent, id)
+    }
+
+    /// Rolls direct tab counts up so each shelf's total includes its sub-shelves.
+    func totals(_ direct: [String: Int]) -> [String: Int] {
+        var totals: [String: Int] = [:]
+        for (id, count) in direct {
+            for shelf in path(of: id) { totals[shelf.id, default: 0] += count }
+        }
+        return totals
+    }
+
+    /// Lower-cased path parts. "›", ">" and "/" all count as separators.
+    static func components(_ text: String) -> [String] {
+        text.split(whereSeparator: { "›>/".contains($0) })
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Fixes up saved data: bad or cyclic parents become top-level.
+    static func sanitized(_ list: [Category]) -> [Category] {
+        var list = list
+        let ids = Set(list.map(\.id))
+        for index in list.indices {
+            let parent = list[index].parentID
+            if list[index].isOther || parent == Category.otherID || parent == list[index].id || parent.map({ !ids.contains($0) }) == true {
+                list[index].parentID = nil
+            }
+        }
+        for index in list.indices {
+            var seen: Set<String> = [list[index].id]
+            var next = list[index].parentID
+            while let current = next {
+                if seen.contains(current) { list[index].parentID = nil; break }
+                seen.insert(current)
+                next = list.first { $0.id == current }?.parentID
+            }
+        }
+        return list
+    }
 }
 
 struct BrowserTab: Decodable, Identifiable, Hashable {
@@ -187,10 +282,13 @@ enum Helium {
 @MainActor
 final class Library: ObservableObject {
     @Published var tabs: [BrowserTab] = []
-    @Published private(set) var categories: [Category]
+    @Published private(set) var categories: [Category] { didSet { tree = ShelfTree(categories) } }
+    private(set) var tree = ShelfTree([])
     @Published private(set) var assignments: [String: String]
     @Published private(set) var siteRules: [String: String]
     @Published private(set) var finishedToday: Int
+    /// Shelves where Claude files new tabs into sub-shelves.
+    @Published private(set) var autoSortShelves: Set<String>
     @Published var updating = false
     @Published var error: String?
     @Published var loaded = false
@@ -212,7 +310,9 @@ final class Library: ObservableObject {
         } else {
             loadedCategories.append(Category.defaults.last!)
         }
-        categories = loadedCategories
+        let sanitized = ShelfTree.sanitized(loadedCategories)
+        categories = sanitized
+        tree = ShelfTree(sanitized)
 
         if let saved = store.dictionary(forKey: "assignments.v2") as? [String: String] {
             assignments = saved
@@ -222,6 +322,8 @@ final class Library: ObservableObject {
             assignments = [:]
         }
         siteRules = store.dictionary(forKey: "siteRules.v2") as? [String: String] ?? [:]
+        // Ignore ids for shelves that no longer exist.
+        autoSortShelves = Set(store.stringArray(forKey: "autoSort.v1") ?? []).filter { id in sanitized.contains { $0.id == id } }
 
         let today = Self.dayStamp()
         finishedToday = store.string(forKey: "finished.day") == today ? store.integer(forKey: "finished.count") : 0
@@ -294,12 +396,30 @@ final class Library: ObservableObject {
 
     var other: Category { categories.last { $0.isOther } ?? Category.defaults.last! }
 
-    func category(withID id: String) -> Category? { categories.first { $0.id == id } }
+    func category(withID id: String) -> Category? { tree.shelf(id) }
 
-    /// Resolve a category by id, or failing that by name (case-insensitive) —
-    /// so the external bridge can take either from an agent.
+    func pathName(of id: String) -> String { tree.pathName(of: id) }
+
+    /// Looks a shelf up by id, name or path (for the bridge and CLI).
+    /// If a name is shared, the top-level shelf wins; use a path to pick a nested one.
     func category(matching token: String) -> Category? {
-        category(withID: token) ?? categories.first { $0.name.caseInsensitiveCompare(token) == .orderedSame }
+        let token = token.trimmed
+        if let exact = category(withID: token) { return exact }
+        let ordered = tree.flattened().map(\.category)
+        let named = ordered.filter { $0.name.caseInsensitiveCompare(token) == .orderedSame }
+        if named.count == 1 { return named[0] }
+        let parts = ShelfTree.components(token)
+        if parts.count > 1, let match = ordered.first(where: { ShelfTree.components(tree.pathName(of: $0.id)) == parts }) {
+            return match
+        }
+        return named.first { $0.parentID == nil } ?? named.first
+    }
+
+    /// "A › B" -> (parent: "A", leaf: "B"). "/" doesn't split, so "CI/CD" stays one name.
+    static func splitCreatePath(_ name: String) -> (parent: String?, leaf: String) {
+        let parts = name.split(whereSeparator: { "›>".contains($0) }).map { String($0).trimmed }.filter { !$0.isEmpty }
+        guard parts.count > 1 else { return (nil, name.trimmed) }
+        return (parts.dropLast().joined(separator: ShelfTree.separator), parts.last!)
     }
 
     /// Assign by raw URL, for the bridge (no BrowserTab needed).
@@ -315,11 +435,13 @@ final class Library: ObservableObject {
         defaults.set(siteRules, forKey: "siteRules.v2")
     }
 
-    /// Return a category with this name, creating one if there isn't yet.
+    /// Return a shelf with this name, creating one if there isn't yet.
+    /// With `parentID`, only that shelf's direct children count and a new shelf goes inside it.
     @discardableResult
-    func ensureCategory(named name: String, symbol: String?) -> Category {
-        if let existing = categories.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) { return existing }
-        let id = addCategory()
+    func ensureCategory(named name: String, symbol: String?, parentID: String? = nil) -> Category {
+        let candidates = parentID.map { tree.children(of: $0) } ?? tree.flattened().map(\.category)
+        if let existing = candidates.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) { return existing }
+        let id = addCategory(inside: parentID)
         update(id) { shelf in
             shelf.name = name
             if let symbol { shelf.symbol = symbol }
@@ -327,14 +449,52 @@ final class Library: ObservableObject {
         return category(withID: id) ?? other
     }
 
+    /// Manual picks and site rules win. Otherwise top-level shelves are checked in order,
+    /// and sub-shelves are checked before their parent so the most specific shelf wins.
     func category(for tab: BrowserTab) -> Category {
         if let id = assignments[tab.address], let manual = category(withID: id) { return manual }
         if let id = siteRules[tab.site], let site = category(withID: id) { return site }
-        return categories.first { !$0.isOther && $0.matches(tab) } ?? other
+        func deepest(_ shelf: Category) -> Category? {
+            for child in tree.children(of: shelf.id) { if let hit = deepest(child) { return hit } }
+            return shelf.matches(tab) ? shelf : nil
+        }
+        for shelf in tree.children(of: nil) where !shelf.isOther {
+            if let hit = deepest(shelf) { return hit }
+        }
+        return other
     }
 
+    /// Tabs filed directly on each shelf (not counting sub-shelves).
     func grouped() -> [String: [BrowserTab]] {
         Dictionary(grouping: tabs) { category(for: $0).id }
+    }
+
+    func totals(_ groups: [String: [BrowserTab]]) -> [String: Int] {
+        tree.totals(groups.mapValues(\.count))
+    }
+
+    /// Non-empty shelves under `parent`, biggest first, "Everything else" last.
+    func visibleChildren(of parent: String?, totals: [String: Int]) -> [Category] {
+        tree.children(of: parent).enumerated()
+            .filter { (totals[$0.element.id] ?? 0) > 0 }
+            .sorted { lhs, rhs in
+                if lhs.element.isOther != rhs.element.isOther { return rhs.element.isOther }
+                let (left, right) = (totals[lhs.element.id] ?? 0, totals[rhs.element.id] ?? 0)
+                return left != right ? left > right : lhs.offset < rhs.offset
+            }
+            .map(\.element)
+    }
+
+    /// All tabs under a shelf in page order: sub-shelves first, then its own tabs.
+    /// The reader uses this too, so it follows the page top to bottom.
+    func orderedTabs(in id: String, groups: [String: [BrowserTab]], totals: [String: Int]) -> [BrowserTab] {
+        visibleChildren(of: id, totals: totals).flatMap { orderedTabs(in: $0.id, groups: groups, totals: totals) }
+            + (groups[id] ?? [])
+    }
+
+    func orderedTabs(in id: String) -> [BrowserTab] {
+        let groups = grouped()
+        return orderedTabs(in: id, groups: groups, totals: totals(groups))
     }
 
     func assign(_ tab: BrowserTab, to id: String?) {
@@ -351,6 +511,12 @@ final class Library: ObservableObject {
         defaults.set(assignments, forKey: "assignments.v2")
     }
 
+    func setAutoSort(_ id: String, _ on: Bool) {
+        guard id != Category.otherID, category(withID: id) != nil || !on else { return }
+        if on { autoSortShelves.insert(id) } else { autoSortShelves.remove(id) }
+        defaults.set(Array(autoSortShelves), forKey: "autoSort.v1")
+    }
+
     func unpinSite(_ site: String) {
         siteRules[site] = nil
         defaults.set(siteRules, forKey: "siteRules.v2")
@@ -364,17 +530,45 @@ final class Library: ObservableObject {
         saveCategories()
     }
 
+    /// New top-level shelves go first; new sub-shelves go last among their siblings.
     @discardableResult
-    func addCategory() -> String {
-        let shelf = Category(id: UUID().uuidString, name: "New shelf", symbol: "bookmark", hue: 0)
-        categories.insert(shelf, at: 0)
+    func addCategory(inside parent: String? = nil) -> String {
+        let parent = parent.flatMap { tree.shelf($0) != nil && $0 != Category.otherID ? $0 : nil }
+        let shelf = Category(id: UUID().uuidString, name: parent == nil ? "New shelf" : "New sub-shelf",
+                             symbol: "bookmark", hue: 0, parentID: parent)
+        if parent == nil {
+            categories.insert(shelf, at: 0)
+        } else {
+            categories.insert(shelf, at: categories.firstIndex(where: \.isOther) ?? categories.count)
+        }
         saveCategories()
         return shelf.id
     }
 
+    /// Moves a shelf under a new parent (nil = top level), as its last child.
+    func setParent(_ id: String, to parent: String?) {
+        guard tree.canNest(id, under: parent), let index = categories.firstIndex(where: { $0.id == id }),
+              categories[index].parentID != parent else { return }
+        var shelf = categories.remove(at: index)
+        shelf.parentID = parent
+        categories.insert(shelf, at: categories.firstIndex(where: \.isOther) ?? categories.count)
+        saveCategories()
+    }
+
+    /// Sub-shelves of a deleted shelf move up a level into its spot.
     func delete(_ id: String) {
-        guard id != Category.otherID else { return }
-        categories.removeAll { $0.id == id }
+        guard id != Category.otherID, let deleted = category(withID: id) else { return }
+        let childIDs = Set(tree.children(of: id).map(\.id))
+        var list = categories
+        var children = list.filter { childIDs.contains($0.id) }
+        for index in children.indices { children[index].parentID = deleted.parentID }
+        list.removeAll { childIDs.contains($0.id) }
+        if let slot = list.firstIndex(where: { $0.id == id }) {
+            list.remove(at: slot)
+            list.insert(contentsOf: children, at: slot)
+        }
+        categories = list
+        setAutoSort(id, false)
         assignments = assignments.filter { $0.value != id }
         siteRules = siteRules.filter { $0.value != id }
         defaults.set(assignments, forKey: "assignments.v2")
@@ -382,16 +576,21 @@ final class Library: ObservableObject {
         saveCategories()
     }
 
+    /// Reorders a shelf among its siblings.
     func move(_ id: String, by offset: Int) {
-        guard let index = categories.firstIndex(where: { $0.id == id }), !categories[index].isOther else { return }
-        let target = index + offset
-        guard target >= 0, target < categories.count - 1 else { return }
-        categories.swapAt(index, target)
+        guard let shelf = category(withID: id), !shelf.isOther else { return }
+        let siblings = tree.children(of: shelf.parentID).filter { !$0.isOther }
+        guard let position = siblings.firstIndex(where: { $0.id == id }), siblings.indices.contains(position + offset),
+              let from = categories.firstIndex(where: { $0.id == id }),
+              let to = categories.firstIndex(where: { $0.id == siblings[position + offset].id }) else { return }
+        categories.swapAt(from, to)
         saveCategories()
     }
 
     func resetCategories() {
         categories = Category.defaults
+        autoSortShelves = []
+        defaults.removeObject(forKey: "autoSort.v1")
         siteRules = [:]
         defaults.set(siteRules, forKey: "siteRules.v2")
         saveCategories()

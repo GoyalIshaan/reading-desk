@@ -10,7 +10,8 @@ import Foundation
 ///  • watches `…/commands/` for little JSON instruction files, applies them to
 ///    the live app, deletes them, and records the result back into the snapshot.
 ///
-/// Nothing here reaches the network; it's all local files the user owns.
+/// Nothing in `DeskBridge` reaches the network; it's all local files the user owns.
+/// (`ShelfAgent` below does: it sends tab titles and URLs to Claude.)
 @MainActor
 final class DeskBridge {
     private unowned let library: Library
@@ -45,6 +46,9 @@ final class DeskBridge {
 
     // MARK: Snapshot
 
+    /// Write state.json right away, skipping the debounce. Call before running the sorter.
+    func flush() { writeState() }
+
     private func scheduleWrite() {
         guard !writeScheduled else { return }
         writeScheduled = true
@@ -56,9 +60,13 @@ final class DeskBridge {
     }
 
     private func writeState() {
-        let categories = library.categories.map { category -> [String: Any] in
-            ["id": category.id, "name": category.name, "isDefault": category.isOther,
-             "sites": category.domains, "keywords": category.keywords]
+        // Parents come before their children.
+        let categories = library.tree.flattened().map { row -> [String: Any] in
+            let category = row.category
+            return ["id": category.id, "name": category.name, "isDefault": category.isOther,
+                    "parent": category.parentID ?? NSNull(), "path": library.pathName(of: category.id),
+                    "autoSort": library.autoSortShelves.contains(category.id),
+                    "sites": category.domains, "keywords": category.keywords]
         }
         let tabs = library.tabs.map { tab -> [String: Any] in
             let category = library.category(for: tab)
@@ -67,6 +75,7 @@ final class DeskBridge {
             return [
                 "id": tab.id, "title": tab.displayTitle, "url": tab.address, "site": tab.site,
                 "category": category.id, "categoryName": category.name,
+                "categoryPath": library.pathName(of: category.id),
                 "assignedBy": manual ? "tab" : bySite ? "site" : "auto",
                 "active": tab.active,
             ]
@@ -134,14 +143,79 @@ final class DeskBridge {
             library.assign(address: url, to: nil)
             record(op, "ok", url)
         case "ensurecategory":
-            guard let name = command["name"] as? String else { return record(op, "error", "missing name") }
-            let category = library.ensureCategory(named: name, symbol: command["icon"] as? String)
-            record(op, "ok", "\(category.name) [\(category.id)]")
+            guard let raw = command["name"] as? String, !raw.trimmed.isEmpty else { return record(op, "error", "missing name") }
+            // A name like "A › B" means "B inside A".
+            let (pathParent, name) = Library.splitCreatePath(raw)
+            let explicitParent = (command["parent"] as? String).flatMap { $0.trimmed.isEmpty ? nil : $0 }
+            if pathParent != nil, explicitParent != nil {
+                return record(op, "error", "give either a path as the name or a parent, not both")
+            }
+            var parentID: String?
+            if let token = pathParent ?? explicitParent {
+                guard let parent = library.category(matching: token) else { return record(op, "error", "unknown parent \(token)") }
+                guard !parent.isOther else { return record(op, "error", "\(parent.name) can't hold other shelves") }
+                parentID = parent.id
+            }
+            let category = library.ensureCategory(named: name, symbol: command["icon"] as? String, parentID: parentID)
+            record(op, "ok", "\(library.pathName(of: category.id)) [\(category.id)]")
         case "refresh":
             library.refresh()
             record(op, "ok")
         default:
             record(op.isEmpty ? "?" : op, "error", "unknown op")
         }
+    }
+}
+
+/// Runs `reading-desk organize` (bundled with the app) to have Claude file a shelf's
+/// tabs into sub-shelves. The script applies its changes through the bridge.
+enum ShelfAgent {
+    struct Outcome {
+        let succeeded: Bool
+        /// Last line the script printed; shown as a toast.
+        let message: String
+        /// The script only prints "Filed …" when it actually moved something.
+        var filedAny: Bool { succeeded && message.hasPrefix("Filed ") }
+    }
+
+    /// `urls` limits the run to those tabs; `maxNew` caps new sub-shelves (nil = script default).
+    static func organize(shelfID: String, maxNew: Int? = nil, urls: [String] = []) async -> Outcome {
+        guard let script = Bundle.main.url(forResource: "reading-desk", withExtension: nil) else {
+            return Outcome(succeeded: false, message: "The sorting script is missing. Rebuild Reading Desk.")
+        }
+        return await Task.detached(priority: .userInitiated) { () -> Outcome in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            process.arguments = [script.path, "organize", "--shelf", shelfID]
+                + (maxNew.map { ["--max-new", String($0)] } ?? [])
+                + urls.flatMap { ["--url", $0] }
+            // Apps launched from Finder get a bare PATH, so add where `claude` usually lives.
+            var environment = ProcessInfo.processInfo.environment
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            environment["PATH"] = ["/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin", "\(home)/.claude/local",
+                                   environment["PATH"] ?? "/usr/bin:/bin"].joined(separator: ":")
+            process.environment = environment
+            let output = Pipe(), errors = Pipe()
+            process.standardOutput = output
+            process.standardError = errors
+            do { try process.run() } catch {
+                return Outcome(succeeded: false, message: "Couldn’t start the sorter: \(error.localizedDescription)")
+            }
+            // The script itself gives up after 5 min.
+            let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 330, execute: timeout)
+            defer { timeout.cancel() }
+            let out = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let err = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            process.waitUntilExit()
+            func lastLine(_ text: String) -> String? {
+                text.split(whereSeparator: \.isNewline).last.map(String.init)
+            }
+            if process.terminationStatus == 0 { return Outcome(succeeded: true, message: lastLine(out) ?? "Sorting finished.") }
+            if process.terminationReason == .uncaughtSignal {
+                return Outcome(succeeded: false, message: "Sorting took too long and was stopped.")
+            }
+            return Outcome(succeeded: false, message: lastLine(err) ?? "Sorting failed.")
+        }.value
     }
 }

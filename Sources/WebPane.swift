@@ -1,0 +1,216 @@
+import SwiftUI
+import WebKit
+
+@MainActor
+final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSWindowDelegate {
+    struct State: Equatable {
+        var url: URL?
+        var back = false
+        var forward = false
+        var loading = false
+    }
+
+    @Published private(set) var state = State()
+    @Published private(set) var failure: String?
+
+    private var observations: [NSKeyValueObservation] = []
+    private var popup: NSWindow?
+    private var requested: URL?
+    private var suppliedConfiguration: WKWebViewConfiguration?
+    private static var popups: [ObjectIdentifier: WebPage] = [:]
+
+    lazy var view: WKWebView = {
+        let view = WKWebView(frame: .zero, configuration: suppliedConfiguration ?? WKWebViewConfiguration())
+        suppliedConfiguration = nil
+        view.navigationDelegate = self
+        view.uiDelegate = self
+        view.allowsBackForwardNavigationGestures = true
+        view.isInspectable = ProcessInfo.processInfo.arguments.contains("--inspect")
+        @MainActor func watch<Value>(_ path: KeyPath<WKWebView, Value>) {
+            observations.append(view.observe(path, options: [.new]) { [weak self] _, _ in
+                Task { @MainActor in self?.update() }
+            })
+        }
+        watch(\.url)
+        watch(\.canGoBack)
+        watch(\.canGoForward)
+        watch(\.isLoading)
+        return view
+    }()
+
+    private func update() {
+        let next = State(url: view.url ?? requested, back: view.canGoBack,
+                         forward: view.canGoForward, loading: view.isLoading)
+        if next != state { state = next }
+    }
+
+    func load(_ url: URL) {
+        failure = nil
+        requested = url
+        let next = State(url: url, back: view.canGoBack, forward: view.canGoForward, loading: true)
+        if next != state { state = next }
+        if url.isFileURL {
+            view.loadFileURL(url, allowingReadAccessTo: url)
+        } else {
+            view.load(URLRequest(url: url))
+        }
+    }
+
+    func retry() {
+        if failure != nil, let url = state.url ?? requested { load(url) }
+        else { view.reload() }
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        failure = nil
+        update()
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { update() }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail(error) }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { fail(error) }
+
+    private func fail(_ error: Error) {
+        let nsError = error as NSError
+        if nsError.code == NSURLErrorCancelled || (nsError.domain == "WebKitErrorDomain" && nsError.code == 102) { return }
+        failure = error.localizedDescription
+        update()
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        failure = "The page stopped responding."
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
+        guard let url = navigationAction.request.url else { return .cancel }
+        if navigationAction.shouldPerformDownload { return .download }
+        switch url.scheme?.lowercased() {
+        case "http", "https", "about", "blob", "data":
+            return .allow
+        case "file":
+            return requested?.isFileURL == true ? .allow : .cancel
+        case "mailto", "tel", "obsidian":
+            if navigationAction.navigationType == .linkActivated { NSWorkspace.shared.open(url) }
+            return .cancel
+        default:
+            return .cancel
+        }
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async -> WKNavigationResponsePolicy {
+        response.canShowMIMEType ? .allow : .download
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String) async -> URL? {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = suggestedFilename
+        return await panel.begin() == .OK ? panel.url : nil
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        fail(error)
+    }
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        let child = WebPage()
+        child.suppliedConfiguration = configuration
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 720),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                              backing: .buffered, defer: false)
+        window.title = navigationAction.request.url?.host ?? "Reading Desk"
+        window.isReleasedWhenClosed = false
+        window.contentView = child.view
+        window.delegate = child
+        child.popup = window
+        Self.popups[ObjectIdentifier(child)] = child
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        return child.view
+    }
+
+    func webViewDidClose(_ webView: WKWebView) { popup?.close() }
+
+    func windowWillClose(_ notification: Notification) {
+        popup = nil
+        Self.popups.removeValue(forKey: ObjectIdentifier(self))
+    }
+}
+
+struct WebSurface: NSViewRepresentable {
+    let page: WebPage
+
+    func makeNSView(context: Context) -> WKWebView { page.view }
+    func updateNSView(_ nsView: WKWebView, context: Context) {}
+}
+
+struct BrowserPane: View {
+    @ObservedObject var page: WebPage
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 3) {
+                DeskIcon("chevron.left", help: "Go back") { page.view.goBack() }
+                    .disabled(!page.state.back)
+                DeskIcon("chevron.right", help: "Go forward") { page.view.goForward() }
+                    .disabled(!page.state.forward)
+                DeskIcon(page.state.loading ? "xmark" : "arrow.clockwise", help: page.state.loading ? "Stop loading" : "Reload") {
+                    if page.state.loading { page.view.stopLoading() } else { page.retry() }
+                }
+                Spacer(minLength: 6)
+                if let url = page.state.url {
+                    Text(url.isFileURL ? url.lastPathComponent : url.host ?? url.absoluteString)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.muted)
+                        .lineLimit(1)
+                        .help(url.absoluteString)
+                    Spacer(minLength: 6)
+                    DeskIcon("link", help: "Copy page link") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+                    }
+                    DeskIcon("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 40)
+            .background(Theme.paper)
+            Rectangle().fill(Theme.line).frame(height: 1)
+            ZStack {
+                WebSurface(page: page)
+                if let failure = page.failure {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Image(systemName: "wifi.exclamationmark").font(.title2).foregroundStyle(Theme.accent)
+                        Text("Couldn’t load this page").font(.title2.weight(.semibold))
+                        Text(failure).font(.callout).foregroundStyle(Theme.muted)
+                        HStack {
+                            Button("Try again") { page.retry() }.buttonStyle(DeskButtonStyle(prominent: true))
+                            if let url = page.state.url {
+                                Button("Open in Helium") { Helium.open(url) }.buttonStyle(DeskButtonStyle())
+                            }
+                        }
+                    }
+                    .frame(maxWidth: 420, alignment: .leading)
+                    .padding(28)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Theme.paper)
+                } else if page.state.loading {
+                    VStack {
+                        ProgressView().progressViewStyle(.linear).tint(Theme.accent)
+                        Spacer(minLength: 0)
+                    }.allowsHitTesting(false)
+                }
+            }
+        }
+    }
+}

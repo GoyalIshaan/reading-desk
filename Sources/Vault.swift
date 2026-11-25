@@ -1,0 +1,253 @@
+import SwiftUI
+
+struct Note: Identifiable, Hashable {
+    let url: URL
+    let path: String
+
+    var id: URL { url }
+    var name: String { url.deletingPathExtension().lastPathComponent }
+}
+
+private actor VaultFiles {
+    enum WriteError: LocalizedError {
+        case conflict
+
+        var errorDescription: String? {
+            "This note changed on disk. Copy your draft, then reopen the note to load the latest version."
+        }
+    }
+
+    func index(_ root: URL) throws -> [Note] {
+        let directory = root.resolvingSymlinksInPath().standardizedFileURL
+        let prefix = directory.path.hasSuffix("/") ? directory.path : directory.path + "/"
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey]
+        guard let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        return files.compactMap { entry -> Note? in
+            guard let url = entry as? URL, url.pathExtension.lowercased() == "md",
+                  let values = try? url.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true, values.isSymbolicLink != true else { return nil }
+            let location = url.resolvingSymlinksInPath().standardizedFileURL
+            guard location.path.hasPrefix(prefix) else { return nil }
+            return Note(url: location, path: String(location.path.dropFirst(prefix.count)))
+        }
+        .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+    }
+
+    func read(_ url: URL) throws -> String {
+        try String(contentsOf: url, encoding: .utf8)
+    }
+
+    func write(_ text: String, replacing original: String, at url: URL) throws {
+        guard try read(url) == original else { throw WriteError.conflict }
+        try Data(text.utf8).write(to: url, options: .atomic)
+    }
+
+    func create(title: String, source: BrowserTab?, in root: URL) throws -> Note {
+        let folder = root.appendingPathComponent("Reading Desk", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let values = try folder.resourceValues(forKeys: [.isSymbolicLinkKey])
+        guard values.isSymbolicLink != true else { throw CocoaError(.fileWriteNoPermission) }
+        let excluded = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/:"))
+        let name = String(title.components(separatedBy: excluded).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines).prefix(100))
+        let base = name.isEmpty || name.hasPrefix(".") ? "Untitled" : name
+        let header = "# " + title.replacingOccurrences(of: "\n", with: " ") + "\n\n"
+        let citation = source.flatMap { tab in
+            tab.readableURL.map { "Source: <" + $0.absoluteString + ">\n\n" }
+        } ?? ""
+        for number in 1...1000 {
+            let filename = base + (number == 1 ? "" : " \(number)") + ".md"
+            let url = folder.appendingPathComponent(filename)
+            do {
+                try Data((header + citation).utf8).write(to: url, options: .withoutOverwriting)
+                return Note(url: url, path: "Reading Desk/" + filename)
+            } catch let error as CocoaError where error.code == .fileWriteFileExists {
+                continue
+            }
+        }
+        throw CocoaError(.fileWriteFileExists)
+    }
+}
+
+@MainActor
+final class Vault: ObservableObject {
+    @Published private(set) var root: URL?
+    @Published private(set) var notes: [Note] = []
+    @Published private(set) var selection: Note?
+    @Published var text = ""
+    @Published private(set) var status = ""
+    @Published private(set) var error: String?
+    @Published private(set) var busy = false
+    @Published var showPicker = true
+    @Published var preview = false
+
+    private var savedText = ""
+    private var autosave: Task<Void, Never>?
+    private var saveTask: Task<Bool, Never>?
+    private let files = VaultFiles()
+
+    var isDirty: Bool { selection != nil && savedText != text }
+
+    init() {
+        let arguments = ProcessInfo.processInfo.arguments
+        if let flag = arguments.firstIndex(of: "--vault"), arguments.indices.contains(flag + 1) {
+            root = URL(fileURLWithPath: arguments[flag + 1], isDirectory: true)
+        } else if let path = UserDefaults.standard.string(forKey: "vaultPath") {
+            root = URL(fileURLWithPath: path, isDirectory: true)
+        }
+    }
+
+    var suggested: URL? {
+        let obsidian = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Mobile Documents/iCloud~md~obsidian/Documents/Dev", isDirectory: true)
+        return FileManager.default.fileExists(atPath: obsidian.path) ? obsidian : nil
+    }
+
+    func chooseFolder() async {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = root ?? suggested
+        panel.prompt = "Use vault"
+        guard await panel.begin() == .OK, let url = panel.url else { return }
+        await use(url)
+    }
+
+    func use(_ url: URL) async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
+        guard await flush() else { return }
+        do {
+            let results = try await files.index(url)
+            root = url
+            notes = results
+            selection = nil
+            text = ""
+            savedText = ""
+            status = ""
+            error = nil
+            preview = false
+            showPicker = true
+            UserDefaults.standard.set(url.path, forKey: "vaultPath")
+        } catch { self.error = error.localizedDescription }
+    }
+
+    func refresh() async {
+        guard let root, !busy else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            notes = try await files.index(root)
+            if !isDirty { error = nil }
+        } catch { self.error = error.localizedDescription }
+    }
+
+    func open(_ note: Note) async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
+        guard await flush() else { return }
+        await read(note)
+    }
+
+    func reload() async {
+        guard let selection, !busy else { return }
+        autosave?.cancel()
+        busy = true
+        defer { busy = false }
+        if let saveTask { _ = await saveTask.value }
+        await read(selection)
+    }
+
+    private func read(_ note: Note) async {
+        do {
+            let content = try await files.read(note.url)
+            text = content
+            savedText = content
+            selection = note
+            status = "Saved"
+            error = nil
+            showPicker = false
+        } catch { self.error = error.localizedDescription }
+    }
+
+    func create(_ title: String, source: BrowserTab?) async {
+        guard let root, !busy else { return }
+        busy = true
+        defer { busy = false }
+        guard await flush() else { return }
+        do {
+            let note = try await files.create(title: title, source: source, in: root)
+            notes.append(note)
+            notes.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+            preview = false
+            await read(note)
+        } catch { self.error = error.localizedDescription }
+    }
+
+    func edit(_ value: String) {
+        text = value
+        status = "Editing…"
+        autosave?.cancel()
+        autosave = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(650))
+                _ = await self?.flush()
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+        }
+    }
+
+    @discardableResult
+    func flush() async -> Bool {
+        while let saveTask {
+            if await saveTask.value == false { return false }
+        }
+        guard let note = selection, isDirty else {
+            if selection != nil { status = "Saved" }
+            return true
+        }
+        let value = text
+        let baseline = savedText
+        status = "Saving…"
+        let task = Task {
+            defer { saveTask = nil }
+            do {
+                try await files.write(value, replacing: baseline, at: note.url)
+                savedText = value
+                status = isDirty ? "Editing…" : "Saved"
+                error = nil
+                return true
+            } catch {
+                self.error = error.localizedDescription
+                status = "Unsaved"
+                return false
+            }
+        }
+        saveTask = task
+        return await task.value
+    }
+
+    func resolve(_ link: String) -> Note? {
+        let target = String(link.split(separator: "#", maxSplits: 1).first ?? "")
+        let candidate = target.hasSuffix(".md") ? target : target + ".md"
+        return notes.first { $0.path.caseInsensitiveCompare(candidate) == .orderedSame }
+            ?? notes.first { $0.url.lastPathComponent.caseInsensitiveCompare(candidate) == .orderedSame }
+    }
+
+    func openInObsidian() {
+        guard let url = selection?.url ?? root else { return }
+        var components = URLComponents()
+        components.scheme = "obsidian"
+        components.host = "open"
+        components.queryItems = [URLQueryItem(name: "path", value: url.path)]
+        if let location = components.url { NSWorkspace.shared.open(location) }
+    }
+}

@@ -3,6 +3,7 @@ import SwiftUI
 struct Note: Identifiable, Hashable {
     let url: URL
     let path: String
+    var modified: Date = .distantPast
 
     var id: URL { url }
     var name: String { url.deletingPathExtension().lastPathComponent }
@@ -17,22 +18,34 @@ private actor VaultFiles {
         }
     }
 
-    func index(_ root: URL) throws -> [Note] {
+    static let attachmentTypes: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "tif", "tiff",
+                                               "pdf", "mp3", "wav", "m4a", "ogg", "flac", "mp4", "mov", "webm"]
+
+    func index(_ root: URL) throws -> (notes: [Note], attachments: [String]) {
         let directory = root.resolvingSymlinksInPath().standardizedFileURL
         let prefix = directory.path.hasSuffix("/") ? directory.path : directory.path + "/"
-        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey]
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]
         guard let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
             throw CocoaError(.fileReadNoSuchFile)
         }
-        return files.compactMap { entry -> Note? in
-            guard let url = entry as? URL, url.pathExtension.lowercased() == "md",
+        var notes: [Note] = []
+        var attachments: [String] = []
+        for case let url as URL in files {
+            let ext = url.pathExtension.lowercased()
+            guard ext == "md" || Self.attachmentTypes.contains(ext),
                   let values = try? url.resourceValues(forKeys: Set(keys)),
-                  values.isRegularFile == true, values.isSymbolicLink != true else { return nil }
+                  values.isRegularFile == true, values.isSymbolicLink != true else { continue }
             let location = url.resolvingSymlinksInPath().standardizedFileURL
-            guard location.path.hasPrefix(prefix) else { return nil }
-            return Note(url: location, path: String(location.path.dropFirst(prefix.count)))
+            guard location.path.hasPrefix(prefix) else { continue }
+            let relative = String(location.path.dropFirst(prefix.count))
+            if ext == "md" {
+                notes.append(Note(url: location, path: relative, modified: values.contentModificationDate ?? .distantPast))
+            } else {
+                attachments.append(relative)
+            }
         }
-        .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        notes.sort { $0.modified > $1.modified }
+        return (notes, attachments)
     }
 
     func read(_ url: URL) throws -> String {
@@ -62,7 +75,7 @@ private actor VaultFiles {
             let url = folder.appendingPathComponent(filename)
             do {
                 try Data((header + citation).utf8).write(to: url, options: .withoutOverwriting)
-                return Note(url: url, path: "Reading Desk/" + filename)
+                return Note(url: url, path: "Reading Desk/" + filename, modified: .now)
             } catch let error as CocoaError where error.code == .fileWriteFileExists {
                 continue
             }
@@ -75,13 +88,14 @@ private actor VaultFiles {
 final class Vault: ObservableObject {
     @Published private(set) var root: URL?
     @Published private(set) var notes: [Note] = []
+    @Published private(set) var attachments: [String] = []
     @Published private(set) var selection: Note?
     @Published var text = ""
     @Published private(set) var status = ""
     @Published private(set) var error: String?
     @Published private(set) var busy = false
     @Published var showPicker = true
-    @Published var preview = false
+    @Published var preview = true
 
     private var savedText = ""
     private var autosave: Task<Void, Never>?
@@ -124,7 +138,8 @@ final class Vault: ObservableObject {
         do {
             let results = try await files.index(url)
             root = url
-            notes = results
+            notes = results.notes
+            attachments = results.attachments
             selection = nil
             text = ""
             savedText = ""
@@ -141,7 +156,9 @@ final class Vault: ObservableObject {
         busy = true
         defer { busy = false }
         do {
-            notes = try await files.index(root)
+            let results = try await files.index(root)
+            notes = results.notes
+            attachments = results.attachments
             if !isDirty { error = nil }
         } catch { self.error = error.localizedDescription }
     }
@@ -151,6 +168,7 @@ final class Vault: ObservableObject {
         busy = true
         defer { busy = false }
         guard await flush() else { return }
+        preview = true
         await read(note)
     }
 
@@ -182,8 +200,7 @@ final class Vault: ObservableObject {
         guard await flush() else { return }
         do {
             let note = try await files.create(title: title, source: source, in: root)
-            notes.append(note)
-            notes.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+            notes.insert(note, at: 0)
             preview = false
             await read(note)
         } catch { self.error = error.localizedDescription }
@@ -233,6 +250,23 @@ final class Vault: ObservableObject {
         }
         saveTask = task
         return await task.value
+    }
+
+    func contents(of note: Note) async -> String? {
+        if note == selection { return text }
+        return try? await files.read(note.url)
+    }
+
+    /// Flips the checkbox on one line of the open note (from a click in reading view).
+    func toggleTask(atLine line: Int) {
+        var lines = text.components(separatedBy: "\n")
+        guard lines.indices.contains(line),
+              let range = lines[line].range(of: #"^([ \t]*[-*+][ \t]+|[ \t]*\d+[.)][ \t]+)\[(.)\]"#, options: .regularExpression) else { return }
+        let marker = lines[line][range]
+        let checked = marker.hasSuffix("[ ]") == false
+        let replaced = marker.dropLast(3) + (checked ? "[ ]" : "[x]")
+        lines[line].replaceSubrange(range, with: replaced)
+        edit(lines.joined(separator: "\n"))
     }
 
     func resolve(_ link: String) -> Note? {

@@ -11,8 +11,11 @@ bundle="$stage_dir/Reading Desk.app"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp "$project_dir/Resources/Info.plist" "$bundle/Contents/Info.plist"
 cp "$project_dir/Resources/helium.js" "$project_dir/Resources/DeskIcon.icns" "$bundle/Contents/Resources/"
+cp -R "$project_dir/Resources/Fonts" "$project_dir/Resources/web" "$bundle/Contents/Resources/"
 swiftc -target "$(uname -m)-apple-macosx14.0" -O -whole-module-optimization -module-name ReadingDesk \
     "$project_dir"/Sources/*.swift -o "$bundle/Contents/MacOS/ReadingDesk"
-codesign --force --sign - "$bundle"
+# Ad-hoc signatures change every build, which makes macOS forget the Automation
+# (control Helium) permission. Pinning the designated requirement to the bundle ID keeps it.
+codesign --force --sign - --requirements '=designated => identifier "dev.readingdesk.mac"' "$bundle"
 ditto "$bundle" "$output_dir/Reading Desk.app"
 printf '%s\n' "$output_dir/Reading Desk.app"

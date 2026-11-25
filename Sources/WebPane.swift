@@ -20,11 +20,19 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     private static var popups: [ObjectIdentifier: WebPage] = [:]
 
     lazy var view: WKWebView = {
-        let view = WKWebView(frame: .zero, configuration: suppliedConfiguration ?? WKWebViewConfiguration())
+        let configuration = suppliedConfiguration ?? {
+            let configuration = WKWebViewConfiguration()
+            // Present as Safari. Google (Gemini) refuses sign-in from "embedded" web views otherwise.
+            configuration.applicationNameForUserAgent = "Version/18.0 Safari/605.1.15"
+            return configuration
+        }()
+        let view = WKWebView(frame: .zero, configuration: configuration)
         suppliedConfiguration = nil
         view.navigationDelegate = self
         view.uiDelegate = self
         view.allowsBackForwardNavigationGestures = true
+        view.allowsMagnification = true
+        view.underPageBackgroundColor = NSColor(Theme.ground)
         view.isInspectable = ProcessInfo.processInfo.arguments.contains("--inspect")
         @MainActor func watch<Value>(_ path: KeyPath<WKWebView, Value>) {
             observations.append(view.observe(path, options: [.new]) { [weak self] _, _ in
@@ -59,6 +67,12 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     func retry() {
         if failure != nil, let url = state.url ?? requested { load(url) }
         else { view.reload() }
+    }
+
+    func copyLink() {
+        guard let url = state.url else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
@@ -129,6 +143,7 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
         window.title = navigationAction.request.url?.host ?? "Reading Desk"
+        window.appearance = NSAppearance(named: .darkAqua)
         window.isReleasedWhenClosed = false
         window.contentView = child.view
         window.delegate = child
@@ -154,63 +169,160 @@ struct WebSurface: NSViewRepresentable {
     func updateNSView(_ nsView: WKWebView, context: Context) {}
 }
 
+/// A web page with no toolbar at all. The only chrome is a small floating pill
+/// in the corner: a link button that expands on hover into back / forward /
+/// reload / open-in-Helium.
 struct BrowserPane: View {
+    @ObservedObject var page: WebPage
+    var showsChrome = true
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            WebSurface(page: page)
+            if let failure = page.failure {
+                FailureView(page: page, message: failure)
+            } else if page.state.loading {
+                LoadingStreak()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .allowsHitTesting(false)
+            }
+            if showsChrome {
+                // Bottom-right: site nav bars live at the top, so this rarely covers anything.
+                PageChrome(page: page)
+                    .padding(.bottom, 14).padding(.trailing, 16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+            }
+        }
+        .background(Theme.ground)
+    }
+}
+
+private struct PageChrome: View {
+    @ObservedObject var page: WebPage
+    @State private var hovered = false
+    @State private var copied = false
+
+    var body: some View {
+        if let url = page.state.url {
+            HStack(spacing: 0) {
+                // Back is always there once there's somewhere to go back to.
+                if page.state.back || hovered {
+                    ChromeButton("arrow.left", help: "Back (⌘[)") { page.view.goBack() }
+                        .disabled(!page.state.back)
+                }
+                if page.state.forward || hovered {
+                    ChromeButton("arrow.right", help: "Forward (⌘])") { page.view.goForward() }
+                        .disabled(!page.state.forward)
+                }
+                if hovered {
+                    ChromeButton(page.state.loading ? "xmark" : "arrow.clockwise", help: page.state.loading ? "Stop" : "Reload") {
+                        if page.state.loading { page.view.stopLoading() } else { page.retry() }
+                    }
+                    ChromeButton("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
+                    Rectangle().fill(Theme.rule).frame(width: 1, height: 14).padding(.horizontal, 3)
+                }
+                ChromeButton(copied ? "checkmark" : "link", help: "Copy link") {
+                    page.copyLink()
+                    withAnimation(.easeOut(duration: 0.15)) { copied = true }
+                    Task {
+                        try? await Task.sleep(for: .seconds(1.4))
+                        withAnimation(.easeOut(duration: 0.2)) { copied = false }
+                    }
+                }
+                .foregroundStyle(copied ? Theme.accent : Theme.ink)
+            }
+            .padding(2)
+            .background(Capsule().fill(Theme.ground.opacity(0.88)))
+            .overlay(Capsule().strokeBorder(Color.white.opacity(0.10)))
+            .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+            .opacity(hovered || copied ? 1 : page.state.back ? 0.85 : 0.5)
+            .environment(\.colorScheme, .dark)
+            .onHover { inside in withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) { hovered = inside } }
+        }
+    }
+}
+
+/// Back / reload for the chat pane, which has no page chrome of its own.
+struct ChatControls: View {
     @ObservedObject var page: WebPage
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 3) {
-                DeskIcon("chevron.left", help: "Go back") { page.view.goBack() }
-                    .disabled(!page.state.back)
-                DeskIcon("chevron.right", help: "Go forward") { page.view.goForward() }
-                    .disabled(!page.state.forward)
-                DeskIcon(page.state.loading ? "xmark" : "arrow.clockwise", help: page.state.loading ? "Stop loading" : "Reload") {
-                    if page.state.loading { page.view.stopLoading() } else { page.retry() }
-                }
-                Spacer(minLength: 6)
-                if let url = page.state.url {
-                    Text(url.isFileURL ? url.lastPathComponent : url.host ?? url.absoluteString)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(Theme.muted)
-                        .lineLimit(1)
-                        .help(url.absoluteString)
-                    Spacer(minLength: 6)
-                    DeskIcon("link", help: "Copy page link") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(url.absoluteString, forType: .string)
-                    }
-                    DeskIcon("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
-                }
+        HStack(spacing: 0) {
+            DeskIcon("arrow.left", help: "Back") { page.view.goBack() }
+                .disabled(!page.state.back)
+            DeskIcon(page.state.loading ? "xmark" : "arrow.clockwise", help: page.state.loading ? "Stop" : "Reload") {
+                if page.state.loading { page.view.stopLoading() } else { page.retry() }
             }
-            .padding(.horizontal, 10)
-            .frame(height: 40)
-            .background(Theme.paper)
-            Rectangle().fill(Theme.line).frame(height: 1)
-            ZStack {
-                WebSurface(page: page)
-                if let failure = page.failure {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Image(systemName: "wifi.exclamationmark").font(.title2).foregroundStyle(Theme.accent)
-                        Text("Couldn’t load this page").font(.title2.weight(.semibold))
-                        Text(failure).font(.callout).foregroundStyle(Theme.muted)
-                        HStack {
-                            Button("Try again") { page.retry() }.buttonStyle(DeskButtonStyle(prominent: true))
-                            if let url = page.state.url {
-                                Button("Open in Helium") { Helium.open(url) }.buttonStyle(DeskButtonStyle())
-                            }
-                        }
-                    }
-                    .frame(maxWidth: 420, alignment: .leading)
-                    .padding(28)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Theme.paper)
-                } else if page.state.loading {
-                    VStack {
-                        ProgressView().progressViewStyle(.linear).tint(Theme.accent)
-                        Spacer(minLength: 0)
-                    }.allowsHitTesting(false)
-                }
+            if let url = page.state.url {
+                DeskIcon("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
             }
         }
+    }
+}
+
+private struct ChromeButton: View {
+    let symbol: String
+    let help: String
+    let action: () -> Void
+    @Environment(\.isEnabled) private var enabled
+
+    init(_ symbol: String, help: String, action: @escaping () -> Void) {
+        self.symbol = symbol
+        self.help = help
+        self.action = action
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 26, height: 26)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .opacity(enabled ? 1 : 0.35)
+        .help(help)
+        .accessibilityLabel(help)
+        .transition(.opacity.combined(with: .scale(scale: 0.8)))
+    }
+}
+
+private struct LoadingStreak: View {
+    @State private var phase = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            Rectangle()
+                .fill(LinearGradient(colors: [.clear, Theme.accent, .clear], startPoint: .leading, endPoint: .trailing))
+                .frame(width: geometry.size.width * 0.35, height: 2)
+                .offset(x: phase ? geometry.size.width : -geometry.size.width * 0.35)
+                .onAppear {
+                    withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: false)) { phase = true }
+                }
+        }
+        .frame(height: 2)
+    }
+}
+
+private struct FailureView: View {
+    @ObservedObject var page: WebPage
+    let message: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("This page didn’t come through.").font(Theme.serif(34))
+            Text(message).font(Theme.sans(13)).foregroundStyle(Theme.ink3)
+            HStack(spacing: 10) {
+                Button("Try again") { page.retry() }.buttonStyle(DeskButtonStyle(.primary))
+                if let url = page.state.url {
+                    Button("Open in Helium") { Helium.open(url) }.buttonStyle(DeskButtonStyle(.outline))
+                }
+            }
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: 440, alignment: .leading)
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.ground)
     }
 }

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct NotesPane: View {
     @ObservedObject var vault: Vault
+    @ObservedObject var renderer: NoteRenderer
     let source: BrowserTab
     @State private var query = ""
     @State private var noteTitle = ""
@@ -10,94 +11,64 @@ struct NotesPane: View {
     @FocusState private var titleFocused: Bool
 
     private var matches: [Note] {
-        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let search = query.trimmed
         return search.isEmpty ? vault.notes : vault.notes.filter { $0.path.localizedCaseInsensitiveContains(search) }
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 4) {
-                if vault.root != nil {
-                    DeskIcon("list.bullet", help: "Browse notes") { vault.showPicker.toggle() }
-                }
-                Text(vault.root?.lastPathComponent ?? "Obsidian")
-                    .font(.system(size: 12, weight: .semibold))
-                    .padding(.leading, vault.root == nil ? 6 : 0)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-                if vault.root != nil {
-                    DeskIcon("plus", help: "New note") {
-                        noteTitle = String(source.displayTitle.prefix(120))
-                        creating = true
-                    }
-                    .disabled(vault.busy)
-                    Menu {
-                        Button("Refresh notes") { Task { await vault.refresh() } }
-                        Button("Choose another vault…") { Task { await vault.chooseFolder() } }
-                        Button("Open in Obsidian") { vault.openInObsidian() }
-                        if vault.selection != nil {
-                            Button("Reload note from disk…") { requestReload() }
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis").font(.system(size: 13, weight: .semibold)).frame(width: 24)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .accessibilityLabel("Note actions")
-                }
-            }
-            .foregroundStyle(Theme.accent)
-            .padding(.horizontal, 10)
-            .frame(height: 40)
-            SurfaceRule()
+            header
+            Hairline()
             if let error = vault.error {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(error).font(.caption).foregroundStyle(Theme.error).fixedSize(horizontal: false, vertical: true)
+                    Text(error).font(Theme.sans(12)).foregroundStyle(Theme.error).fixedSize(horizontal: false, vertical: true)
                     if vault.isDirty {
-                        HStack {
-                            Button("Copy draft") {
+                        HStack(spacing: 14) {
+                            TextAction(title: "Copy draft") {
                                 NSPasteboard.general.clearContents()
                                 NSPasteboard.general.setString(vault.text, forType: .string)
-                            }.buttonStyle(DeskButtonStyle())
-                            Button("Reload…") { requestReload() }.buttonStyle(DeskButtonStyle())
+                            }
+                            TextAction(title: "Reload from disk…") { requestReload() }
                         }
                     }
                 }
-                .padding(12)
+                .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.panel)
-                SurfaceRule()
+                Hairline()
             }
             if vault.root == nil {
                 connect
             } else if vault.showPicker || vault.selection == nil {
                 picker
             } else if let note = vault.selection {
-                editor(note)
-            }
-        }
-        .background(Theme.paper)
-        .task { await vault.refresh() }
-        .sheet(isPresented: $creating) {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("New note").font(Theme.display(25))
-                TextField("Note title", text: $noteTitle).focused($titleFocused).textFieldStyle(.roundedBorder)
-                HStack {
-                    Spacer()
-                    Button("Cancel") { creating = false }.keyboardShortcut(.cancelAction)
-                    Button("Create") {
-                        creating = false
-                        let title = noteTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-                        Task { await vault.create(title, source: source) }
+                ZStack(alignment: .bottomTrailing) {
+                    if vault.preview {
+                        NoteWebView(renderer: renderer)
+                            .onAppear { renderer.show(note, text: vault.text) }
+                            .onChange(of: vault.text) { _, text in renderer.show(note, text: text) }
+                            .onChange(of: note) { _, next in renderer.show(next, text: vault.text) }
+                    } else {
+                        MarkdownEditor(text: vault.text) { vault.edit($0) }
+                            .id(note.id)
                     }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(noteTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if vault.isDirty || vault.status != "Saved" {
+                        Text(vault.status).font(Theme.mono(10)).foregroundStyle(Theme.ink4)
+                            .padding(.horizontal, 14).padding(.vertical, 10)
+                            .accessibilityIdentifier("save-status")
+                    }
                 }
             }
-            .padding(24).frame(width: 380)
-            .onAppear { titleFocused = true }
         }
+        .background(Theme.notes)
+        .background {
+            ShortcutButton("Toggle source mode", "e") { if vault.selection != nil { vault.preview.toggle() } }
+            ShortcutButton("Save", "s") { Task { await vault.flush() } }
+        }
+        .task {
+            renderer.vault = vault
+            await vault.refresh()
+        }
+        .sheet(isPresented: $creating) { newNoteSheet }
         .confirmationDialog("Reload this note from disk?", isPresented: $confirmingReload) {
             Button("Discard draft and reload", role: .destructive) { Task { await vault.reload() } }
         } message: {
@@ -105,200 +76,195 @@ struct NotesPane: View {
         }
     }
 
-    private func requestReload() {
-        if vault.isDirty { confirmingReload = true }
-        else { Task { await vault.reload() } }
+    private var header: some View {
+        HStack(spacing: 2) {
+            if vault.root != nil {
+                DeskIcon(vault.showPicker ? "doc.text" : "sidebar.left", help: vault.showPicker ? "Back to note" : "All notes") {
+                    if vault.selection != nil || !vault.showPicker { vault.showPicker.toggle() }
+                }
+                .disabled(vault.showPicker && vault.selection == nil)
+            }
+            breadcrumb.padding(.leading, 4)
+            Spacer(minLength: 6)
+            if vault.root != nil {
+                if vault.selection != nil && !vault.showPicker {
+                    DeskIcon(vault.preview ? "chevron.left.forwardslash.chevron.right" : "text.book.closed",
+                             help: vault.preview ? "Source mode (⌘E)" : "Live preview (⌘E)") {
+                        vault.preview.toggle()
+                    }
+                }
+                DeskIcon("square.and.pencil", help: "New note for this page") {
+                    noteTitle = String(source.displayTitle.prefix(120))
+                    creating = true
+                }
+                .disabled(vault.busy)
+                Menu {
+                    Button("Refresh notes") { Task { await vault.refresh() } }
+                    Button("Choose another vault…") { Task { await vault.chooseFolder() } }
+                    Button("Open in Obsidian") { vault.openInObsidian() }
+                    if vault.selection != nil { Button("Reload note from disk…") { requestReload() } }
+                } label: {
+                    Image(systemName: "ellipsis").font(.system(size: 12)).foregroundStyle(Theme.ink3).frame(width: 26, height: 28)
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .accessibilityLabel("Note actions")
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 40)
+    }
+
+    @ViewBuilder private var breadcrumb: some View {
+        if let root = vault.root {
+            HStack(spacing: 5) {
+                Text(root.lastPathComponent).foregroundStyle(Theme.ink3)
+                if let note = vault.selection, !vault.showPicker {
+                    let parts = note.path.split(separator: "/").map(String.init)
+                    ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
+                        Text("/").foregroundStyle(Theme.ink4)
+                        Text(index == parts.count - 1 ? part.replacingOccurrences(of: ".md", with: "") : part)
+                            .foregroundStyle(index == parts.count - 1 ? Theme.ink : Theme.ink3)
+                    }
+                }
+            }
+            .font(Theme.sans(12, .medium))
+            .lineLimit(1)
+            .truncationMode(.head)
+        } else {
+            Text("Obsidian").font(Theme.sans(12, .medium)).foregroundStyle(Theme.ink3)
+        }
     }
 
     private var connect: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Image(systemName: "folder").font(.system(size: 26, weight: .light)).foregroundStyle(Theme.accent)
-            Text("Connect a vault").font(Theme.display(27))
-            Text("Open your Obsidian folder to read and edit Markdown beside the page.")
-                .font(.callout).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
-            if let suggested = vault.suggested {
-                Button("Use Dev vault") { Task { await vault.use(suggested) } }
-                    .buttonStyle(DeskButtonStyle(prominent: true)).disabled(vault.busy)
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Your notes, beside the page.").font(Theme.serif(30)).foregroundStyle(Theme.ink)
+            Text("Connect an Obsidian vault to read and write Markdown here. Callouts, links, embeds and math render the way Obsidian renders them.")
+                .font(Theme.sans(13)).lineSpacing(3).foregroundStyle(Theme.ink3).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                if let suggested = vault.suggested {
+                    Button("Use “\(suggested.lastPathComponent)” vault") { Task { await vault.use(suggested) } }
+                        .buttonStyle(DeskButtonStyle(.primary)).disabled(vault.busy)
+                }
+                Button("Choose folder…") { Task { await vault.chooseFolder() } }
+                    .buttonStyle(DeskButtonStyle(.outline)).disabled(vault.busy)
             }
-            Button("Choose folder…") { Task { await vault.chooseFolder() } }
-                .buttonStyle(DeskButtonStyle()).disabled(vault.busy)
+            .padding(.top, 4)
         }
-        .padding(26)
+        .padding(28)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var picker: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 7) {
-                Image(systemName: "magnifyingglass").foregroundStyle(Theme.muted)
-                TextField("Find a note", text: $query).textFieldStyle(.plain)
+            Button {
+                noteTitle = String(source.displayTitle.prefix(120))
+                creating = true
+            } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("New note for this page").font(Theme.sans(11.5, .medium)).foregroundStyle(Theme.accent)
+                    Text(source.displayTitle).font(Theme.serif(18)).foregroundStyle(Theme.ink).lineLimit(2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.surface))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.rule))
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 10).frame(height: 34)
-            .background(Theme.panel, in: RoundedRectangle(cornerRadius: 5))
-            .padding(12)
+            .buttonStyle(.plain)
+            .padding(.horizontal, 14).padding(.top, 14)
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(Theme.ink3)
+                TextField("Find a note", text: $query).textFieldStyle(.plain).font(Theme.sans(13))
+            }
+            .padding(.horizontal, 12).frame(height: 32)
+            .overlay(Capsule().strokeBorder(Theme.rule))
+            .padding(14)
+
             if vault.busy && vault.notes.isEmpty {
-                ProgressView().controlSize(.small).padding(12)
+                ProgressView().controlSize(.small).padding(16)
                 Spacer()
             } else if matches.isEmpty {
-                Text(query.isEmpty ? "This vault has no Markdown notes." : "No matching notes.")
-                    .foregroundStyle(Theme.muted).padding(12)
+                Text(query.isEmpty ? "This vault has no notes yet." : "No matching notes.")
+                    .font(Theme.serif(17, italic: true)).foregroundStyle(Theme.ink3).padding(16)
                 Spacer()
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(matches) { note in
-                            Button {
-                                Task { await vault.open(note) }
-                            } label: {
-                                HStack(alignment: .top, spacing: 9) {
-                                    Image(systemName: "doc.text").foregroundStyle(Theme.accent)
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(note.name).font(.system(size: 12, weight: .semibold)).lineLimit(1)
-                                        if note.path.contains("/") {
-                                            Text(note.path).font(.caption2).foregroundStyle(Theme.muted).lineLimit(1)
-                                        }
-                                    }
-                                    Spacer(minLength: 0)
-                                }
-                                .padding(.horizontal, 13).padding(.vertical, 10)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(vault.busy)
-                            .background(vault.selection == note ? Theme.panel : .clear)
-                            SurfaceRule().padding(.leading, 13)
-                        }
+                        ForEach(matches) { note in NoteRow(note: note, selected: vault.selection == note) { Task { await vault.open(note) } } }
                     }
+                    .padding(.bottom, 20)
                 }
             }
         }
     }
 
-    private func editor(_ note: Note) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(note.name).font(Theme.display(19)).lineLimit(1)
-                    Text(note.path).font(.caption2).foregroundStyle(Theme.muted).lineLimit(1)
-                }
-                Spacer(minLength: 4)
-                Button(vault.preview ? "Edit" : "Preview") { vault.preview.toggle() }
-                    .buttonStyle(DeskButtonStyle())
-            }
-            .padding(12)
-            SurfaceRule()
-            if vault.preview {
-                MarkdownPreview(text: vault.text, vault: vault)
-            } else {
-                TextEditor(text: Binding(get: { vault.text }, set: { vault.edit($0) }))
-                    .font(.system(size: 13, design: .monospaced))
-                    .scrollContentBackground(.hidden)
-                    .padding(8)
-                    .foregroundStyle(Theme.ink)
-                    .disabled(vault.busy)
-                    .accessibilityLabel("Markdown editor")
-            }
-            SurfaceRule()
+    private var newNoteSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("New note").font(Theme.serif(28))
+            TextField("Title", text: $noteTitle)
+                .focused($titleFocused)
+                .textFieldStyle(.plain)
+                .font(Theme.sans(14))
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Theme.surface))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.rule))
+            Text("Saved to Reading Desk/ in your vault, with a link back to this page.")
+                .font(Theme.sans(11.5)).foregroundStyle(Theme.ink3)
             HStack {
-                Text(vault.status).font(.caption).foregroundStyle(vault.error == nil ? Theme.muted : Theme.error)
-                    .accessibilityIdentifier("save-status")
                 Spacer()
-                Button("Save") { Task { await vault.flush() } }
-                    .buttonStyle(DeskButtonStyle())
-                    .keyboardShortcut("s", modifiers: .command)
-                    .disabled(!vault.isDirty || vault.busy)
+                Button("Cancel") { creating = false }.buttonStyle(DeskButtonStyle(.outline)).keyboardShortcut(.cancelAction)
+                Button("Create") {
+                    creating = false
+                    let title = noteTitle.trimmed
+                    Task { await vault.create(title, source: source) }
+                }
+                .buttonStyle(DeskButtonStyle(.primary))
+                .keyboardShortcut(.defaultAction)
+                .disabled(noteTitle.trimmed.isEmpty)
             }
-            .padding(.horizontal, 12).frame(height: 40)
         }
+        .padding(26).frame(width: 420)
+        .background(Theme.ground)
+        .preferredColorScheme(.dark)
+        .onAppear { titleFocused = true }
+    }
+
+    private func requestReload() {
+        if vault.isDirty { confirmingReload = true }
+        else { Task { await vault.reload() } }
     }
 }
 
-private struct MarkdownPreview: View {
-    let text: String
-    let vault: Vault
-    private static let wiki = try! NSRegularExpression(pattern: #"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]"#)
+private struct NoteRow: View {
+    let note: Note
+    let selected: Bool
+    let action: () -> Void
+    @State private var hovered = false
+
+    private var folder: String? {
+        guard let slash = note.path.lastIndex(of: "/") else { return nil }
+        return String(note.path[..<slash])
+    }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                    lineView(line)
+        Button(action: action) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(note.name).font(Theme.sans(13.5, .medium)).foregroundStyle(Theme.ink).lineLimit(1)
+                    if let folder { Text(folder).font(Theme.mono(10)).foregroundStyle(Theme.ink4).lineLimit(1) }
+                }
+                Spacer(minLength: 8)
+                if note.modified > .distantPast {
+                    Text(note.modified, format: .relative(presentation: .named, unitsStyle: .abbreviated))
+                        .font(Theme.mono(10)).foregroundStyle(Theme.ink4)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(16)
+            .padding(.horizontal, 16).padding(.vertical, 9)
+            .background(selected || hovered ? Theme.surface : .clear)
+            .contentShape(Rectangle())
         }
-        .environment(\.openURL, OpenURLAction { url in
-            if url.scheme == "desk-note" {
-                let target = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first?.value ?? ""
-                if let note = vault.resolve(target) { Task { await vault.open(note) } }
-                return .handled
-            }
-            if ["http", "https", "mailto", "obsidian"].contains(url.scheme ?? "") { return .systemAction }
-            return .discarded
-        })
-    }
-
-    private struct Line {
-        let content: String
-        let inCode: Bool
-    }
-
-    private var lines: [Line] {
-        var inCode = false
-        var visible: [Line] = []
-        for line in text.components(separatedBy: .newlines) {
-            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") { inCode.toggle() }
-            else { visible.append(Line(content: line, inCode: inCode)) }
-        }
-        return visible
-    }
-
-    @ViewBuilder private func lineView(_ line: Line) -> some View {
-        let value = line.content
-        if line.inCode {
-            Text(verbatim: value.isEmpty ? " " : value)
-                .font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8).padding(.vertical, 2)
-                .background(Theme.panel)
-        } else if value.isEmpty {
-            Color.clear.frame(height: 9)
-        } else {
-            let level = value.prefix(while: { $0 == "#" }).count
-            if (1...6).contains(level), value.dropFirst(level).first == " " {
-                Text(inline(String(value.dropFirst(level + 1))))
-                    .font(Theme.display(level == 1 ? 24 : level == 2 ? 19 : 16))
-                    .padding(.vertical, 4)
-                    .textSelection(.enabled)
-            } else if value == "---" {
-                SurfaceRule().padding(.vertical, 7)
-            } else {
-                let formatted = value.hasPrefix("- [ ] ") ? "☐ " + value.dropFirst(6) :
-                    value.hasPrefix("- [x] ") ? "☑ " + value.dropFirst(6) :
-                    value.hasPrefix("- ") ? "•  " + value.dropFirst(2) : value
-                Text(inline(String(formatted))).font(.system(size: 13))
-                    .lineSpacing(3).padding(.vertical, 2).textSelection(.enabled)
-            }
-        }
-    }
-
-    private func inline(_ value: String) -> AttributedString {
-        var processed = value
-        let range = NSRange(value.startIndex..<value.endIndex, in: value)
-        for match in Self.wiki.matches(in: value, range: range).reversed() {
-            guard let token = Range(match.range, in: processed), let targetRange = Range(match.range(at: 1), in: processed) else { continue }
-            let target = String(processed[targetRange])
-            let alias = Range(match.range(at: 2), in: processed).map { String(processed[$0]) } ?? target
-            var components = URLComponents()
-            components.scheme = "desk-note"
-            components.host = "open"
-            components.queryItems = [URLQueryItem(name: "name", value: target)]
-            if let url = components.url {
-                let safeAlias = alias.replacingOccurrences(of: "[", with: "\\[").replacingOccurrences(of: "]", with: "\\]")
-                processed.replaceSubrange(token, with: "[\(safeAlias)](<\(url.absoluteString)>)")
-            }
-        }
-        return (try? AttributedString(markdown: processed, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(value)
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
     }
 }

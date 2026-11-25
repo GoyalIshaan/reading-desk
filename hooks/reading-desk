@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Read and reorganize Reading Desk's open tabs from the command line.
+
+The app exports a live snapshot of every tab (with its shelf) and watches a
+commands folder. This talks to both, so you — or another agent — can sort tabs
+into shelves without touching the UI. The app applies changes within ~1 second.
+
+Examples:
+  reading-desk tabs                      # every tab and its shelf
+  reading-desk tabs --json               # same, as JSON (for agents)
+  reading-desk tabs --shelf "Everything else"
+  reading-desk shelves
+  reading-desk ensure-shelf "To read on the plane" --icon airplane
+  reading-desk assign https://arxiv.org/abs/1706.03762 "Papers & research"
+  reading-desk assign-site news.ycombinator.com "Everything else"
+  reading-desk auto https://example.com  # back to automatic filing
+  reading-desk refresh                   # re-read Helium
+  reading-desk apply plan.json           # a JSON array of commands at once
+  echo '[{"op":"assign","url":"...","category":"ai"}]' | reading-desk apply -
+"""
+import argparse, json, os, sys, time, uuid
+
+BASE = os.path.expanduser("~/Library/Application Support/dev.readingdesk.mac")
+STATE = os.path.join(BASE, "state.json")
+CMDS = os.path.join(BASE, "commands")
+
+
+def state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        sys.exit("No snapshot yet — open Reading Desk once so it can export state.json.")
+
+
+def queue(commands):
+    os.makedirs(CMDS, exist_ok=True)
+    name = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}.json"
+    tmp = os.path.join(CMDS, "." + name)
+    with open(tmp, "w") as f:
+        json.dump(commands, f)
+    os.replace(tmp, os.path.join(CMDS, name))
+    n = len(commands) if isinstance(commands, list) else 1
+    print(f"Queued {n} command(s). Reading Desk applies them within ~1s; re-run `tabs` to confirm.")
+
+
+def cmd_tabs(a):
+    s = state()
+    tabs = s.get("tabs", [])
+    if a.shelf:
+        tabs = [t for t in tabs if a.shelf.lower() in (t["category"].lower(), t["categoryName"].lower())]
+    if a.site:
+        tabs = [t for t in tabs if a.site.lower() in t["site"].lower()]
+    if a.auto_only:
+        tabs = [t for t in tabs if t["assignedBy"] == "auto"]
+    if a.json:
+        print(json.dumps(tabs, indent=2))
+        return
+    if not tabs:
+        print("No matching tabs.")
+        return
+    width = max(len(t["categoryName"]) for t in tabs)
+    for t in tabs:
+        mark = "*" if t.get("active") else " "
+        pin = {"tab": "·", "site": "#", "auto": " "}[t["assignedBy"]]
+        print(f"{mark}{pin} {t['categoryName']:<{width}}  {t['title'][:70]}")
+        print(f"     {' ':<{width}}  {t['url']}")
+    print(f"\n{len(tabs)} tab(s). Source: {s.get('source')} · updated {s.get('updated')}")
+    print("Legend: * active in Helium · ·=filed by tab · #=filed by site")
+
+
+def cmd_shelves(a):
+    s = state()
+    counts = {}
+    for t in s.get("tabs", []):
+        counts[t["category"]] = counts.get(t["category"], 0) + 1
+    rows = s.get("categories", [])
+    if a.json:
+        for r in rows:
+            r["count"] = counts.get(r["id"], 0)
+        print(json.dumps(rows, indent=2))
+        return
+    for r in rows:
+        tag = " (catch-all)" if r.get("isDefault") else ""
+        print(f'{counts.get(r["id"], 0):>3}  {r["name"]}{tag}  [id: {r["id"]}]')
+
+
+def cmd_assign(a):
+    queue({"op": "assign", "url": a.url, "category": a.shelf})
+
+
+def cmd_assign_site(a):
+    queue({"op": "assignSite", "site": a.site, "category": a.shelf})
+
+
+def cmd_auto(a):
+    queue({"op": "auto", "url": a.url})
+
+
+def cmd_ensure(a):
+    cmd = {"op": "ensureCategory", "name": a.name}
+    if a.icon:
+        cmd["icon"] = a.icon
+    queue(cmd)
+
+
+def cmd_refresh(a):
+    queue({"op": "refresh"})
+
+
+def cmd_apply(a):
+    raw = sys.stdin.read() if a.file == "-" else open(a.file).read()
+    data = json.loads(raw)
+    queue(data if isinstance(data, list) else [data])
+
+
+def main():
+    p = argparse.ArgumentParser(prog="reading-desk", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    t = sub.add_parser("tabs", help="list open tabs and their shelf")
+    t.add_argument("--json", action="store_true")
+    t.add_argument("--shelf", "--category", dest="shelf")
+    t.add_argument("--site")
+    t.add_argument("--auto-only", action="store_true", help="only tabs filed automatically")
+    t.set_defaults(func=cmd_tabs)
+
+    sh = sub.add_parser("shelves", help="list shelves and their ids")
+    sh.add_argument("--json", action="store_true")
+    sh.set_defaults(func=cmd_shelves)
+
+    asg = sub.add_parser("assign", help="put a tab (by url) on a shelf")
+    asg.add_argument("url")
+    asg.add_argument("shelf", help="shelf name or id")
+    asg.set_defaults(func=cmd_assign)
+
+    ass = sub.add_parser("assign-site", help="always file a whole site on a shelf")
+    ass.add_argument("site")
+    ass.add_argument("shelf")
+    ass.set_defaults(func=cmd_assign_site)
+
+    au = sub.add_parser("auto", help="return a tab to automatic filing")
+    au.add_argument("url")
+    au.set_defaults(func=cmd_auto)
+
+    en = sub.add_parser("ensure-shelf", help="create a shelf if it doesn't exist")
+    en.add_argument("name")
+    en.add_argument("--icon", help="SF Symbol name, e.g. airplane, flask, bookmark")
+    en.set_defaults(func=cmd_ensure)
+
+    rf = sub.add_parser("refresh", help="re-read tabs from Helium")
+    rf.set_defaults(func=cmd_refresh)
+
+    ap = sub.add_parser("apply", help="queue a JSON array of commands (file or - for stdin)")
+    ap.add_argument("file")
+    ap.set_defaults(func=cmd_apply)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

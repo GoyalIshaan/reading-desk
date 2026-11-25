@@ -34,10 +34,10 @@ final class Room: ObservableObject {
     func start(_ tabs: [BrowserTab], at first: BrowserTab, in categoryID: String) {
         let next = tabs.filter { $0.readableURL != nil }
         guard let index = next.firstIndex(of: first) else { return }
-        let previous = current
+        let canKeepPage = current == first
         self.categoryID = categoryID
         queue = next
-        if previous == first { self.index = index }
+        if canKeepPage { self.index = index }
         else { go(to: index) }
     }
 
@@ -97,7 +97,7 @@ struct DeskView: View {
     /// Not observed here: preview updates should only re-render the library, never the reading room.
     let previews: Previews
     let renderer: NoteRenderer
-    @AppStorage("fullscreenOnOpen") private var fullscreenOnOpen = true
+    @AppStorage("fullscreenOnOpen") private var fullscreenOnOpen = false
     @AppStorage("closeInHelium") private var closeInHelium = true
     @AppStorage("readerFraction") private var readerFraction = 0.62
     @State private var draggedFraction: Double?
@@ -109,29 +109,73 @@ struct DeskView: View {
     @State private var showingQueue = false
     @State private var toast: String?
     @State private var paletteOpen = false
+    @State private var editingShelves = false
     @State private var toastTask: Task<Void, Never>?
+    /// Drives the library → reader transition: false while the room is still arriving.
+    @State private var revealed = false
+    @State private var hero: Hero?
+    @State private var heroTask: Task<Void, Never>?
+    @State private var transition = 0
+    @State private var windowSize: CGSize = .zero
+    /// The floating dock at the bottom of the page: hidden until the pointer comes near.
+    @State private var dockHover = false
+    @State private var dockFlash = false
+    @State private var dockFlashTask: Task<Void, Never>?
+    @State private var dockMonitor: Any?
+    @State private var bridge: DeskBridge?
+
+    private var dockVisible: Bool { dockHover || dockFlash || showingQueue }
+    private var titleBarHeight: CGFloat { fullscreen ? 0 : 28 }
+
+    struct Hero {
+        var image: NSImage?
+        var title: String
+        var site: String
+        var from: CGRect
+        var expanded = false
+    }
+
+    /// Where the reading pane sits, so the hero card can land exactly on it.
+    private var readerRect: CGRect {
+        let top = titleBarHeight
+        let width = Double(windowSize.width - 7)
+        guard width > 0 else { return .zero }
+        let minimum = 420 / width
+        let maximum = max(minimum, 1 - 360 / width)
+        let fraction = min(max(readerFraction, minimum), maximum)
+        return CGRect(x: 0, y: top, width: CGFloat(width * fraction), height: windowSize.height - top)
+    }
 
     var body: some View {
         ZStack(alignment: .bottom) {
             // The library stays alive underneath so coming back is instant and keeps its scroll position.
             LibraryView(library: library, previews: previews, selectedCategory: $selectedCategory,
-                        fullscreenOnOpen: $fullscreenOnOpen, closeInHelium: $closeInHelium,
-                        topInset: fullscreen ? 0 : 1, open: open)
-                .opacity(reading ? 0 : 1)
+                        closeInHelium: closeInHelium, titleBarHeight: titleBarHeight, open: open)
+                .opacity(reading && revealed ? 0 : 1)
+                .scaleEffect(reading && revealed ? 0.965 : 1, anchor: .center)
                 .allowsHitTesting(!reading)
                 .disabled(reading)
                 .accessibilityHidden(reading)
             if reading, let source = room.current {
                 roomView(source)
             }
+            if let hero {
+                let rect = hero.expanded ? readerRect : hero.from
+                HeroCover(hero: hero)
+                    .frame(width: rect.width, height: rect.height)
+                    .clipShape(RoundedRectangle(cornerRadius: hero.expanded ? 0 : 6, style: .continuous))
+                    .shadow(color: .black.opacity(hero.expanded ? 0 : 0.5), radius: 30, y: 14)
+                    .position(x: rect.midX, y: rect.midY)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+                    .zIndex(1)
+            }
             if paletteOpen {
                 CommandPalette(library: library, previews: previews,
+                               fullscreenOnOpen: fullscreenOnOpen, closeInHelium: closeInHelium,
                                close: { withAnimation(.easeOut(duration: 0.14)) { paletteOpen = false } },
-                               openTab: { tab in open(library.category(for: tab).id, tab: tab) },
-                               openShelf: { id in
-                                   if reading { closeRoom() }
-                                   selectedCategory = id
-                               })
+                               openTab: { tab in open(library.category(for: tab).id, tab, nil) },
+                               openShelf: showShelf, performCommand: performPaletteCommand)
                     .transition(.opacity)
                     .zIndex(2)
             }
@@ -143,21 +187,34 @@ struct DeskView: View {
                     .background(Capsule().fill(Theme.raised))
                     .overlay(Capsule().strokeBorder(Color.white.opacity(0.08)))
                     .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
-                    .padding(.bottom, 26)
+                    .padding(.bottom, reading ? 84 : 26)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .allowsHitTesting(false)
             }
         }
         .frame(minWidth: 920, minHeight: 580)
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { windowSize = proxy.size }
+                    .onChange(of: proxy.size) { _, size in windowSize = size }
+            }
+        }
         .ignoresSafeArea()
         .foregroundStyle(Theme.ink)
         .background(Theme.ground)
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $editingShelves) { ShelvesEditor(library: library) }
         .task {
+            if bridge == nil {
+                let bridge = DeskBridge(library: library)
+                bridge.start()
+                self.bridge = bridge
+            }
             if !library.loaded { library.refresh() }
             if NoteRenderer.debug {
                 try? await Task.sleep(for: .seconds(1))
-                if let tab = library.tabs.first(where: { $0.readableURL != nil }) { open(library.category(for: tab).id, tab: tab) }
+                if let tab = library.tabs.first(where: { $0.readableURL != nil }) { open(library.category(for: tab).id, tab, nil) }
                 room.choose(.notes)
                 await vault.refresh()
                 if let note = vault.notes.first(where: { $0.path.contains("Attention") }) ?? vault.notes.first { await vault.open(note) }
@@ -178,7 +235,22 @@ struct DeskView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in fullscreen = false }
     }
 
-    private func open(_ categoryID: String, tab: BrowserTab? = nil) {
+    private func showShelf(_ id: String?) {
+        if reading { closeRoom() }
+        selectedCategory = id
+    }
+
+    private func performPaletteCommand(_ command: CommandPalette.Command) {
+        switch command {
+        case .allShelves: showShelf(nil)
+        case .refresh: library.refresh()
+        case .editShelves: editingShelves = true
+        case .toggleFullscreen: fullscreenOnOpen.toggle()
+        case .toggleCloseInHelium: closeInHelium.toggle()
+        }
+    }
+
+    private func open(_ categoryID: String, _ tab: BrowserTab?, _ origin: CGRect?) {
         let tabs = library.tabs.filter { library.category(for: $0).id == categoryID }
         guard let first = tab ?? tabs.first(where: { $0.readableURL != nil }) else { return }
         guard first.readableURL != nil else {
@@ -193,20 +265,55 @@ struct DeskView: View {
         room.start(tabs, at: first, in: categoryID)
         if room.companion != .notes { _ = room.chat(for: room.companion) }
         previews.paused = true
-        // Switch instantly; the full-screen animation is the only motion.
+        transition += 1
+        let id = transition
+
+        // 1. The room appears underneath, still "unrevealed"; the tapped card's
+        //    cover sits exactly where the card was.
         var instant = Transaction()
         instant.disablesAnimations = true
-        withTransaction(instant) { reading = true }
-        if fullscreenOnOpen, let window = NSApp.keyWindow, !window.styleMask.contains(.fullScreen) {
-            enteredFullScreen = true
-            DispatchQueue.main.async { window.toggleFullScreen(nil) }
+        withTransaction(instant) {
+            revealed = false
+            hero = origin.map { Hero(image: previews.images[first.address], title: first.displayTitle, site: first.sourceName, from: $0) }
+            reading = true
+        }
+        // 2. Next frame: the cover grows into the reading pane while the library
+        //    recedes and the side column slides in.
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.5, dampingFraction: 0.9)) {
+                revealed = true
+                hero?.expanded = true
+            }
+        }
+        // 3. Once the real page is there, the cover dissolves into it.
+        heroTask?.cancel()
+        heroTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(560))
+            for _ in 0..<14 where room.reader.state.loading {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard !Task.isCancelled, transition == id else { return }
+            withAnimation(.easeOut(duration: 0.35)) { hero = nil }
+            if fullscreenOnOpen, let window = NSApp.keyWindow, !window.styleMask.contains(.fullScreen) {
+                enteredFullScreen = true
+                window.toggleFullScreen(nil)
+            }
         }
     }
 
     private func closeRoom() {
-        var instant = Transaction()
-        instant.disablesAnimations = true
-        withTransaction(instant) { reading = false }
+        heroTask?.cancel()
+        hero = nil
+        transition += 1
+        let id = transition
+        withAnimation(.easeOut(duration: 0.24)) { revealed = false }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard transition == id else { return }
+            var instant = Transaction()
+            instant.disablesAnimations = true
+            withTransaction(instant) { reading = false }
+        }
         previews.paused = false
         if enteredFullScreen, let window = NSApp.keyWindow, window.styleMask.contains(.fullScreen) {
             window.toggleFullScreen(nil)
@@ -239,6 +346,30 @@ struct DeskView: View {
 
     // MARK: Reading room
 
+    /// The tapped card's cover, in flight from the grid to the reading pane.
+    private struct HeroCover: View {
+        let hero: Hero
+
+        var body: some View {
+            ZStack(alignment: .topLeading) {
+                Theme.surface
+                if let image = hero.image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .clipped()
+                } else {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(hero.site).font(Theme.mono(11)).foregroundStyle(Theme.ink3)
+                        Text(hero.title).font(Theme.serif(30)).foregroundStyle(Theme.ink).lineLimit(5)
+                    }
+                    .padding(32)
+                }
+            }
+        }
+    }
+
     private func roomView(_ source: BrowserTab) -> some View {
         let category = library.category(withID: room.categoryID) ?? library.other
         return VStack(spacing: 0) {
@@ -252,9 +383,12 @@ struct DeskView: View {
                 let maximum = max(minimum, 1 - 360 / width)
                 let fraction = min(max(draggedFraction ?? readerFraction, minimum), maximum)
                 HStack(spacing: 0) {
-                    BrowserPane(page: room.reader)
+                    BrowserPane(page: room.reader, showsChrome: false)
                         .frame(width: CGFloat(width * fraction))
+                        .overlay(alignment: .bottom) { dock(category).padding(.bottom, 18) }
+                        .opacity(revealed ? 1 : 0)
                     divider(fraction: fraction, width: width, minimum: minimum, maximum: maximum)
+                        .opacity(revealed ? 1 : 0)
                     VStack(spacing: 0) {
                         companionHeader(category)
                         Group {
@@ -268,12 +402,18 @@ struct DeskView: View {
                         .clipped()
                     }
                     .background(Theme.ground)
+                    .offset(x: revealed ? 0 : 56)
+                    .opacity(revealed ? 1 : 0)
                 }
                 .coordinateSpace(name: "split")
             }
         }
-        .background(Theme.ground)
+        // Fades in so the library can be seen receding behind it.
+        .background(Theme.ground.opacity(revealed ? 1 : 0))
         .background { roomShortcuts }
+        .onAppear(perform: installDockMonitor)
+        .onDisappear(perform: removeDockMonitor)
+        .onChange(of: room.index) { _, _ in flashDock() }
     }
 
     private var roomShortcuts: some View {
@@ -324,35 +464,6 @@ struct DeskView: View {
 
     private func companionHeader(_ category: Category) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
-                BackButton(help: "Back to library (⇧⌘[)") { closeRoom() }
-                Text(category.name)
-                    .font(Theme.serif(17, italic: true))
-                    .foregroundStyle(Theme.ink2)
-                    .lineLimit(1)
-                Spacer(minLength: 6)
-                HStack(spacing: 0) {
-                    DeskIcon("chevron.left", help: "Previous tab (⌥⌘←)") { room.go(to: room.index - 1) }
-                        .disabled(room.index == 0)
-                    Button { showingQueue.toggle() } label: {
-                        Text("\(room.index + 1) of \(room.queue.count)")
-                            .font(Theme.mono(11, .medium)).foregroundStyle(Theme.ink2)
-                            .padding(.horizontal, 4).frame(height: 28).contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("See every tab on this shelf")
-                    .popover(isPresented: $showingQueue, arrowEdge: .bottom) { queuePopover }
-                    DeskIcon("chevron.right", help: "Next tab (⌥⌘→)") { room.go(to: room.index + 1) }
-                        .disabled(room.index + 1 >= room.queue.count)
-                }
-                Button { finish() } label: {
-                    HStack(spacing: 6) { Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)); Text("Done") }
-                }
-                .buttonStyle(DeskButtonStyle(.primary))
-                .help(closeInHelium ? "Close this tab in Helium and open the next (⇧⌘D)" : "Mark read and open the next (⇧⌘D)")
-            }
-            .padding(.leading, 16).padding(.trailing, 12)
-            .frame(height: 50)
             HStack(alignment: .top, spacing: 0) {
                 CompanionTabs(selection: room.companion) { room.choose($0) }
                 if room.companion != .notes, let page = room.chat(for: room.companion) {
@@ -360,9 +471,61 @@ struct DeskView: View {
                 }
             }
             .padding(.horizontal, 16)
+            .padding(.top, 14)
             Hairline()
         }
         .background(Theme.ground)
+    }
+
+    // MARK: Floating dock
+
+    private func dock(_ category: Category) -> some View {
+        ReaderDock(page: room.reader, shelf: category.name, index: room.index, count: room.queue.count,
+                   closeInHelium: closeInHelium, showingQueue: $showingQueue,
+                   back: { closeRoom() },
+                   previous: { room.go(to: room.index - 1) },
+                   next: { room.go(to: room.index + 1) },
+                   done: { finish() },
+                   copied: { showToast("Link copied") },
+                   queue: { AnyView(queuePopover) })
+            .opacity(dockVisible ? 1 : 0)
+            .offset(y: dockVisible ? 0 : 10)
+            .allowsHitTesting(dockVisible)
+            .animation(.easeOut(duration: dockVisible ? 0.16 : 0.4), value: dockVisible)
+    }
+
+    /// Shows the dock for a moment so it's discoverable, then lets it fade.
+    private func flashDock() {
+        dockFlashTask?.cancel()
+        dockFlash = true
+        dockFlashTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2.2))
+            guard !Task.isCancelled else { return }
+            dockFlash = false
+        }
+    }
+
+    /// Watches the pointer instead of laying an invisible hover area over the
+    /// page, which would swallow clicks meant for the page itself.
+    private func installDockMonitor() {
+        guard dockMonitor == nil else { return }
+        NSApp.windows.forEach { $0.acceptsMouseMovedEvents = true }
+        dockMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { event in
+            guard let content = event.window?.contentView else { return event }
+            let point = event.locationInWindow
+            let y = content.bounds.height - point.y
+            let pane = readerRect
+            let near = point.x >= pane.minX && point.x <= pane.maxX && y >= pane.maxY - 120 && y <= pane.maxY + 2
+            if near != dockHover { dockHover = near }
+            return event
+        }
+        flashDock()
+    }
+
+    private func removeDockMonitor() {
+        if let dockMonitor { NSEvent.removeMonitor(dockMonitor) }
+        dockMonitor = nil
+        dockHover = false
     }
 
     private var queuePopover: some View {
@@ -406,6 +569,84 @@ struct DeskView: View {
             .onAppear { proxy.scrollTo(room.index, anchor: .center) }
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+/// Floating controls for the page: library, shelf position, page history, Done.
+private struct ReaderDock: View {
+    @ObservedObject var page: WebPage
+    let shelf: String
+    let index: Int
+    let count: Int
+    let closeInHelium: Bool
+    @Binding var showingQueue: Bool
+    let back: () -> Void
+    let previous: () -> Void
+    let next: () -> Void
+    let done: () -> Void
+    let copied: () -> Void
+    let queue: () -> AnyView
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            bar(full: true)
+            bar(full: false)
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private func bar(full: Bool) -> some View {
+        HStack(spacing: 2) {
+            BackButton(help: "Back to library (⇧⌘[)", action: back)
+            if full {
+                Text(shelf)
+                    .font(Theme.serif(15, italic: true))
+                    .foregroundStyle(Theme.ink2)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .padding(.leading, 6).padding(.trailing, 4)
+            }
+            separator
+            DeskIcon("chevron.left", help: "Previous tab (⌥⌘←)", action: previous).disabled(index == 0)
+            Button { showingQueue.toggle() } label: {
+                Text("\(index + 1) of \(count)")
+                    .font(Theme.mono(11, .medium)).foregroundStyle(Theme.ink2)
+                    .padding(.horizontal, 3).frame(height: 28).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .help("Every tab on this shelf")
+            .popover(isPresented: $showingQueue, arrowEdge: .top) { queue() }
+            DeskIcon("chevron.right", help: "Next tab (⌥⌘→)", action: next).disabled(index + 1 >= count)
+            if full {
+                separator
+                DeskIcon("arrow.uturn.left", help: "Page back (⌘[)") { page.view.goBack() }.disabled(!page.state.back)
+                DeskIcon("arrow.uturn.right", help: "Page forward (⌘])") { page.view.goForward() }.disabled(!page.state.forward)
+                DeskIcon("link", help: "Copy link (⇧⌘C)") {
+                    page.copyLink()
+                    copied()
+                }
+                if let url = page.state.url {
+                    DeskIcon("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
+                }
+            }
+            Button(action: done) {
+                HStack(spacing: 6) { Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)); Text("Done") }
+            }
+            .buttonStyle(DeskButtonStyle(.primary))
+            .fixedSize()
+            .padding(.leading, 6)
+            .help(closeInHelium ? "Close this tab in Helium and open the next (⇧⌘D)" : "Mark read and open the next (⇧⌘D)")
+        }
+        .padding(.leading, 5).padding(.trailing, 5).padding(.vertical, 5)
+        .background(Capsule().fill(Theme.raised.opacity(0.96)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.09)))
+        .shadow(color: .black.opacity(0.45), radius: 22, y: 10)
+        .fixedSize()
+    }
+
+    private var separator: some View {
+        Rectangle().fill(Theme.rule).frame(width: 1, height: 18).padding(.horizontal, 6)
     }
 }
 
@@ -495,7 +736,7 @@ struct ReadingDeskApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandMenu("Library") {
-                Button("Search Tabs…") { NotificationCenter.default.post(name: .openPalette, object: nil) }
+                Button("Command Palette…") { NotificationCenter.default.post(name: .openPalette, object: nil) }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                 Divider()
                 Button("Refresh Helium Tabs") { library.refresh() }.keyboardShortcut("r", modifiers: [.command, .shift])

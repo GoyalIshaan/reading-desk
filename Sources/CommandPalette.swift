@@ -4,174 +4,328 @@ extension Notification.Name {
     static let openPalette = Notification.Name("ReadingDesk.openPalette")
 }
 
-/// ⌘⇧P: a centered search over every tab and shelf, by title, site, shelf,
-/// address and the page's own description.
+/// ⇧⌘P: commands and search over every tab and shelf. Tab matching and ranking
+/// live in `SearchIndex`; this view only keeps the results for the current query, so
+/// hovering and scrolling never re-run the search.
 struct CommandPalette: View {
     @ObservedObject var library: Library
     @ObservedObject var previews: Previews
+    let fullscreenOnOpen: Bool
+    let closeInHelium: Bool
     let close: () -> Void
     let openTab: (BrowserTab) -> Void
     let openShelf: (String) -> Void
+    let performCommand: (Command) -> Void
 
     @State private var query = ""
     @State private var selection = 0
+    @State private var index = SearchIndex(documents: [])
+    @State private var indexedTabs: [BrowserTab] = []
+    @State private var results: [Item] = []
+    /// Set by arrow keys only. Hover changes the selection without scrolling the list.
+    @State private var scrollTarget: Int?
+    @State private var keyMonitor: Any?
+    @State private var wasPaused = false
+    @State private var mouseLocation = NSEvent.mouseLocation
     @FocusState private var focused: Bool
 
-    enum Item: Identifiable {
-        case shelf(Category, count: Int)
-        case tab(BrowserTab, Category)
+    enum Command: String, CaseIterable {
+        case allShelves, refresh, editShelves, toggleFullscreen, toggleCloseInHelium
+
+        var label: (title: String, symbol: String, keywords: String) {
+            switch self {
+            case .allShelves: ("Show all shelves", "square.grid.2x2", "everything back library")
+            case .refresh: ("Refresh Helium tabs", "arrow.clockwise", "reload import update")
+            case .editShelves: ("Edit shelves and filing rules", "books.vertical", "manage categories autofiling")
+            case .toggleFullscreen: ("Enter full screen when reading", "arrow.up.left.and.arrow.down.right", "fullscreen settings reading options")
+            case .toggleCloseInHelium: ("Close Helium tabs when marked done", "xmark.circle", "keep tabs open settings reading options")
+            }
+        }
+    }
+
+    struct Item: Identifiable {
+        enum Kind { case command(Command), shelf(Category, count: Int), tab(BrowserTab, Category) }
+        enum Section { case commands, shelves, tabs }
+        let kind: Kind
+        var words: Set<String> = []
+        var snippet: String?
+        var detail: String?
 
         var id: String {
-            switch self {
+            switch kind {
+            case .command(let command): "command:" + command.rawValue
             case .shelf(let category, _): "shelf:" + category.id
             case .tab(let tab, _): "tab:" + tab.id
             }
         }
+
+        var section: Section {
+            switch kind {
+            case .command: .commands
+            case .shelf: .shelves
+            case .tab: .tabs
+            }
+        }
     }
 
-    private var terms: [String] {
-        query.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
+    // MARK: Search
+
+    private func rebuildIndex() {
+        indexedTabs = library.tabs
+        index = SearchIndex(documents: indexedTabs.map { tab in
+            let preview = previews.info[tab.address]
+            let path = tab.url.map { $0.path + " " + ($0.query ?? "") } ?? tab.address
+            return [
+                .title: tab.displayTitle,
+                .site: tab.site + " " + (preview?.siteName ?? ""),
+                .shelf: library.category(for: tab).name,
+                .address: path,
+                .summary: preview?.summary ?? "",
+                .body: preview?.text ?? "",
+            ]
+        })
+        runSearch(keepSelection: true)
     }
 
-    private var items: [Item] {
+    /// A new query starts at the top. A refresh of the same query (tabs changed)
+    /// keeps whichever row was selected, so the list never jumps under you.
+    private func runSearch(keepSelection: Bool = false) {
+        let selectedID = keepSelection && results.indices.contains(selection) ? results[selection].id : nil
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        let terms = SearchIndex.queryTerms(trimmed)
+        let commands = Command.allCases.compactMap { command -> Item? in
+            let label = command.label
+            let words = SearchIndex.words(in: label.title + " " + label.keywords)
+            guard terms.allSatisfy({ term in words.contains { $0.hasPrefix(term) } }) else { return nil }
+            let detail: String? = switch command {
+            case .toggleFullscreen: fullscreenOnOpen ? "On" : "Off"
+            case .toggleCloseInHelium: closeInHelium ? "On" : "Off"
+            default: nil
+            }
+            return Item(kind: .command(command), detail: detail)
+        }
         let groups = library.grouped()
-        let words = terms
-        let shelves: [Item] = library.categories.compactMap { category in
+        let shelves = library.categories.compactMap { category -> Item? in
             let count = groups[category.id]?.count ?? 0
-            guard count > 0 else { return nil }
-            if words.isEmpty { return .shelf(category, count: count) }
-            let name = category.name.lowercased()
-            return words.allSatisfy { name.contains($0) } ? .shelf(category, count: count) : nil
+            return count > 0 ? Item(kind: .shelf(category, count: count)) : nil
         }
-        if words.isEmpty {
-            return Array(shelves.prefix(4)) + library.tabs.prefix(30).map { .tab($0, library.category(for: $0)) }
+        if trimmed.isEmpty {
+            results = shelves + commands + indexedTabs.prefix(40).map { Item(kind: .tab($0, library.category(for: $0))) }
+        } else {
+            let matchingShelves = shelves.filter { item in
+                guard case .shelf(let category, _) = item.kind else { return false }
+                let words = SearchIndex.words(in: category.name)
+                return terms.allSatisfy { term in words.contains { $0.hasPrefix(term) } }
+            }
+            let tabs = index.search(trimmed).map { hit -> Item in
+                let tab = indexedTabs[hit.index]
+                return Item(kind: .tab(tab, library.category(for: tab)), words: hit.words, snippet: hit.snippet)
+            }
+            results = commands + Array(matchingShelves.prefix(3)) + tabs
         }
-        let tabs = library.tabs.compactMap { tab -> (Int, Item)? in
-            let category = library.category(for: tab)
-            guard let score = Self.score(tab, category: category, preview: previews.info[tab.address], terms: words) else { return nil }
-            return (score, .tab(tab, category))
+        if let selectedID, let kept = results.firstIndex(where: { $0.id == selectedID }) {
+            selection = kept
+        } else {
+            selection = 0
+            scrollTarget = 0
         }
-        .sorted { $0.0 > $1.0 }
-        .prefix(60)
-        .map(\.1)
-        return Array(shelves.prefix(3)) + tabs
     }
 
-    static func score(_ tab: BrowserTab, category: Category, preview: PagePreview?, terms: [String]) -> Int? {
-        let title = tab.displayTitle.lowercased()
-        let site = tab.site
-        let shelf = category.name.lowercased()
-        let address = tab.address.lowercased()
-        let summary = (preview?.summary ?? "").lowercased()
-        let siteName = (preview?.siteName ?? "").lowercased()
-        var total = 0
-        for term in terms {
-            if title.hasPrefix(term) { total += 60 }
-            else if title.range(of: "\\b" + NSRegularExpression.escapedPattern(for: term), options: .regularExpression) != nil { total += 45 }
-            else if title.contains(term) { total += 30 }
-            else if site.hasPrefix(term) || site.contains("." + term) || siteName.hasPrefix(term) { total += 40 }
-            else if site.contains(term) || siteName.contains(term) { total += 25 }
-            else if shelf.contains(term) { total += 20 }
-            else if address.contains(term) { total += 12 }
-            else if summary.contains(term) { total += 8 }
-            else { return nil }
-        }
-        return total + (tab.active ? 3 : 0)
-    }
+    // MARK: Layout
 
     var body: some View {
-        let results = items
         ZStack(alignment: .top) {
-            Color.black.opacity(0.55)
+            Color.black.opacity(0.5)
                 .ignoresSafeArea()
                 .onTapGesture(perform: close)
             VStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    Image(systemName: "magnifyingglass").font(.system(size: 15, weight: .regular)).foregroundStyle(Theme.ink3)
-                    TextField("Search by title, site, shelf…", text: $query)
-                        .textFieldStyle(.plain)
-                        .font(Theme.sans(18))
-                        .focused($focused)
-                        .onSubmit { activate(results, inHelium: false) }
-                        .onKeyPress(.upArrow) { move(-1, count: results.count); return .handled }
-                        .onKeyPress(.downArrow) { move(1, count: results.count); return .handled }
-                        .onKeyPress(.escape) { close(); return .handled }
-                        .onKeyPress(keys: [.return], phases: .down) { press in
-                            guard press.modifiers.contains(.command) else { return .ignored }
-                            activate(results, inHelium: true)
-                            return .handled
-                        }
-                    Text("esc").font(Theme.mono(10)).foregroundStyle(Theme.ink4)
-                        .padding(.horizontal, 6).padding(.vertical, 3)
-                        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Theme.rule))
-                }
-                .padding(.horizontal, 20)
-                .frame(height: 60)
+                field
                 Hairline()
-                if results.isEmpty {
-                    VStack(spacing: 6) {
-                        Text("Nothing matches “\(query)”.").font(Theme.serif(20, italic: true)).foregroundStyle(Theme.ink2)
-                        Text("Try a site name like arxiv, a word from the title, or a shelf.").font(Theme.sans(12.5)).foregroundStyle(Theme.ink3)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 40)
-                } else {
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 0) {
-                                ForEach(Array(results.enumerated()), id: \.element.id) { index, item in
-                                    if index == 0 || kind(results[index - 1]) != kind(item) {
-                                        Text(kind(item) == 0 ? "Shelves" : (terms.isEmpty ? "Recently in Helium" : "Tabs"))
-                                            .font(Theme.serif(13, italic: true)).foregroundStyle(Theme.ink3)
-                                            .padding(.horizontal, 20).padding(.top, index == 0 ? 10 : 14).padding(.bottom, 4)
-                                    }
-                                    row(item, selected: index == selection)
-                                        .id(index)
-                                        .onHover { if $0 { selection = index } }
-                                        .onTapGesture { selection = index; activate(results, inHelium: false) }
-                                }
-                            }
-                            .padding(.bottom, 8)
-                        }
-                        .frame(maxHeight: 440)
-                        .onChange(of: selection) { _, value in proxy.scrollTo(value, anchor: nil) }
-                    }
-                }
+                list
                 Hairline()
-                HStack(spacing: 16) {
-                    hint("↑↓", "move")
-                    hint("↩", "read")
-                    hint("⌘↩", "open in Helium")
-                    Spacer()
-                    Text("\(library.tabs.count) tabs").font(Theme.mono(10)).foregroundStyle(Theme.ink4)
-                }
-                .padding(.horizontal, 20)
-                .frame(height: 36)
+                footer
             }
-            .frame(width: 680)
-            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Theme.surface))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.white.opacity(0.09)))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .shadow(color: .black.opacity(0.6), radius: 40, y: 20)
+            .frame(width: 640)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Theme.surface))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.08)))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .compositingGroup()
+            .shadow(color: .black.opacity(0.5), radius: 30, y: 16)
             .padding(.top, 110)
         }
-        .onAppear { focused = true }
-        .onChange(of: query) { _, _ in selection = 0 }
+        .defaultFocus($focused, true, priority: .userInitiated)
+        .onAppear {
+            // Preview fetching publishes every 300 ms while it runs, which redraws the
+            // library underneath. Hold it while the palette is up.
+            wasPaused = previews.paused
+            previews.paused = true
+            mouseLocation = NSEvent.mouseLocation
+            rebuildIndex()
+            installKeys()
+        }
+        .task {
+            await Task.yield()
+            focused = true
+        }
+        .onDisappear {
+            previews.paused = wasPaused
+            if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+            keyMonitor = nil
+        }
+        .onChange(of: query) { _, _ in runSearch() }
+        .onChange(of: library.tabs) { _, _ in rebuildIndex() }
     }
 
-    private func kind(_ item: Item) -> Int {
-        if case .shelf = item { return 0 }
-        return 1
+    /// Arrow keys go to the list, not the text field. A window-level monitor sees them
+    /// before the field editor does, which `onKeyPress` on a TextField doesn't guarantee.
+    private func installKeys() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let control = event.modifierFlags.contains(.control)
+            switch event.keyCode {
+            case 125: move(1); return nil                       // ↓
+            case 126: move(-1); return nil                      // ↑
+            case 45 where control: move(1); return nil          // ⌃N
+            case 35 where control: move(-1); return nil         // ⌃P
+            case 121: move(8); return nil                       // page down
+            case 116: move(-8); return nil                      // page up
+            case 36, 76: activate(inHelium: event.modifierFlags.contains(.command)); return nil // ↩
+            case 53: close(); return nil                        // esc
+            default: return event
+            }
+        }
     }
 
-    private func move(_ delta: Int, count: Int) {
-        guard count > 0 else { return }
-        selection = (selection + delta + count) % count
+    private var field: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(Theme.ink3)
+            TextField("Search tabs, shelves, and commands", text: $query,
+                      prompt: Text("Search tabs, shelves, and commands").foregroundStyle(Theme.ink4))
+                .textFieldStyle(.plain)
+                .font(Theme.sans(15))
+                .foregroundStyle(Theme.ink)
+                .focused($focused)
+                .accessibilityLabel("Search tabs, shelves, and commands")
+            if !query.isEmpty {
+                Text("\(results.count)")
+                    .font(Theme.sans(12).monospacedDigit())
+                    .foregroundStyle(Theme.ink4)
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 50)
     }
 
-    private func activate(_ results: [Item], inHelium: Bool) {
+    @ViewBuilder private var list: some View {
+        if results.isEmpty {
+            VStack(spacing: 4) {
+                Text("No results for “\(query)”").font(Theme.sans(13.5, .medium)).foregroundStyle(Theme.ink2)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 36)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(results.enumerated()), id: \.element.id) { offset, item in
+                            if offset == 0 || results[offset - 1].section != item.section {
+                                header(item.section, first: offset == 0)
+                            }
+                            PaletteRow(item: item, selected: offset == selection, icon: icon(for: item)).equatable()
+                                .id(offset)
+                                .onContinuousHover { phase in
+                                    guard case .active = phase else { return }
+                                    let location = NSEvent.mouseLocation
+                                    // Filtering can move a row under a stationary pointer.
+                                    guard location != mouseLocation else { return }
+                                    mouseLocation = location
+                                    selection = offset
+                                }
+                                .onTapGesture { selection = offset; activate(inHelium: false) }
+                                .accessibilityElement(children: .combine)
+                                .accessibilityAddTraits(.isButton)
+                                .accessibilityAction { selection = offset; activate(inHelium: false) }
+                        }
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.bottom, 6)
+                }
+                .scrollIndicators(.never)
+                .frame(maxHeight: 420)
+                .onChange(of: scrollTarget) { _, target in
+                    guard let target else { return }
+                    proxy.scrollTo(target, anchor: nil)
+                    scrollTarget = nil
+                }
+            }
+        }
+    }
+
+    private func header(_ section: Item.Section, first: Bool) -> some View {
+        let title = switch section {
+        case .commands: "Commands"
+        case .shelves: "Shelves"
+        case .tabs: query.isEmpty ? "Recent tabs" : "Tabs"
+        }
+        return Text(title)
+            .font(Theme.sans(11, .medium))
+            .foregroundStyle(Theme.ink3)
+            .padding(.horizontal, 10)
+            .padding(.top, first ? 10 : 12)
+            .padding(.bottom, 4)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 14) {
+            hint("↑↓", "Move")
+            if results.indices.contains(selection) {
+                switch results[selection].section {
+                case .commands: hint("↩", "Run")
+                case .shelves: hint("↩", "Open shelf")
+                case .tabs:
+                    hint("↩", "Read")
+                    hint("⌘↩", "Open in Helium")
+                }
+            }
+            Spacer()
+            Text("\(library.tabs.count) tabs").font(Theme.sans(11).monospacedDigit()).foregroundStyle(Theme.ink4)
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 34)
+    }
+
+    private func hint(_ key: String, _ label: String) -> some View {
+        HStack(spacing: 5) {
+            Text(key)
+                .font(Theme.sans(10.5, .medium)).foregroundStyle(Theme.ink2)
+                .padding(.horizontal, 4).frame(minWidth: 18, minHeight: 17)
+                .background(RoundedRectangle(cornerRadius: 4).fill(Theme.raised))
+            Text(label).font(Theme.sans(11)).foregroundStyle(Theme.ink3)
+        }
+    }
+
+    private func icon(for item: Item) -> NSImage? {
+        if case .tab(let tab, _) = item.kind { return previews.icons[tab.host] }
+        return nil
+    }
+
+    // MARK: Actions
+
+    private func move(_ delta: Int) {
+        guard !results.isEmpty else { return }
+        selection = (selection + delta % results.count + results.count) % results.count
+        scrollTarget = selection
+    }
+
+    private func activate(inHelium: Bool) {
         guard results.indices.contains(selection) else { return }
-        switch results[selection] {
+        switch results[selection].kind {
+        case .command(let command):
+            close()
+            performCommand(command)
+            return
         case .shelf(let category, _):
             openShelf(category.id)
         case .tab(let tab, _):
@@ -179,65 +333,83 @@ struct CommandPalette: View {
         }
         close()
     }
+}
 
-    private func hint(_ key: String, _ label: String) -> some View {
-        HStack(spacing: 5) {
-            Text(key).font(Theme.mono(10, .medium)).foregroundStyle(Theme.ink2)
-            Text(label).font(Theme.sans(11)).foregroundStyle(Theme.ink4)
-        }
+/// One result. Kept as its own view so a selection change only redraws the two rows involved.
+private struct PaletteRow: View, Equatable {
+    let item: CommandPalette.Item
+    let selected: Bool
+    let icon: NSImage?
+
+    static func == (a: Self, b: Self) -> Bool {
+        a.item.id == b.item.id && a.selected == b.selected && a.icon === b.icon
+            && a.item.words == b.item.words && a.item.snippet == b.item.snippet && a.item.detail == b.item.detail
     }
 
-    @ViewBuilder private func row(_ item: Item, selected: Bool) -> some View {
-        HStack(spacing: 13) {
-            switch item {
-            case .shelf(let category, let count):
-                Image(systemName: "books.vertical").font(.system(size: 13)).foregroundStyle(Theme.accent)
-                    .frame(width: 20, height: 20)
-                Text(highlighted(category.name, size: 17)).lineLimit(1)
+    var body: some View {
+        HStack(spacing: 11) {
+            switch item.kind {
+            case .command(let command):
+                Image(systemName: command.label.symbol)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(selected ? Theme.accent : Theme.ink3)
+                    .frame(width: 18, height: 18)
+                Text(command.label.title).font(Theme.sans(13.5, .medium)).foregroundStyle(Theme.ink).lineLimit(1)
                 Spacer(minLength: 8)
-                Text("\(count) tabs").font(Theme.mono(10.5)).foregroundStyle(Theme.ink3)
-            case .tab(let tab, let category):
-                Favicon(icon: previews.icons[tab.host], site: tab.sourceName, size: 20)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(highlighted(tab.displayTitle, size: 16)).lineLimit(1)
-                    HStack(spacing: 6) {
-                        if tab.active { Circle().fill(Theme.accent).frame(width: 5, height: 5) }
-                        Text(tab.sourceName).font(Theme.mono(10.5)).foregroundStyle(Theme.ink3)
-                    }
+                if let detail = item.detail {
+                    Text(detail).font(Theme.sans(12)).foregroundStyle(Theme.ink3)
                 }
+            case .shelf(let category, let count):
+                Image(systemName: category.symbol)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(selected ? Theme.accent : Theme.ink3)
+                    .frame(width: 18, height: 18)
+                Text(category.name).font(Theme.sans(13.5, .medium)).foregroundStyle(Theme.ink).lineLimit(1)
                 Spacer(minLength: 8)
-                Text(category.name).font(Theme.sans(11.5)).foregroundStyle(Theme.ink3).lineLimit(1)
+                Text("\(count)").font(Theme.sans(12).monospacedDigit()).foregroundStyle(Theme.ink3)
+            case .tab(let tab, let category):
+                Favicon(icon: icon, site: tab.sourceName, size: 18)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(Self.marked(tab.displayTitle, item.words, size: 13.5, base: Theme.ink))
+                        .lineLimit(1)
+                    Text(Self.marked(item.snippet.map { tab.sourceName + "  ·  " + $0 } ?? tab.sourceName,
+                                     item.words, size: 11.5, base: Theme.ink3))
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 12)
+                if tab.active {
+                    Circle().fill(Theme.accent).frame(width: 5, height: 5).help("Active in Helium")
+                }
+                Text(category.name).font(Theme.sans(11.5)).foregroundStyle(Theme.ink4).lineLimit(1).fixedSize()
             }
         }
-        .padding(.horizontal, 20)
-        .frame(height: 50)
-        .background(selected ? Theme.raised : .clear)
-        .overlay(alignment: .leading) {
-            if selected { Rectangle().fill(Theme.accent).frame(width: 2) }
-        }
+        .padding(.horizontal, 10)
+        .frame(height: item.section == .tabs ? 46 : 34)
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(selected ? Theme.raised : .clear))
         .contentShape(Rectangle())
     }
 
-    /// Serif title with the matched words picked out in the accent color.
-    private func highlighted(_ text: String, size: CGFloat) -> AttributedString {
+    /// Geist text with the words the search matched brightened in the accent.
+    static func marked(_ text: String, _ words: Set<String>, size: CGFloat, base: Color) -> AttributedString {
         var result = AttributedString(text)
-        result.font = Theme.serif(size, .medium)
-        result.foregroundColor = Theme.ink
-        let lower = text.lowercased()
-        for term in terms where !term.isEmpty {
-            var searchStart = lower.startIndex
-            let length = result.characters.count
-            while let range = lower.range(of: term, range: searchStart..<lower.endIndex) {
-                // Map by character offset: lowercasing can shift String indices.
-                let from = lower.distance(from: lower.startIndex, to: range.lowerBound)
-                let to = lower.distance(from: lower.startIndex, to: range.upperBound)
-                if to <= length {
-                    let start = result.characters.index(result.startIndex, offsetBy: from)
-                    let end = result.characters.index(result.startIndex, offsetBy: to)
-                    result[start..<end].foregroundColor = Theme.accent
-                }
-                searchStart = range.upperBound
+        result.font = Theme.sans(size, size > 12 ? .medium : .regular)
+        result.foregroundColor = base
+        guard !words.isEmpty else { return result }
+        let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+        // Folding can change the character count (e.g. ligatures); skip highlighting then.
+        guard folded.count == text.count else { return result }
+        var start = folded.startIndex
+        while start < folded.endIndex {
+            guard let wordStart = folded[start...].firstIndex(where: { $0.isLetter || $0.isNumber }) else { break }
+            let wordEnd = folded[wordStart...].firstIndex(where: { !($0.isLetter || $0.isNumber) }) ?? folded.endIndex
+            if words.contains(String(folded[wordStart..<wordEnd])) {
+                let from = folded.distance(from: folded.startIndex, to: wordStart)
+                let to = folded.distance(from: folded.startIndex, to: wordEnd)
+                let a = result.characters.index(result.startIndex, offsetBy: from)
+                let b = result.characters.index(result.startIndex, offsetBy: to)
+                result[a..<b].foregroundColor = Theme.accent
             }
+            start = wordEnd
         }
         return result
     }

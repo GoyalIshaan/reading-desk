@@ -11,6 +11,9 @@ struct PagePreview: Codable, Equatable {
     var imageURL: String?
     var iconURL: String?
     var minutes: Int?
+    /// About 300 words of the page's main text, for search. Nil in caches written
+    /// before it existed; empty when the page couldn't be read.
+    var text: String?
     var isPDF = false
     var hasImage = false
     var aspect: Double?
@@ -67,6 +70,7 @@ final class Previews: ObservableObject {
                 images[tab.address] = image
             }
             requestIcon(host: tab.host, hint: cached.iconURL.flatMap(URL.init(string:)))
+            if cached.text == nil && !cached.isPDF { Task { await backfillText(address: tab.address, url: url, key: key, cached: cached) } }
             return
         }
         Task { await build(address: tab.address, url: url, key: key) }
@@ -90,6 +94,24 @@ final class Previews: ObservableObject {
             pendingInfo = [:]
             pendingImages = [:]
             flushScheduled = false
+        }
+    }
+
+    /// Caches from before page text was kept: fetch just the HTML again for its text.
+    private func backfillText(address: String, url: URL, key: String, cached: PagePreview) async {
+        await waitWhilePaused()
+        await fetchSlots.acquire()
+        var preview = cached
+        preview.text = ""
+        if let (data, response) = try? await session.data(from: url),
+           (response.mimeType?.lowercased() ?? "html").contains("html") {
+            let html = String(decoding: data.prefix(2_500_000), as: UTF8.self)
+            preview.text = await Task.detached(priority: .utility) { Self.parse(html, base: response.url ?? url).text }.value ?? ""
+        }
+        await fetchSlots.release()
+        publish(address, info: preview, image: nil)
+        if let data = try? JSONEncoder().encode(preview) {
+            try? data.write(to: directory.appendingPathComponent(key + ".json"))
         }
     }
 
@@ -130,6 +152,7 @@ final class Previews: ObservableObject {
             await snapshotSlots.release()
         }
 
+        if preview.text == nil { preview.text = "" }
         var published: NSImage?
         if let cover, let (scaled, jpeg) = Self.downscale(cover, width: 760) {
             try? jpeg.write(to: directory.appendingPathComponent(key + ".jpg"))
@@ -204,14 +227,25 @@ final class Previews: ObservableObject {
             preview.iconURL = URL(string: decode(icon.1), relativeTo: base)?.absoluteString
         }
 
+        let text = plainText(html)
+        let words = text.split(whereSeparator: { $0.isWhitespace }).filter { $0.count > 1 }
+        if words.count > 150 { preview.minutes = max(1, Int((Double(words.count) / 230).rounded())) }
+        // Search text comes from <article> or <main> when the page has one, so menus and
+        // sidebars don't drown out what the page is about.
+        let main = ["article", "main"].lazy.compactMap { block in
+            html.range(of: "<\(block)\\b[\\s\\S]*?</\(block)>", options: [.regularExpression, .caseInsensitive]).map { String(html[$0]) }
+        }.first
+        let body = main.map(plainText).flatMap { $0.count > 200 ? $0 : nil } ?? text
+        preview.text = String(decode(body).split(whereSeparator: { $0.isWhitespace }).prefix(300).joined(separator: " ").prefix(2400))
+        return preview
+    }
+
+    nonisolated private static func plainText(_ html: String) -> String {
         var text = html
-        for block in ["script", "style", "noscript", "svg", "nav", "header", "footer"] {
+        for block in ["script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form"] {
             text = text.replacingOccurrences(of: "<\(block)\\b[\\s\\S]*?</\(block)>", with: " ", options: [.regularExpression, .caseInsensitive])
         }
-        text = text.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
-        let words = text.split(whereSeparator: { $0.isWhitespace }).filter { $0.count > 1 }.count
-        if words > 150 { preview.minutes = max(1, Int((Double(words) / 230).rounded())) }
-        return preview
+        return text.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
     }
 
     nonisolated private static func attributes(_ tag: String) -> [String: String] {

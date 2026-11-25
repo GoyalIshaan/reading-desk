@@ -6,9 +6,9 @@ A dark, distraction-free macOS app for working through your open Helium tabs. Ta
 
 1. Open **Reading Desk** with Helium running. If macOS asks, allow it to control Helium. It needs that to read your tabs and to close the ones you finish.
 2. Pick a shelf from the index at the top, then click **Begin reading**, or click any card to start from that tab.
-3. On the right, switch between **ChatGPT · Claude · Gemini · Notes**. Each one keeps its own sign-in, and you stay logged in between launches.
-4. The page has no toolbar. Hover the small pill in its bottom-right corner to get back, forward, reload and "open in Helium". Click the link icon to copy the URL.
-5. Click **Done** (⇧⌘D) when you've finished a tab. To keep tabs open in Helium, turn that off under the sliders menu.
+3. The reading tab and **ChatGPT · Claude · Gemini · Notes** open inside Reading Desk. Website sign-ins use Reading Desk’s persistent browser profile, which is separate from your Helium profile. Website sign-in popups stay in the pane that opened them.
+4. Hover the bottom-right controls to go back, go forward, reload, copy the link, or open the page in Helium.
+5. Click **Done** (⇧⌘D) when you've finished a tab. To keep tabs open in Helium, press ⇧⌘P and turn off **Close Helium tabs when marked done**.
 
 ## Library
 
@@ -22,7 +22,7 @@ The Notes pane renders Markdown the way Obsidian does: Properties, callouts (inc
 
 ## Shelves and auto-filing
 
-Click the books icon in the library to edit shelves. You can add, rename, reorder and delete them. Each shelf has:
+Press ⇧⌘P and choose **Edit shelves and filing rules** to add, rename, reorder or delete shelves. Each shelf has:
 
 - **Sites**: `arxiv.org` matches that site and its subdomains, `docs.` matches hosts that start with it, and `/blog/` matches anywhere in the URL.
 - **Title keywords**: words that show up in the tab title.
@@ -33,7 +33,7 @@ A tab goes onto the first shelf (top to bottom) that matches it. Use *Earlier* t
 
 | | |
 |---|---|
-| ⇧⌘P | Search every tab by title, site, shelf or description |
+| ⇧⌘P | Search tabs and shelves, refresh Helium, edit shelves or change reading options |
 | ⌘[ | Library: back to all shelves |
 | ⌘↩ | Start reading the open shelf |
 | ⇧⌘D | Done, then next tab |

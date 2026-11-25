@@ -296,6 +296,37 @@ final class Library: ObservableObject {
 
     func category(withID id: String) -> Category? { categories.first { $0.id == id } }
 
+    /// Resolve a category by id, or failing that by name (case-insensitive) —
+    /// so the external bridge can take either from an agent.
+    func category(matching token: String) -> Category? {
+        category(withID: token) ?? categories.first { $0.name.caseInsensitiveCompare(token) == .orderedSame }
+    }
+
+    /// Assign by raw URL, for the bridge (no BrowserTab needed).
+    func assign(address: String, to id: String?) {
+        assignments[address] = id
+        defaults.set(assignments, forKey: "assignments.v2")
+    }
+
+    func fileSite(_ site: String, to id: String) {
+        let site = site.lowercased()
+        guard !site.isEmpty else { return }
+        siteRules[site] = id
+        defaults.set(siteRules, forKey: "siteRules.v2")
+    }
+
+    /// Return a category with this name, creating one if there isn't yet.
+    @discardableResult
+    func ensureCategory(named name: String, symbol: String?) -> Category {
+        if let existing = categories.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) { return existing }
+        let id = addCategory()
+        update(id) { shelf in
+            shelf.name = name
+            if let symbol { shelf.symbol = symbol }
+        }
+        return category(withID: id) ?? other
+    }
+
     func category(for tab: BrowserTab) -> Category {
         if let id = assignments[tab.address], let manual = category(withID: id) { return manual }
         if let id = siteRules[tab.site], let site = category(withID: id) { return site }

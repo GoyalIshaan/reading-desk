@@ -4,12 +4,10 @@ struct LibraryView: View {
     @ObservedObject var library: Library
     @ObservedObject var previews: Previews
     @Binding var selectedCategory: String?
-    @Binding var fullscreenOnOpen: Bool
-    @Binding var closeInHelium: Bool
-    let topInset: CGFloat
-    let open: (String, BrowserTab?) -> Void
-
-    @State private var editingShelves = false
+    let closeInHelium: Bool
+    let titleBarHeight: CGFloat
+    /// Shelf, tab to start on, and where the tapped card sits on screen (for the hero transition).
+    let open: (String, BrowserTab?, CGRect?) -> Void
 
     private let margin: CGFloat = 48
     private let gutter: CGFloat = 28
@@ -51,7 +49,7 @@ struct LibraryView: View {
             let columnWidth = (available - gutter * CGFloat(columns - 1)) / CGFloat(columns)
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    topBar
+                    sourceStatus.frame(height: 28)
                     if let error = library.error {
                         HStack(spacing: 8) {
                             Text(error).font(Theme.sans(12.5)).foregroundStyle(Theme.error).textSelection(.enabled)
@@ -81,65 +79,19 @@ struct LibraryView: View {
                     }
                 }
                 .padding(.horizontal, margin)
+                .padding(.top, 16)
                 .padding(.bottom, 80)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .scrollIndicators(.hidden)
             .overlay(alignment: .top) {
                 LinearGradient(colors: [Theme.ground, Theme.ground.opacity(0)], startPoint: .top, endPoint: .bottom)
-                    .frame(height: 44)
+                    .frame(height: 16)
                     .allowsHitTesting(false)
             }
+            .padding(.top, titleBarHeight)
         }
         .background(Theme.ground)
-        .sheet(isPresented: $editingShelves) { ShelvesEditor(library: library) }
-    }
-
-    // MARK: Header
-
-    private var topBar: some View {
-        HStack(spacing: 4) {
-            if selectedCategory != nil {
-                BackButton(help: "All shelves (⌘[)") { select(nil) }
-                    .padding(.trailing, 12)
-                    .transition(.move(edge: .leading).combined(with: .opacity))
-            }
-            Button { select(nil) } label: {
-                Text("Reading Desk").font(Theme.serif(22, italic: true)).foregroundStyle(Theme.ink)
-            }
-            .buttonStyle(.plain)
-            .help("All shelves")
-            sourceStatus.padding(.leading, 16)
-            Spacer(minLength: 16)
-            Button { NotificationCenter.default.post(name: .openPalette, object: nil) } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass").font(.system(size: 11))
-                    Text("Search")
-                    Text("⇧⌘P").font(Theme.mono(10)).foregroundStyle(Theme.ink4)
-                }
-                .font(Theme.sans(12.5))
-                .foregroundStyle(Theme.ink3)
-                .padding(.horizontal, 12).frame(height: 28)
-                .overlay(Capsule().strokeBorder(Theme.rule))
-                .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .padding(.trailing, 8)
-            DeskIcon("arrow.clockwise", help: "Refresh from Helium (⇧⌘R)") { library.refresh() }
-                .disabled(library.updating)
-            DeskIcon("books.vertical", help: "Shelves & filing rules") { editingShelves = true }
-            Menu {
-                Toggle("Enter full screen when reading", isOn: $fullscreenOnOpen)
-                Toggle("Close the tab in Helium when I mark it done", isOn: $closeInHelium)
-            } label: {
-                Image(systemName: "slider.horizontal.3").font(.system(size: 12.5))
-                    .foregroundStyle(Theme.ink3).frame(width: 28, height: 28)
-            }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-            .help("Reading options")
-        }
-        .padding(.leading, topInset > 0 ? 40 : 0)
-        .frame(height: 58)
         .background {
             ShortcutButton("All shelves", "[") { select(nil) }
         }
@@ -197,7 +149,7 @@ struct LibraryView: View {
             if library.updating { ProgressView().controlSize(.mini) }
             Spacer()
             if let category, tabs.contains(where: { $0.readableURL != nil }) {
-                Button { open(category.id, nil) } label: {
+                Button { open(category.id, nil, nil) } label: {
                     HStack(spacing: 7) { Text("Begin reading"); Image(systemName: "arrow.right").font(.system(size: 10.5, weight: .semibold)) }
                 }
                 .buttonStyle(DeskButtonStyle(.primary))
@@ -226,7 +178,7 @@ struct LibraryView: View {
                         .padding(.trailing, 14)
                 }
                 if tabs.contains(where: { $0.readableURL != nil }) {
-                    Button { open(category.id, nil) } label: { Text("Read shelf") }
+                    Button { open(category.id, nil, nil) } label: { Text("Read shelf") }
                         .buttonStyle(DeskButtonStyle(.outline))
                 }
             }
@@ -278,7 +230,7 @@ struct LibraryView: View {
                        icon: previews.icons[tab.host], width: width,
                        shelfName: selectedCategory == nil && !query.isEmpty ? category.name : nil,
                        categories: library.categories, currentCategory: category.id,
-                       open: { open(category.id, tab) },
+                       open: { rect in open(category.id, tab, rect) },
                        done: { library.finish(tab, closeInHelium: closeInHelium) },
                        assign: { library.assign(tab, to: $0) },
                        fileSite: { library.fileSite(of: tab, in: $0) })
@@ -351,12 +303,14 @@ struct TabCard: View {
     let shelfName: String?
     let categories: [Category]
     let currentCategory: String
-    let open: () -> Void
+    /// Called with the card's cover frame in window coordinates.
+    let open: (CGRect) -> Void
     let done: () -> Void
     let assign: (String?) -> Void
     let fileSite: (String) -> Void
 
     @State private var hovered = false
+    @State private var frame = FrameBox()
 
     private var title: String {
         let page = tab.title.trimmed
@@ -417,11 +371,24 @@ struct TabCard: View {
         }
         .frame(width: width, alignment: .leading)
         .contentShape(Rectangle())
-        .onTapGesture(perform: open)
+        .background {
+            // Track where the card is without re-rendering on every scroll frame.
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { frame.rect = proxy.frame(in: .global) }
+                    .onChange(of: proxy.frame(in: .global)) { _, rect in frame.rect = rect }
+            }
+        }
+        .onTapGesture {
+            open(CGRect(x: frame.rect.minX, y: frame.rect.minY, width: frame.rect.width, height: coverHeight))
+        }
         .onHover { inside in withAnimation(.easeOut(duration: 0.16)) { hovered = inside } }
         .help(tab.readableURL == nil ? "Switch to this tab in Helium" : tab.address)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            open(CGRect(x: frame.rect.minX, y: frame.rect.minY, width: frame.rect.width, height: coverHeight))
+        }
         .accessibilityAction(named: "Mark done", done)
     }
 
@@ -498,6 +465,10 @@ private struct CardAction: View {
         .onHover { hovered = $0 }
         .help(help)
     }
+}
+
+final class FrameBox {
+    var rect: CGRect = .zero
 }
 
 /// When a page has no image: a quiet bookplate with the site's mark and name.

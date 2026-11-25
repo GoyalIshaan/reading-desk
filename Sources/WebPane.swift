@@ -2,7 +2,7 @@ import SwiftUI
 import WebKit
 
 @MainActor
-final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSWindowDelegate {
+final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
     struct State: Equatable {
         var url: URL?
         var back = false
@@ -12,16 +12,18 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     @Published private(set) var state = State()
     @Published private(set) var failure: String?
+    @Published private(set) var openedPage: WebPage?
 
     private var observations: [NSKeyValueObservation] = []
-    private var popup: NSWindow?
+    private weak var opener: WebPage?
+    private var openedPages: [WebPage] = []
     private var requested: URL?
     private var suppliedConfiguration: WKWebViewConfiguration?
-    private static var popups: [ObjectIdentifier: WebPage] = [:]
 
     lazy var view: WKWebView = {
         let configuration = suppliedConfiguration ?? {
             let configuration = WKWebViewConfiguration()
+            configuration.websiteDataStore = .default()
             // Present as Safari. Google (Gemini) refuses sign-in from "embedded" web views otherwise.
             configuration.applicationNameForUserAgent = "Version/18.0 Safari/605.1.15"
             return configuration
@@ -53,6 +55,11 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     func load(_ url: URL) {
+        if openedPage != nil {
+            for child in openedPages { child.view.stopLoading() }
+            openedPages.removeAll()
+            openedPage = nil
+        }
         failure = nil
         requested = url
         let next = State(url: url, back: view.canGoBack, forward: view.canGoForward, loading: true)
@@ -138,28 +145,27 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         let child = WebPage()
+        // WebKit supplies this configuration to retain the opener and storage
+        // context for window.open, including a site's sign-in callbacks.
         child.suppliedConfiguration = configuration
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 720),
-                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                              backing: .buffered, defer: false)
-        window.title = navigationAction.request.url?.host ?? "Reading Desk"
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.isReleasedWhenClosed = false
-        window.contentView = child.view
-        window.delegate = child
-        child.popup = window
-        Self.popups[ObjectIdentifier(child)] = child
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        return child.view
+        child.opener = self
+        let childView = child.view
+        openedPages.append(child)
+        openedPage = child
+        return childView
     }
 
-    func webViewDidClose(_ webView: WKWebView) { popup?.close() }
-
-    func windowWillClose(_ notification: Notification) {
-        popup = nil
-        Self.popups.removeValue(forKey: ObjectIdentifier(self))
+    func webViewDidClose(_ webView: WKWebView) {
+        opener?.dismiss(self)
     }
+
+    func dismiss(_ page: WebPage) {
+        guard openedPages.contains(where: { $0 === page }) else { return }
+        page.view.stopLoading()
+        openedPages.removeAll { $0 === page }
+        if openedPage === page { openedPage = openedPages.last }
+    }
+
 }
 
 struct WebSurface: NSViewRepresentable {
@@ -192,6 +198,40 @@ struct BrowserPane: View {
                     .padding(.bottom, 14).padding(.trailing, 16)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
             }
+        }
+        .background(Theme.ground)
+        .accessibilityHidden(page.openedPage != nil)
+        .overlay {
+            if let opened = page.openedPage {
+                InPanePage(page: opened) { page.dismiss(opened) }
+                    .id(ObjectIdentifier(opened))
+            }
+        }
+    }
+}
+
+private struct InPanePage: View {
+    @ObservedObject var page: WebPage
+    let close: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 3) {
+                DeskIcon("chevron.left", help: "Go back") { page.view.goBack() }
+                    .disabled(!page.state.back)
+                DeskIcon("chevron.right", help: "Go forward") { page.view.goForward() }
+                    .disabled(!page.state.forward)
+                Text(page.state.url?.host ?? "New page")
+                    .font(Theme.sans(12, .medium))
+                    .foregroundStyle(Theme.ink2)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                DeskIcon("xmark", help: "Close this page", action: close)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 37)
+            Hairline()
+            BrowserPane(page: page, showsChrome: false)
         }
         .background(Theme.ground)
     }

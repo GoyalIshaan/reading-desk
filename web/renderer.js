@@ -607,7 +607,7 @@ function layout(active, caret) {
 
     live.relayouting = true;
     const scroll = window.scrollY;
-    container.replaceChildren(...children);
+    syncChildren(container, children);
     if (active) {
         const ta = live.textarea;
         const value = live.lines.slice(active.start, active.end).join('\n');
@@ -630,6 +630,74 @@ function layout(active, caret) {
     }
     live.relayouting = false;
 }
+
+/// Bring the container's children in line with `wanted` without moving nodes
+/// that are already in place, so a text selection in an untouched block survives
+/// (moving a node clears any selection inside it, which broke ⌘C).
+function syncChildren(container, wanted) {
+    const keep = new Set(wanted);
+    for (const node of [...container.childNodes]) if (!keep.has(node)) node.remove();
+    wanted.forEach((node, i) => {
+        const current = container.childNodes[i];
+        if (current !== node) container.insertBefore(node, current || null);
+    });
+}
+
+// ---------- undo / redo ----------
+// The editor rewrites the textarea whenever the cursor crosses into another
+// block, which wipes WebKit's own undo stack, so the editor keeps its own:
+// snapshots of the whole note, with bursts of typing coalesced into one step.
+
+const history = { undo: [], redo: [], last: 0, kind: '' };
+
+function snapshot() {
+    return { source: live.source, caret: live.active ? caretOffset() : null };
+}
+
+function remember(kind) {
+    const now = Date.now();
+    if (kind && kind === history.kind && now - history.last < 1200) { history.last = now; return; }
+    history.undo.push(snapshot());
+    if (history.undo.length > 400) history.undo.shift();
+    history.redo = [];
+    history.last = now;
+    history.kind = kind || '';
+}
+
+function restore(entry) {
+    setSource(entry.source);
+    scheduleEdit();
+    flushEdit();
+    if (entry.caret != null) layout(rangeForLine(lineOf(entry.caret)), entry.caret);
+    else layout(null, null);
+}
+
+function undo() {
+    if (!history.undo.length) return;
+    history.redo.push(snapshot());
+    restore(history.undo.pop());
+    history.kind = '';
+}
+
+function redo() {
+    if (!history.redo.length) return;
+    history.undo.push(snapshot());
+    restore(history.redo.pop());
+    history.kind = '';
+}
+
+document.addEventListener('keydown', (event) => {
+    if (!event.metaKey || event.altKey || event.ctrlKey) return;
+    const key = event.key.toLowerCase();
+    if (key === 'z') {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.shiftKey) redo(); else undo();
+    } else if (key === 'y' && !event.shiftKey) {
+        event.preventDefault();
+        redo();
+    }
+}, true);
 
 function commit() {
     clearTimeout(live.idleTimer);
@@ -702,6 +770,13 @@ function moveTo(line, column) {
 function flushEditLater() { if (live.editTimer != null) scheduleEdit(); }
 
 function wireTextarea(ta) {
+    ta.addEventListener('beforeinput', (event) => {
+        // Edit ▸ Undo / Redo from the menu arrive here.
+        if (event.inputType === 'historyUndo') { event.preventDefault(); undo(); return; }
+        if (event.inputType === 'historyRedo') { event.preventDefault(); redo(); return; }
+        const type = event.inputType || '';
+        remember(type === 'insertText' ? 'type' : type.startsWith('delete') ? 'delete' : type);
+    });
     ta.addEventListener('input', () => {
         armIdle();
         absorbTextarea();
@@ -734,6 +809,7 @@ function wireTextarea(ta) {
         if (event.key === 'Backspace' && start === 0 && end === 0 && a.start > 0) {
             // Join with the line above, like any editor.
             event.preventDefault();
+            remember('');
             const at = live.offsets[a.start] - 1;
             setSource(live.source.slice(0, at) + live.source.slice(at + 1));
             scheduleEdit();
@@ -748,6 +824,7 @@ function wireTextarea(ta) {
             // Enter at or before the marker just pushes the item down.
             if (item && start - lineStart > item[0].length - 1) {
                 event.preventDefault();
+                remember('');
                 if (current.trim() === item[0].trim()) {
                     // Empty item ends the list, leaving a blank line so what
                     // follows isn't swallowed into the last item.
@@ -764,6 +841,7 @@ function wireTextarea(ta) {
         }
         if (event.key === 'Tab') {
             event.preventDefault();
+            remember('');
             const lineStart = before.lastIndexOf('\n') + 1;
             if (event.shiftKey) {
                 const indent = /^(\t| {1,4})/.exec(value.slice(lineStart));
@@ -878,6 +956,7 @@ function toggleTask(line) {
     const lines = [...live.lines];
     lines[line] = match[1] + (match[2] === ' ' ? '[x]' : '[ ]') + text.slice(match[0].length);
     const caret = live.active ? caretOffset() : null;
+    remember('');
     setSource(lines.join('\n'));
     scheduleEdit();
     flushEdit();
@@ -896,7 +975,11 @@ window.deskRender = (payload) => {
     const y = window.scrollY;
     clearTimeout(live.editTimer);
     live.editTimer = null;
-    if (!sameNote) document.getElementById('live').replaceChildren();
+    if (!sameNote) {
+        document.getElementById('live').replaceChildren();
+        history.undo = [];
+        history.redo = [];
+    }
     live.active = null;
     setSource(payload.markdown);
     layout(null, null);

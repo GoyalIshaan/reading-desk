@@ -2,7 +2,7 @@ import SwiftUI
 import WebKit
 
 @MainActor
-final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
     struct State: Equatable {
         var url: URL?
         var back = false
@@ -19,6 +19,22 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     private var openedPages: [WebPage] = []
     private var requested: URL?
     private var suppliedConfiguration: WKWebViewConfiguration?
+    /// The reading pane reports selections and scroll position; chat panes don't.
+    private let captures: Bool
+    /// Selection / scroll messages from the injected capture script, with the web view they
+    /// came from: the page itself, or a window a link opened over it.
+    var onCapture: (([String: Any], WKWebView) -> Void)?
+    /// The main frame turned out to be a PDF, which reads better in the paper reader.
+    var onPDF: ((URL) -> Void)?
+    /// Extra items at the top of the right-click menu (Save to note, Ask…).
+    var menuItems: (() -> [NSMenuItem])?
+
+    static let debugCapture = ProcessInfo.processInfo.arguments.contains("--debug-capture")
+
+    init(captures: Bool = false) {
+        self.captures = captures
+        super.init()
+    }
 
     lazy var view: WKWebView = {
         let configuration = suppliedConfiguration ?? {
@@ -28,7 +44,13 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
             configuration.applicationNameForUserAgent = "Version/18.0 Safari/605.1.15"
             return configuration
         }()
-        let view = WKWebView(frame: .zero, configuration: configuration)
+        if captures {
+            let controller = configuration.userContentController
+            controller.addUserScript(WKUserScript(source: CaptureScript.source, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+            controller.add(CaptureHandler(self), name: "deskCapture")
+        }
+        let view = DeskWebView(frame: .zero, configuration: configuration)
+        view.extraMenuItems = { [weak self] in self?.menuItems?() ?? [] }
         suppliedConfiguration = nil
         view.navigationDelegate = self
         view.uiDelegate = self
@@ -36,7 +58,7 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         view.allowsMagnification = true
         view.underPageBackgroundColor = NSColor(Theme.ground)
         view.isInspectable = ProcessInfo.processInfo.arguments.contains("--inspect")
-        @MainActor func watch<Value>(_ path: KeyPath<WKWebView, Value>) {
+        @MainActor func watch<Value>(_ path: KeyPath<DeskWebView, Value>) {
             observations.append(view.observe(path, options: [.new]) { [weak self] _, _ in
                 Task { @MainActor in self?.update() }
             })
@@ -71,6 +93,16 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         }
     }
 
+    /// Drops the page's content (and most of its web process's memory).
+    func unload() {
+        for child in openedPages { child.view.stopLoading() }
+        openedPages.removeAll()
+        openedPage = nil
+        view.stopLoading()
+        view.loadHTMLString("", baseURL: nil)
+        requested = nil
+    }
+
     func retry() {
         if failure != nil, let url = state.url ?? requested { load(url) }
         else { view.reload() }
@@ -87,7 +119,43 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         update()
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { update() }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        update()
+        if Self.debugCapture && (captures || opener != nil) {
+            NSLog("RD capture: finished \(webView.url?.absoluteString ?? "")")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                webView.evaluateJavaScript("(() => { const p = [...document.querySelectorAll('p, font, td')].find(e => e.innerText && e.innerText.length > 80); if (!p) return 'no paragraph; installed=' + !!window.__deskCapture; const r = document.createRange(); r.selectNodeContents(p); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); return 'selected; installed=' + !!window.__deskCapture; })()") { result, error in NSLog("RD capture: select → \(String(describing: result)) \(String(describing: error))") }
+            }
+        }
+        guard captures, let url = webView.url, let y = ReadingMemory.scroll(for: url), y > 40 else { return }
+        webView.evaluateJavaScript("window.__deskRestore && window.__deskRestore(\(Int(y)))")
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if Self.debugCapture { NSLog("RD capture: message \((message.body as? [String: Any])?["type"] ?? "?") main=\(message.frameInfo.isMainFrame) same=\(message.webView === view)") }
+        // Windows opened from this page share its configuration, script and handler, so
+        // their messages arrive here too. Only the reading pane's family has this script.
+        guard message.frameInfo.isMainFrame, let webView = message.webView,
+              let body = message.body as? [String: Any] else { return }
+        if body["type"] as? String == "scroll", let y = body["y"] as? Double, let url = webView.url {
+            ReadingMemory.setScroll(y, for: url)
+        }
+        onCapture?(body, webView)
+    }
+
+    /// The page's headings, for the Contents menu.
+    func outline() async -> [(level: Int, text: String)] {
+        guard captures, let result = try? await view.evaluateJavaScript("window.__deskOutline ? window.__deskOutline() : []"),
+              let items = result as? [[String: Any]] else { return [] }
+        return items.compactMap { item in
+            guard let text = item["text"] as? String, !text.isEmpty else { return nil }
+            return ((item["level"] as? Int) ?? (item["level"] as? Double).map(Int.init) ?? 2, text)
+        }
+    }
+
+    func jump(toHeading index: Int) {
+        view.evaluateJavaScript("window.__deskJump && window.__deskJump(\(index))")
+    }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail(error) }
 
@@ -121,7 +189,11 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse) async -> WKNavigationResponsePolicy {
-        response.canShowMIMEType ? .allow : .download
+        if response.isForMainFrame, response.response.mimeType?.lowercased() == "application/pdf",
+           let url = response.response.url, let onPDF {
+            onPDF(url)
+        }
+        return response.canShowMIMEType ? .allow : .download
     }
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
@@ -149,6 +221,8 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         // context for window.open, including a site's sign-in callbacks.
         child.suppliedConfiguration = configuration
         child.opener = self
+        // A page opened from the reader gets the same right-click actions.
+        child.menuItems = { [weak self] in self?.menuItems?() ?? [] }
         let childView = child.view
         openedPages.append(child)
         openedPage = child
@@ -166,6 +240,50 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         if openedPage === page { openedPage = openedPages.last }
     }
 
+}
+
+/// A web view whose right-click menu can lead with Reading Desk's own actions.
+final class DeskWebView: WKWebView {
+    var extraMenuItems: (() -> [NSMenuItem])?
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        menu.insertExtras(extraMenuItems?() ?? [])
+    }
+}
+
+/// A menu item that runs a closure.
+final class ActionMenuItem: NSMenuItem {
+    private let handler: () -> Void
+
+    init(_ title: String, symbol: String? = nil, handler: @escaping () -> Void) {
+        self.handler = handler
+        super.init(title: title, action: #selector(run), keyEquivalent: "")
+        target = self
+        if let symbol { image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
+    }
+
+    required init(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func run() { handler() }
+}
+
+extension NSMenu {
+    /// Puts items at the top, above the system's own, with a separator between.
+    func insertExtras(_ items: [NSMenuItem]) {
+        guard !items.isEmpty else { return }
+        if !self.items.isEmpty { insertItem(.separator(), at: 0) }
+        for item in items.reversed() { insertItem(item, at: 0) }
+    }
+}
+
+/// WKUserContentController retains its handlers; this keeps the page from leaking.
+private final class CaptureHandler: NSObject, WKScriptMessageHandler {
+    weak var target: WKScriptMessageHandler?
+    init(_ target: WKScriptMessageHandler) { self.target = target }
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        target?.userContentController(controller, didReceive: message)
+    }
 }
 
 struct WebSurface: NSViewRepresentable {

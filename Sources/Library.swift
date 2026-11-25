@@ -10,9 +10,20 @@ struct Category: Codable, Identifiable, Hashable {
     var hue: Double
     var domains: [String] = []
     var keywords: [String] = []
+    /// Created by an agent through the bridge, not by you. Such a shelf holds the tabs the
+    /// agent filed there and quietly goes away once they're all read, unless you keep it.
+    var madeByAgent: Bool?
+
+    var isAgentMade: Bool { madeByAgent == true }
 
     static let otherID = "other"
+    static let laterID = "later"
     var isOther: Bool { id == Self.otherID }
+    var isLater: Bool { id == Self.laterID }
+    /// Built-in shelves that can be renamed but never deleted.
+    var isBuiltIn: Bool { isOther || isLater }
+
+    static let later = Category(id: laterID, name: "Read later", symbol: "bookmark", hue: 0.08)
 
     /// Site rules accept three forms:
     /// - `arxiv.org`  matches the domain and any subdomain
@@ -41,6 +52,7 @@ struct Category: Codable, Identifiable, Hashable {
     }
 
     static let defaults: [Category] = [
+        later,
         Category(id: "ai", name: "AI assistants", symbol: "sparkle", hue: 0.46,
                  domains: ["chatgpt.com", "claude.ai", "gemini.google.com", "perplexity.ai", "grok.com"]),
         Category(id: "research", name: "Papers & research", symbol: "books.vertical", hue: 0.10,
@@ -64,7 +76,7 @@ struct Category: Codable, Identifiable, Hashable {
                            "developer.mozilla.org", "developer.apple.com", "pytorch.org", "rust-lang.org", "godbolt.org",
                            "llvm.org", "pypi.org", "npmjs.com", "docs.", "developer.", "/docs/"],
                  keywords: ["api reference", "documentation", "language reference"]),
-        Category(id: otherID, name: "Everything else", symbol: "rectangle.on.rectangle", hue: 0.66),
+        Category(id: otherID, name: "Unsorted", symbol: "rectangle.on.rectangle", hue: 0.66),
     ]
 
     /// Names used by the first version of the app, for migrating saved assignments.
@@ -197,6 +209,13 @@ final class Library: ObservableObject {
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var rawCount = 0
     @Published var sample = ProcessInfo.processInfo.arguments.contains("--sample")
+    /// Pages saved to Read later, newest first. They outlive their Helium tabs.
+    @Published private(set) var later: [SavedSource]
+    private var laterAddresses: Set<String> { Set(later.map(\.address)) }
+    /// Agent shelves made this session, with when: they get a grace period to be filled.
+    private var agentShelvesMade: [String: Date] = [:]
+    /// Helium tabs this app already closed, so a later Done doesn't try again.
+    private var closed: Set<String> = []
 
     private var refreshTask: Task<Void, Never>?
     /// Tabs finished this session. Hidden even if a refresh races the close.
@@ -212,7 +231,13 @@ final class Library: ObservableObject {
         } else {
             loadedCategories.append(Category.defaults.last!)
         }
+        if !loadedCategories.contains(where: \.isLater) { loadedCategories.insert(Category.later, at: 0) }
+        // "Everything else" sat right next to "Everything" in the index; the catch-all is now "Unsorted".
+        if let index = loadedCategories.firstIndex(where: \.isOther), loadedCategories[index].name == "Everything else" {
+            loadedCategories[index].name = "Unsorted"
+        }
         categories = loadedCategories
+        later = store.data(forKey: "readLater.v1").flatMap { try? JSONDecoder().decode([SavedSource].self, from: $0) } ?? []
 
         if let saved = store.dictionary(forKey: "assignments.v2") as? [String: String] {
             assignments = saved
@@ -232,7 +257,7 @@ final class Library: ObservableObject {
     func refresh() {
         guard refreshTask == nil else { return }
         if sample {
-            tabs = Self.sampleTabs.filter { !finished.contains($0.id) }
+            tabs = withSaved(Self.sampleTabs.filter { !finished.contains($0.id) })
             loaded = true
             return
         }
@@ -251,8 +276,9 @@ final class Library: ObservableObject {
             do {
                 let imported = try JSONDecoder().decode([BrowserTab].self, from: try await Helium.run())
                 rawCount = imported.count
-                tabs = Self.merge(imported.filter { !finished.contains($0.id) })
+                tabs = withSaved(Self.merge(imported.filter { !finished.contains($0.id) }))
                 lastUpdated = .now
+                pruneAgentShelves()
             } catch {
                 self.error = error.localizedDescription
             }
@@ -275,17 +301,62 @@ final class Library: ObservableObject {
         return order.compactMap { byAddress[$0] }
     }
 
+    /// Saved pages whose Helium tab is gone still get a card, after the open tabs.
+    private func withSaved(_ open: [BrowserTab]) -> [BrowserTab] {
+        let present = Set(open.map(\.address))
+        return open + later.filter { !present.contains($0.address) }.map(\.tab)
+    }
+
+    func isSaved(_ tab: BrowserTab) -> Bool { laterAddresses.contains(tab.address) }
+
+    /// Puts a page on the Read later shelf and, optionally, closes its Helium tab.
+    func saveForLater(_ tab: BrowserTab, closeInHelium: Bool) {
+        guard tab.readableURL != nil else { return }
+        if !isSaved(tab) {
+            later.insert(SavedSource(address: tab.address, title: tab.displayTitle, saved: .now), at: 0)
+            saveLater()
+        }
+        let copies = tab.copies.filter { $0.windowID != SavedSource.windowID && !closed.contains($0.id) }
+        guard closeInHelium, !sample, !copies.isEmpty else { return }
+        copies.forEach { finished.insert($0.id); closed.insert($0.id) }
+        if let index = tabs.firstIndex(where: { $0.address == tab.address }),
+           let saved = later.first(where: { $0.address == tab.address }) {
+            tabs[index] = saved.tab
+        }
+        Task {
+            do { _ = try await Helium.run(["close"] + copies.flatMap { [$0.windowID, $0.id] }) }
+            catch { self.error = "Couldn’t close the tab in Helium: \(error.localizedDescription)" }
+        }
+    }
+
+    /// Takes a page off Read later. If its Helium tab is still open it goes back to its usual shelf.
+    func removeFromLater(_ address: String) {
+        later.removeAll { $0.address == address }
+        saveLater()
+        tabs.removeAll { $0.windowID == SavedSource.windowID && $0.address == address }
+    }
+
+    private func saveLater() {
+        if let data = try? JSONEncoder().encode(later) { defaults.set(data, forKey: "readLater.v1") }
+    }
+
     /// Marks a tab as read: hides it here and, optionally, closes it in Helium.
     func finish(_ tab: BrowserTab, closeInHelium: Bool) {
         tab.copies.forEach { finished.insert($0.id) }
-        tabs.removeAll { $0.id == tab.id }
+        tabs.removeAll { $0.id == tab.id || $0.address == tab.address }
+        if isSaved(tab) {
+            later.removeAll { $0.address == tab.address }
+            saveLater()
+        }
         let today = Self.dayStamp()
         finishedToday = (defaults.string(forKey: "finished.day") == today ? finishedToday : 0) + 1
         defaults.set(today, forKey: "finished.day")
         defaults.set(finishedToday, forKey: "finished.count")
-        guard closeInHelium, !sample else { return }
+        let copies = tab.copies.filter { $0.windowID != SavedSource.windowID && !closed.contains($0.id) }
+        guard closeInHelium, !sample, !copies.isEmpty else { return }
+        copies.forEach { closed.insert($0.id) }
         Task {
-            do { _ = try await Helium.run(["close"] + tab.copies.flatMap { [$0.windowID, $0.id] }) }
+            do { _ = try await Helium.run(["close"] + copies.flatMap { [$0.windowID, $0.id] }) }
             catch { self.error = "Couldn’t close the tab in Helium: \(error.localizedDescription)" }
         }
     }
@@ -304,6 +375,9 @@ final class Library: ObservableObject {
 
     /// Assign by raw URL, for the bridge (no BrowserTab needed).
     func assign(address: String, to id: String?) {
+        if id == Category.laterID, let tab = tabs.first(where: { $0.address == address }) {
+            return saveForLater(tab, closeInHelium: false)
+        }
         assignments[address] = id
         defaults.set(assignments, forKey: "assignments.v2")
     }
@@ -315,22 +389,41 @@ final class Library: ObservableObject {
         defaults.set(siteRules, forKey: "siteRules.v2")
     }
 
-    /// Return a category with this name, creating one if there isn't yet.
+    /// Return a category with this name, creating one if there isn't yet. Used by agents
+    /// through the bridge, so a new shelf is marked as theirs and goes after your own.
     @discardableResult
     func ensureCategory(named name: String, symbol: String?) -> Category {
         if let existing = categories.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) { return existing }
-        let id = addCategory()
-        update(id) { shelf in
-            shelf.name = name
-            if let symbol { shelf.symbol = symbol }
-        }
-        return category(withID: id) ?? other
+        let shelf = Category(id: UUID().uuidString, name: name, symbol: symbol ?? "sparkles", hue: 0, madeByAgent: true)
+        categories.insert(shelf, at: max(0, categories.count - 1))
+        agentShelvesMade[shelf.id] = .now
+        saveCategories()
+        return shelf
     }
 
+    /// Turns an agent's shelf into one of yours, so it stays even when empty.
+    func keep(_ id: String) {
+        update(id) { $0.madeByAgent = nil }
+    }
+
+    /// Agent shelves exist for the tabs they hold. Once those are all read (and you
+    /// haven't given the shelf rules of its own), the shelf goes.
+    private func pruneAgentShelves() {
+        let used = Set(tabs.map { category(for: $0).id })
+        // An agent makes a shelf, then files tabs onto it in a later step; don't prune in between.
+        let settling = Set(agentShelvesMade.filter { Date.now.timeIntervalSince($0.value) < 600 }.keys)
+        let stale = categories.filter { $0.isAgentMade && $0.domains.isEmpty && $0.keywords.isEmpty
+            && !used.contains($0.id) && !settling.contains($0.id) }
+        stale.forEach { delete($0.id) }
+    }
+
+    var laterShelf: Category { categories.first { $0.isLater } ?? Category.later }
+
     func category(for tab: BrowserTab) -> Category {
+        if laterAddresses.contains(tab.address) { return laterShelf }
         if let id = assignments[tab.address], let manual = category(withID: id) { return manual }
         if let id = siteRules[tab.site], let site = category(withID: id) { return site }
-        return categories.first { !$0.isOther && $0.matches(tab) } ?? other
+        return categories.first { !$0.isBuiltIn && $0.matches(tab) } ?? other
     }
 
     func grouped() -> [String: [BrowserTab]] {
@@ -338,6 +431,13 @@ final class Library: ObservableObject {
     }
 
     func assign(_ tab: BrowserTab, to id: String?) {
+        if id == Category.laterID { return saveForLater(tab, closeInHelium: false) }
+        // A saved page with no Helium tab only exists on Read later, so it stays there.
+        guard tab.windowID != SavedSource.windowID else { return }
+        if isSaved(tab) {
+            later.removeAll { $0.address == tab.address }
+            saveLater()
+        }
         assignments[tab.address] = id
         defaults.set(assignments, forKey: "assignments.v2")
     }
@@ -373,7 +473,7 @@ final class Library: ObservableObject {
     }
 
     func delete(_ id: String) {
-        guard id != Category.otherID else { return }
+        guard id != Category.otherID, id != Category.laterID else { return }
         categories.removeAll { $0.id == id }
         assignments = assignments.filter { $0.value != id }
         siteRules = siteRules.filter { $0.value != id }

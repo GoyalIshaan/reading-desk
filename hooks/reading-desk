@@ -8,11 +8,11 @@ into shelves without touching the UI. The app applies changes within ~1 second.
 Examples:
   reading-desk tabs                      # every tab and its shelf
   reading-desk tabs --json               # same, as JSON (for agents)
-  reading-desk tabs --shelf "Everything else"
+  reading-desk tabs --shelf "Unsorted"
   reading-desk shelves
   reading-desk ensure-shelf "To read on the plane" --icon airplane
   reading-desk assign https://arxiv.org/abs/1706.03762 "Papers & research"
-  reading-desk assign-site news.ycombinator.com "Everything else"
+  reading-desk assign-site news.ycombinator.com "Unsorted"
   reading-desk auto https://example.com  # back to automatic filing
   reading-desk refresh                   # re-read Helium
   reading-desk apply plan.json           # a JSON array of commands at once

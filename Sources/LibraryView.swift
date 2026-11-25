@@ -3,6 +3,8 @@ import SwiftUI
 struct LibraryView: View {
     @ObservedObject var library: Library
     @ObservedObject var previews: Previews
+    /// Notes in the vault about each page, for the little ✎ count on cards.
+    @ObservedObject var notes: NoteIndex
     @Binding var selectedCategory: String?
     let closeInHelium: Bool
     let titleBarHeight: CGFloat
@@ -28,6 +30,7 @@ struct LibraryView: View {
             .filter { !(groups[$0.id]?.isEmpty ?? true) }
             .sorted { lhs, rhs in
                 if lhs.isOther != rhs.isOther { return rhs.isOther }
+                if lhs.isLater != rhs.isLater { return lhs.isLater }
                 return (groups[lhs.id]?.count ?? 0) > (groups[rhs.id]?.count ?? 0)
             }
     }
@@ -48,7 +51,8 @@ struct LibraryView: View {
             let columns = max(1, min(5, Int((available + gutter) / (290 + gutter))))
             let columnWidth = (available - gutter * CGFloat(columns - 1)) / CGFloat(columns)
             ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
+                // Lazy, so only the sections on screen are laid out and drawn.
+                LazyVStack(alignment: .leading, spacing: 0) {
                     sourceStatus.frame(height: 28)
                     if let error = library.error {
                         HStack(spacing: 8) {
@@ -128,10 +132,10 @@ struct LibraryView: View {
     /// The shelf index: big Garamond words with superscript counts.
     private func masthead(_ ordered: [Category], groups: [String: [BrowserTab]]) -> some View {
         FlowLayout(spacing: 30, lineSpacing: 2) {
-            ShelfWord(name: "Everything", count: library.tabs.count, selected: selectedCategory == nil) { select(nil) }
+            ShelfWord(name: "All", count: library.tabs.count, selected: selectedCategory == nil) { select(nil) }
             ForEach(ordered) { category in
                 ShelfWord(name: category.name, count: groups[category.id]?.count ?? 0,
-                          selected: selectedCategory == category.id) { select(category.id) }
+                          selected: selectedCategory == category.id, agent: category.isAgentMade) { select(category.id) }
             }
         }
     }
@@ -230,8 +234,11 @@ struct LibraryView: View {
                        icon: previews.icons[tab.host], width: width,
                        shelfName: selectedCategory == nil && !query.isEmpty ? category.name : nil,
                        categories: library.categories, currentCategory: category.id,
-                       open: { rect in open(category.id, tab, rect) },
+                       noteCount: notes.count(for: tab.address), saved: library.isSaved(tab),
+                       open: { _ in open(category.id, tab, nil) },
                        done: { library.finish(tab, closeInHelium: closeInHelium) },
+                       readLater: { library.saveForLater(tab, closeInHelium: closeInHelium) },
+                       removeFromLater: { library.removeFromLater(tab.address) },
                        assign: { library.assign(tab, to: $0) },
                        fileSite: { library.fileSite(of: tab, in: $0) })
             .onAppear { previews.request(tab) }
@@ -268,6 +275,7 @@ private struct ShelfWord: View {
     let name: String
     let count: Int
     let selected: Bool
+    var agent = false
     let action: () -> Void
     @State private var hovered = false
 
@@ -278,6 +286,13 @@ private struct ShelfWord: View {
                     .font(Theme.serif(42, italic: selected))
                     .tracking(-0.6)
                     .foregroundStyle(selected ? Theme.ink : hovered ? Theme.ink2 : Theme.ink3.opacity(0.7))
+                if agent {
+                    // Shelves an agent made: same type, a small mark so you know who filed them.
+                    Image(systemName: "sparkle").font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(selected ? Theme.accent : Theme.ink4)
+                        .padding(.top, 10)
+                        .help("Sorted by an agent. This shelf goes away once its tabs are read.")
+                }
                 Text("\(count)")
                     .font(Theme.mono(11, .medium))
                     .foregroundStyle(selected ? Theme.accent : Theme.ink4)
@@ -303,14 +318,17 @@ struct TabCard: View {
     let shelfName: String?
     let categories: [Category]
     let currentCategory: String
+    var noteCount = 0
+    var saved = false
     /// Called with the card's cover frame in window coordinates.
     let open: (CGRect) -> Void
     let done: () -> Void
+    var readLater: () -> Void = {}
+    var removeFromLater: () -> Void = {}
     let assign: (String?) -> Void
     let fileSite: (String) -> Void
 
     @State private var hovered = false
-    @State private var frame = FrameBox()
 
     private var title: String {
         let page = tab.title.trimmed
@@ -322,6 +340,9 @@ struct TabCard: View {
         if image != nil, let aspect = preview?.aspect { return width * min(max(aspect, 0.42), 0.85) }
         return width * 0.58
     }
+
+    /// X posts and profiles: shown as the words themselves, not an empty cover.
+    private var post: XPost? { image == nil ? XPost(tab: tab, preview: preview) : nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -344,6 +365,14 @@ struct TabCard: View {
                             .help("Open \(tab.copies.count) times in Helium. Done closes every copy.")
                     }
                     Spacer(minLength: 6)
+                    if noteCount > 0 {
+                        HStack(spacing: 3) {
+                            Image(systemName: "pencil.line").font(.system(size: 9, weight: .medium))
+                            Text("\(noteCount)").font(Theme.mono(10.5))
+                        }
+                        .foregroundStyle(Theme.accent.opacity(0.85))
+                        .help(noteCount == 1 ? "You have a note on this page" : "You have \(noteCount) notes on this page")
+                    }
                     if let shelfName {
                         Text(shelfName).font(Theme.mono(10.5)).foregroundStyle(Theme.ink4).lineLimit(1)
                     } else if preview?.isPDF == true {
@@ -352,13 +381,13 @@ struct TabCard: View {
                         Text("\(minutes) min").font(Theme.mono(10.5)).foregroundStyle(Theme.ink4)
                     }
                 }
-                Text(title)
+                Text(post?.byline ?? title)
                     .font(Theme.serif(20, .medium))
                     .lineSpacing(-1)
                     .foregroundStyle(hovered ? Color.white : Theme.ink)
                     .lineLimit(4)
                     .fixedSize(horizontal: false, vertical: true)
-                if let summary = preview?.summary, summary.caseInsensitiveCompare(title) != .orderedSame {
+                if post == nil, let summary = preview?.summary, summary.caseInsensitiveCompare(title) != .orderedSame {
                     Text(summary)
                         .font(Theme.sans(12.5))
                         .lineSpacing(3)
@@ -371,40 +400,27 @@ struct TabCard: View {
         }
         .frame(width: width, alignment: .leading)
         .contentShape(Rectangle())
-        .background {
-            // Track where the card is without re-rendering on every scroll frame.
-            GeometryReader { proxy in
-                Color.clear
-                    .onAppear { frame.rect = proxy.frame(in: .global) }
-                    .onChange(of: proxy.frame(in: .global)) { _, rect in frame.rect = rect }
-            }
-        }
-        .onTapGesture {
-            open(CGRect(x: frame.rect.minX, y: frame.rect.minY, width: frame.rect.width, height: coverHeight))
-        }
+        .onTapGesture { open(.zero) }
         .onHover { inside in withAnimation(.easeOut(duration: 0.16)) { hovered = inside } }
         .help(tab.readableURL == nil ? "Switch to this tab in Helium" : tab.address)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
-        .accessibilityAction {
-            open(CGRect(x: frame.rect.minX, y: frame.rect.minY, width: frame.rect.width, height: coverHeight))
-        }
+        .accessibilityAction { open(.zero) }
         .accessibilityAction(named: "Mark done", done)
     }
 
     @ViewBuilder private var cover: some View {
-        if let image {
+        if let post {
+            PostCover(post: post, hovered: hovered)
+        } else if let image {
             Image(nsImage: image)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .frame(width: width, height: coverHeight, alignment: .top)
                 .clipped()
-                .scaleEffect(hovered ? 1.025 : 1)
-                .saturation(hovered ? 1 : 0.82)
-                .brightness(hovered ? 0 : -0.08)
-                .overlay(alignment: .bottom) {
-                    LinearGradient(colors: [.clear, Theme.ground.opacity(hovered ? 0.12 : 0.32)], startPoint: .center, endPoint: .bottom)
-                }
+                // A flat dim instead of saturation/brightness filters: filters make every
+                // visible cover re-render off-screen on each scroll frame.
+                .overlay(Theme.ground.opacity(hovered ? 0 : 0.14))
         } else {
             TypeCover(site: tab.sourceName, icon: icon, loading: preview == nil && tab.readableURL != nil)
         }
@@ -413,7 +429,15 @@ struct TabCard: View {
     private var actions: some View {
         HStack(spacing: 2) {
             CardAction(symbol: "checkmark", help: "Mark done") { done() }
+            if tab.readableURL != nil && !saved {
+                CardAction(symbol: "bookmark", help: "Read later") { readLater() }
+            }
             Menu {
+                if saved {
+                    Button("Remove from Read later") { removeFromLater() }
+                } else if tab.readableURL != nil {
+                    Button("Read later") { readLater() }
+                }
                 Section("Move to shelf") {
                     ForEach(categories) { option in
                         Button { assign(option.id) } label: {
@@ -467,8 +491,90 @@ private struct CardAction: View {
     }
 }
 
-final class FrameBox {
-    var rect: CGRect = .zero
+
+/// What an X (Twitter) tab is about, read from its title, address and description.
+/// Titles come as `Name on X: "post text" / X` for posts and `Name (@handle) / X` for profiles.
+struct XPost {
+    enum Kind { case post, profile, other }
+    var kind: Kind
+    var author: String?
+    var handle: String?
+    var text: String?
+
+    init?(tab: BrowserTab, preview: PagePreview?) {
+        let site = tab.site
+        guard site == "x.com" || site == "twitter.com" || site.hasSuffix(".x.com") || site == "mobile.twitter.com" else { return nil }
+        let parts = tab.url?.pathComponents.filter { $0 != "/" } ?? []
+        let reserved: Set<String> = ["home", "explore", "search", "notifications", "messages", "settings", "i", "compose", "hashtag"]
+        handle = parts.first.flatMap { reserved.contains($0.lowercased()) ? nil : $0 }
+        kind = parts.count >= 3 && parts[1] == "status" ? .post : handle != nil && parts.count == 1 ? .profile : .other
+        let title = (tab.title.trimmed.isEmpty ? preview?.title : tab.title)?.trimmed ?? ""
+        if let post = Self.postTitle.firstMatch(in: title, range: NSRange(title.startIndex..., in: title)),
+           let name = Range(post.range(at: 1), in: title), let quoted = Range(post.range(at: 2), in: title) {
+            author = String(title[name])
+            // The description holds the whole post; the title cuts it off.
+            text = preview?.summary?.trimmed.nonEmpty ?? String(title[quoted]).trimmed.nonEmpty
+            kind = .post
+        } else if let open = title.range(of: " (@"), let close = title.range(of: ")", range: open.upperBound..<title.endIndex) {
+            author = String(title[..<open.lowerBound])
+            handle = String(title[open.upperBound..<close.lowerBound])
+            text = preview?.summary?.trimmed.nonEmpty
+            kind = .profile
+        } else {
+            text = preview?.summary?.trimmed.nonEmpty
+        }
+        if let text, text.isEmpty { self.text = nil }
+    }
+
+    private static let postTitle = try! NSRegularExpression(pattern: #"^(.+?) on (?:X|Twitter): [“"](.*)[”"]\s*(?:/ (?:X|Twitter))?$"#,
+                                                            options: [.dotMatchesLineSeparators])
+
+    /// The line under the cover: who it's from.
+    var byline: String {
+        switch kind {
+        case .post: author.map { "\($0)’s post" } ?? handle.map { "Post by @\($0)" } ?? "A post on X"
+        case .profile: author ?? handle.map { "@\($0)" } ?? "Profile on X"
+        case .other: author ?? handle.map { "@\($0) on X" } ?? "X"
+        }
+    }
+}
+
+/// An X tab without an image: the post's own words, set like a pull quote.
+private struct PostCover: View {
+    let post: XPost
+    let hovered: Bool
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Rectangle().fill(hovered ? Theme.raised : Theme.surface)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 7) {
+                    Image(systemName: post.kind == .profile ? "person.crop.circle" : "text.bubble")
+                        .font(.system(size: 10.5, weight: .medium))
+                    Text(post.handle.map { "@\($0)" } ?? "x.com")
+                        .font(Theme.mono(10.5))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(Theme.ink3)
+                if let text = post.text {
+                    Text(text)
+                        .font(Theme.serif(post.kind == .profile ? 17 : 19))
+                        .lineSpacing(1)
+                        .foregroundStyle(post.kind == .profile ? Theme.ink2 : Theme.ink)
+                        .lineLimit(post.kind == .profile ? 5 : 7)
+                        .padding(.leading, post.kind == .post ? 12 : 0)
+                        .overlay(alignment: .leading) {
+                            if post.kind == .post { Rectangle().fill(Theme.accent.opacity(0.7)).frame(width: 2) }
+                        }
+                } else {
+                    Text(post.kind == .profile ? "Profile" : "Post")
+                        .font(Theme.serif(24, italic: true)).foregroundStyle(Theme.ink3)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(18)
+        }
+    }
 }
 
 /// When a page has no image: a quiet bookplate with the site's mark and name.
@@ -476,7 +582,6 @@ private struct TypeCover: View {
     let site: String
     let icon: NSImage?
     let loading: Bool
-    @State private var pulse = false
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -489,8 +594,8 @@ private struct TypeCover: View {
                 }
             }
             if loading {
-                Rectangle().fill(Theme.raised).opacity(pulse ? 0.55 : 0.15)
-                    .onAppear { withAnimation(.easeInOut(duration: 1.1).repeatForever()) { pulse = true } }
+                // Static: a pulsing placeholder per loading card keeps the whole grid animating.
+                Rectangle().fill(Theme.raised).opacity(0.3)
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Favicon(icon: icon, site: site, size: 26)
@@ -686,6 +791,15 @@ private struct ShelfForm: View {
                 if category.isOther {
                     Text("Anything that doesn’t match another shelf lands here. It always comes last.")
                         .font(Theme.sans(13)).foregroundStyle(Theme.ink3)
+                } else if category.isAgentMade {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("An agent made this shelf and filed tabs onto it. It goes away by itself once those tabs are read. Keep it to make it one of your shelves, with its own rules.")
+                            .font(Theme.sans(13)).foregroundStyle(Theme.ink3).fixedSize(horizontal: false, vertical: true)
+                        Button("Keep this shelf") { library.keep(category.id) }.buttonStyle(DeskButtonStyle(.outline))
+                    }
+                } else if category.isLater {
+                    Text("Pages you save with Read later (the bookmark on a card or in the reader, or right-click a page). They stay here after their Helium tab closes, until you mark them done.")
+                        .font(Theme.sans(13)).foregroundStyle(Theme.ink3).fixedSize(horizontal: false, vertical: true)
                 } else {
                     field("Sites", hint: "arxiv.org matches the site and its subdomains · docs. matches hosts starting with it · /blog/ matches anywhere in the address") {
                         TextField("arxiv.org, docs., /blog/", text: $sites, axis: .vertical).lineLimit(2...6).modifier(FieldBox())

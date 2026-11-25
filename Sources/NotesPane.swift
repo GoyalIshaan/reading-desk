@@ -3,12 +3,18 @@ import SwiftUI
 struct NotesPane: View {
     @ObservedObject var vault: Vault
     @ObservedObject var renderer: NoteRenderer
+    @ObservedObject var index: NoteIndex
     let source: BrowserTab
     @State private var query = ""
     @State private var noteTitle = ""
     @State private var creating = false
     @State private var confirmingReload = false
     @FocusState private var titleFocused: Bool
+
+    /// Notes you've already written that point at this page, its own note first.
+    private var related: [Note] {
+        index.refs(for: source.address).compactMap { vault.note(atPath: $0.path) }
+    }
 
     private var matches: [Note] {
         let search = query.trimmed
@@ -41,6 +47,7 @@ struct NotesPane: View {
             } else if vault.showPicker || vault.selection == nil {
                 picker
             } else if let note = vault.selection {
+                earlierNotes(besides: note)
                 ZStack(alignment: .bottomTrailing) {
                     if vault.preview {
                         NoteWebView(renderer: renderer)
@@ -102,6 +109,9 @@ struct NotesPane: View {
                     Button("Refresh notes") { Task { await vault.refresh() } }
                     Button("Choose another vault…") { Task { await vault.chooseFolder() } }
                     Button("Open in Obsidian") { vault.openInObsidian() }
+                    if let note = vault.selection, !vault.showPicker, !vault.isSourceNote(note, for: source) {
+                        Button("Save this page’s highlights here") { vault.linkSelection(to: source) }
+                    }
                     if vault.selection != nil { Button("Reload note from disk…") { requestReload() } }
                 } label: {
                     Image(systemName: "ellipsis").font(.system(size: 12)).foregroundStyle(Theme.ink3).frame(width: 26, height: 28)
@@ -173,6 +183,15 @@ struct NotesPane: View {
             .buttonStyle(.plain)
             .padding(.horizontal, 14).padding(.top, 14)
 
+            if query.isEmpty, !related.isEmpty {
+                Text("ON THIS PAGE").font(Theme.mono(10, .medium)).foregroundStyle(Theme.ink4)
+                    .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 2)
+                ForEach(related) { note in
+                    NoteRow(note: note, selected: vault.selection == note) { Task { await vault.open(note) } }
+                }
+                Hairline().padding(.top, 6)
+            }
+
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(Theme.ink3)
                 TextField("Find a note", text: $query).textFieldStyle(.plain).font(Theme.sans(13))
@@ -228,6 +247,32 @@ struct NotesPane: View {
         .background(Theme.ground)
         .preferredColorScheme(.dark)
         .onAppear { titleFocused = true }
+    }
+
+    /// A slim reminder above an unrelated note: you've written about this page before.
+    @ViewBuilder private func earlierNotes(besides note: Note) -> some View {
+        let others = related.filter { $0 != note }
+        if !others.isEmpty, !related.contains(note) {
+            HStack(spacing: 8) {
+                Image(systemName: "clock.arrow.circlepath").font(.system(size: 10.5)).foregroundStyle(Theme.accent)
+                Text(others.count == 1 ? "You have a note on this page:" : "\(others.count) earlier notes on this page:")
+                    .font(Theme.sans(12)).foregroundStyle(Theme.ink3)
+                if others.count == 1, let only = others.first {
+                    TextAction(title: only.name) { Task { await vault.open(only) } }.lineLimit(1)
+                } else {
+                    Menu {
+                        ForEach(others) { other in Button(other.name) { Task { await vault.open(other) } } }
+                    } label: {
+                        Text("Open…").font(Theme.sans(12.5, .medium)).foregroundStyle(Theme.ink2)
+                    }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 14).frame(height: 32)
+            .background(Theme.surface)
+            Hairline()
+        }
     }
 
     private func requestReload() {

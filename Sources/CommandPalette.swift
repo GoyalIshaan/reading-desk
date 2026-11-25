@@ -12,6 +12,7 @@ struct CommandPalette: View {
     @ObservedObject var previews: Previews
     let fullscreenOnOpen: Bool
     let closeInHelium: Bool
+    var resumeOnLaunch = true
     let close: () -> Void
     let openTab: (BrowserTab) -> Void
     let openShelf: (String) -> Void
@@ -30,7 +31,7 @@ struct CommandPalette: View {
     @FocusState private var focused: Bool
 
     enum Command: String, CaseIterable {
-        case allShelves, refresh, editShelves, toggleFullscreen, toggleCloseInHelium
+        case continueReading, allShelves, refresh, editShelves, toggleFullscreen, toggleCloseInHelium, toggleResume
 
         var label: (title: String, symbol: String, keywords: String) {
             switch self {
@@ -39,6 +40,8 @@ struct CommandPalette: View {
             case .editShelves: ("Edit shelves and filing rules", "books.vertical", "manage categories autofiling")
             case .toggleFullscreen: ("Enter full screen when reading", "arrow.up.left.and.arrow.down.right", "fullscreen settings reading options")
             case .toggleCloseInHelium: ("Close Helium tabs when marked done", "xmark.circle", "keep tabs open settings reading options")
+            case .continueReading: ("Continue where I left off", "book", "resume last session reopen")
+            case .toggleResume: ("Reopen where I left off on launch", "clock.arrow.circlepath", "resume continue session settings reading options")
             }
         }
     }
@@ -94,12 +97,15 @@ struct CommandPalette: View {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         let terms = SearchIndex.queryTerms(trimmed)
         let commands = Command.allCases.compactMap { command -> Item? in
+            if command == .continueReading && ReadingMemory.session == nil { return nil }
             let label = command.label
             let words = SearchIndex.words(in: label.title + " " + label.keywords)
             guard terms.allSatisfy({ term in words.contains { $0.hasPrefix(term) } }) else { return nil }
             let detail: String? = switch command {
             case .toggleFullscreen: fullscreenOnOpen ? "On" : "Off"
             case .toggleCloseInHelium: closeInHelium ? "On" : "Off"
+            case .toggleResume: resumeOnLaunch ? "On" : "Off"
+            case .continueReading: ReadingMemory.session?.title
             default: nil
             }
             return Item(kind: .command(command), detail: detail)
@@ -357,7 +363,7 @@ private struct PaletteRow: View, Equatable {
                 Text(command.label.title).font(Theme.sans(13.5, .medium)).foregroundStyle(Theme.ink).lineLimit(1)
                 Spacer(minLength: 8)
                 if let detail = item.detail {
-                    Text(detail).font(Theme.sans(12)).foregroundStyle(Theme.ink3)
+                    Text(detail).font(Theme.sans(12)).foregroundStyle(Theme.ink3).lineLimit(1).truncationMode(.middle)
                 }
             case .shelf(let category, let count):
                 Image(systemName: category.symbol)

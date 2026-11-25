@@ -70,6 +70,29 @@ Live preview supports frontmatter, callouts, wikilinks, embeds, tags, highlights
 
 If the same note changes on disk while you’re editing it, Reading Desk shows a conflict and keeps your draft available to copy before you reload the file.
 
+## Highlights and questions
+
+Select anything on the page (a paragraph, an equation, a code block) and a small bar appears above it. The same actions are in the right-click menu:
+
+- **Save to note** quotes it in the page’s note as an Obsidian `[!quote]` callout. The callout carries the page title and a link straight back to the passage (a scroll-to-text link, or `#page=N` for PDFs), plus the section it sits under and, for PDFs, the page number. The Notes pane opens with the caret on the line below the quote, so you can write down what you understood. Math is saved as TeX (KaTeX, MathJax, Wikipedia and arXiv HTML all work), and code keeps its language.
+- **Ask** drafts a question in ChatGPT, Claude or Gemini (the chevron picks which) with the passage and its source in the message box. Nothing is sent. If a chat’s box can’t be reached, the question goes on your clipboard instead.
+
+Each page has one note. It’s the note you created for it, or any note whose `source:` property links to it. If there isn’t one, the first highlight creates `Reading Desk/<title>.md` with `source`, `created` and `tags` properties. arXiv abstract, PDF and HTML links all count as the same paper, and so do DOIs, OpenReview links, and addresses that differ only in `www.`, trailing slashes or tracking parameters. To send a page’s highlights to a different note, open that note and choose **Save this page’s highlights here** from the Notes `…` menu.
+
+## Earlier notes
+
+Reading Desk indexes the links in your vault. A card with notes about its page shows a ✎ count. When you open the page, a toast tells you, the Notes tab shows the count, and the notes list starts with **On this page**. If you have another note open, a strip above it links to the earlier ones.
+
+## Papers
+
+PDFs open in a native PDF reader. **Contents** (the list icon in the dock, or right-click → Sections…) jumps between the PDF’s sections, or the headings of a web page. The dock shows the page you’re on, and Reading Desk remembers it. On a paper (arXiv, OpenReview, a DOI, ACL, NeurIPS, PMLR, PDFs), **Copy BibTeX** (in the dock or the right-click menu) fetches the published entry, or builds a `@misc` entry when there isn’t one. On arXiv, the dock flips between the abstract page and the PDF.
+
+## Read later and continuing
+
+**Read later** (the bookmark in the dock, a card’s hover button, or right-click on the page) moves a page to the *Read later* shelf and, if *Close Helium tabs when marked done* is on, closes its Helium tab. The page stays on the shelf until you mark it done. Remove it from a card’s `…` menu.
+
+Quit while reading and Reading Desk reopens the same page at the same scroll position (or PDF page), with the same companion and note. Turn this off with ⇧⌘P → **Reopen where I left off on launch**, or jump back any time with **Continue where I left off**.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |

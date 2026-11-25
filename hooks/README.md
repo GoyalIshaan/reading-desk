@@ -22,7 +22,7 @@ running for live changes; commands queued while it's closed run at next launch.
 ```bash
 hooks/reading-desk tabs                 # every tab and its shelf
 hooks/reading-desk tabs --json          # for agents
-hooks/reading-desk tabs --shelf "Everything else"
+hooks/reading-desk tabs --shelf "Unsorted"
 hooks/reading-desk tabs --auto-only     # tabs the app filed automatically
 hooks/reading-desk shelves              # shelves with their ids and counts
 
@@ -44,7 +44,7 @@ A typical "organize my tabs" run for an agent:
 cat > plan.json <<'JSON'
 [
   {"op": "assign", "url": "https://arxiv.org/abs/1706.03762", "category": "Papers & research"},
-  {"op": "assign", "url": "https://news.ycombinator.com/item?id=1", "category": "Everything else"}
+  {"op": "assign", "url": "https://news.ycombinator.com/item?id=1", "category": "Unsorted"}
 ]
 JSON
 reading-desk apply plan.json
@@ -70,6 +70,16 @@ then rename into place, so the app never reads a half-written file. Supported
 `category` is a shelf **id** or its **name** (case-insensitive). `url` must
 match a tab's `url` from `state.json` exactly. `icon` is an SF Symbol name
 (`airplane`, `flask`, `bookmark`, …).
+
+### Shelves an agent makes
+
+`ensureCategory` makes a shelf marked `madeByAgent` in `state.json`. It goes after the
+user's own shelves, shows a small ✦ in the library index, and is **temporary**: once
+none of its tabs are open any more (they were read, or closed in Helium), the app
+removes it, after a 10-minute grace period so an agent can create a shelf and fill it in
+separate steps. The user can choose **Keep this shelf** in the shelf editor to make it
+permanent. So an agent can sort the *Unsorted* pile into topic shelves freely: the
+shelves tidy themselves up afterwards and never pile up.
 
 Assignments you make here are the same ones the app's own "Move to shelf" menu
 writes, so they persist and win over the automatic rules — exactly as if you'd

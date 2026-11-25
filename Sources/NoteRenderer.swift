@@ -12,6 +12,8 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private var ready = false
     private var pending: [String: Any]?
     private var shown: (path: String, text: String)?
+    /// Set after a highlight: once the note re-renders, put the caret on the last line.
+    private var caretToEnd = false
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -40,7 +42,29 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
             "markdown": text, "path": note.path, "keepScroll": keep,
             "attachments": vault?.attachments ?? [],
         ]
-        if ready { call("deskRender", payload) } else { pending = payload }
+        if ready {
+            call("deskRender", payload)
+            placeCaretIfAsked()
+        } else { pending = payload }
+    }
+
+    /// Asks for the caret at the end of the note on its next render (or now, if it's already shown).
+    func startEditingAtEnd(_ note: Note, text: String) {
+        caretToEnd = true
+        if ready, shown?.path == note.path, shown?.text == text { placeCaretIfAsked() }
+    }
+
+    private func placeCaretIfAsked() {
+        guard caretToEnd else { return }
+        caretToEnd = false
+        view.window?.makeFirstResponder(view)
+        call("deskStartEditing")
+        // The pane may only just have been put on screen; take focus once it's in the window.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self, let window = self.view.window, window.firstResponder !== self.view else { return }
+            window.makeFirstResponder(self.view)
+        }
+        view.evaluateJavaScript("window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' })")
     }
 
     func forget() { shown = nil }
@@ -61,7 +85,10 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
             NSLog("ReadingDesk notes JS: \(body["message"] ?? "")")
         case "ready":
             ready = true
-            if let pending { call("deskRender", pending) }
+            if let pending {
+                call("deskRender", pending)
+                placeCaretIfAsked()
+            }
             pending = nil
         case "open":
             guard let target = body["target"] as? String, let vault else { return }

@@ -67,14 +67,19 @@ private actor VaultFiles {
             .trimmingCharacters(in: .whitespacesAndNewlines).prefix(100))
         let base = name.isEmpty || name.hasPrefix(".") ? "Untitled" : name
         let header = "# " + title.replacingOccurrences(of: "\n", with: " ") + "\n\n"
+        // A `source` property ties the note to its page: highlights from that page land here,
+        // and Reading Desk finds it again next time you open the page.
         let citation = source.flatMap { tab in
-            tab.readableURL.map { "Source: <" + $0.absoluteString + ">\n\n" }
+            tab.readableURL.map { url in
+                let day = localDay()
+                return "---\nsource: " + url.absoluteString + "\ncreated: " + day + "\ntags:\n  - reading-desk\n---\n"
+            }
         } ?? ""
         for number in 1...1000 {
             let filename = base + (number == 1 ? "" : " \(number)") + ".md"
             let url = folder.appendingPathComponent(filename)
             do {
-                try Data((header + citation).utf8).write(to: url, options: .withoutOverwriting)
+                try Data((citation + header).utf8).write(to: url, options: .withoutOverwriting)
                 return Note(url: url, path: "Reading Desk/" + filename, modified: .now)
             } catch let error as CocoaError where error.code == .fileWriteFileExists {
                 continue
@@ -101,6 +106,8 @@ final class Vault: ObservableObject {
     private var autosave: Task<Void, Never>?
     private var saveTask: Task<Bool, Never>?
     private let files = VaultFiles()
+    /// Which notes mention which pages, for highlights and "earlier notes on this page".
+    let index = NoteIndex()
 
     var isDirty: Bool { selection != nil && savedText != text }
 
@@ -148,6 +155,7 @@ final class Vault: ObservableObject {
             preview = false
             showPicker = true
             UserDefaults.standard.set(url.path, forKey: "vaultPath")
+            Task { await index.rebuild(results.notes) }
         } catch { self.error = error.localizedDescription }
     }
 
@@ -160,6 +168,7 @@ final class Vault: ObservableObject {
             notes = results.notes
             attachments = results.attachments
             if !isDirty { error = nil }
+            Task { await index.rebuild(results.notes) }
         } catch { self.error = error.localizedDescription }
     }
 
@@ -201,9 +210,56 @@ final class Vault: ObservableObject {
         do {
             let note = try await files.create(title: title, source: source, in: root)
             notes.insert(note, at: 0)
+            if let source {
+                index.add(note.path, isSource: true, for: source.address)
+                if let key = SourceKey.key(for: source.address) { ReadingMemory.setNotePath(note.path, for: key) }
+            }
             preview = false
             await read(note)
         } catch { self.error = error.localizedDescription }
+    }
+
+    func note(atPath path: String) -> Note? { notes.first { $0.path == path } }
+
+    /// The note highlights from this page go into: the one you picked or created
+    /// for it, else one whose `source` property points at it.
+    func sourceNote(for tab: BrowserTab) -> Note? {
+        guard let key = SourceKey.key(for: tab.address) else { return nil }
+        if let path = ReadingMemory.notePath(for: key), let note = note(atPath: path) { return note }
+        return index.refs(for: tab.address).first(where: \.isSource).flatMap { note(atPath: $0.path) }
+    }
+
+    /// Ties the open note to a page, so highlights from it land here.
+    func linkSelection(to tab: BrowserTab) {
+        guard let selection, let key = SourceKey.key(for: tab.address) else { return }
+        ReadingMemory.setNotePath(selection.path, for: key)
+        index.add(selection.path, isSource: true, for: tab.address)
+    }
+
+    func isSourceNote(_ note: Note, for tab: BrowserTab) -> Bool { sourceNote(for: tab) == note }
+
+    /// Appends a quote to the page's note (creating the note if it has none) and
+    /// leaves the note open in live preview, ready for the caret to land under it.
+    func capture(_ block: String, from tab: BrowserTab) async -> Bool {
+        guard root != nil else { return false }
+        if notes.isEmpty { await refresh() }
+        var note = sourceNote(for: tab)
+        if note == nil {
+            await create(String(tab.displayTitle.prefix(120)), source: tab)
+            note = selection
+        } else if let note, selection != note {
+            await open(note)
+        }
+        guard let note, selection == note else { return false }
+        var value = text
+        while let last = value.last, last.isWhitespace { value.removeLast() }
+        value += (value.isEmpty ? "" : "\n\n") + block + "\n\n"
+        edit(value)
+        if let key = SourceKey.key(for: tab.address) { ReadingMemory.setNotePath(note.path, for: key) }
+        index.add(note.path, isSource: true, for: tab.address)
+        preview = true
+        showPicker = false
+        return true
     }
 
     func edit(_ value: String) {

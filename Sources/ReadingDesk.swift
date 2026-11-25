@@ -1,4 +1,6 @@
+import Combine
 import SwiftUI
+import WebKit
 
 enum Companion: String, CaseIterable, Identifiable {
     case chatGPT = "ChatGPT"
@@ -26,15 +28,195 @@ final class Room: ObservableObject {
     @Published private(set) var companion: Companion = UserDefaults.standard.string(forKey: "companion")
         .flatMap(Companion.init(rawValue:)) ?? .chatGPT
 
-    let reader = WebPage()
+    let reader = WebPage(captures: true)
+    /// Set while the source is a PDF, which reads in PDFKit instead of the web view.
+    @Published private(set) var paper: PaperReader?
+    /// The passage selected on the page right now, if any.
+    @Published var excerpt: Excerpt?
     private var chats: [Companion: WebPage] = [:]
+    /// Chats from least to most recently used. Each chat page is its own web process
+    /// (often hundreds of MB once a conversation is long), so only two stay loaded.
+    private var chatOrder: [Companion] = []
+    private static let liveChats = 2
+    /// Set after a while back in the library: the reader and chats were unloaded to free memory.
+    private var asleep = false
+    /// PDFs PDFKit couldn't open; they stay in the web view.
+    private var pdfFailed: Set<URL> = []
+    /// The paper came from a web page turning out to be a PDF, so leaving that page closes it.
+    private var paperFollowsWeb = false
+    private var cancellables: Set<AnyCancellable> = []
+
+    /// What the right-click menu asks for; DeskView carries it out.
+    enum Action { case save, ask(Companion), readLater, bibtex, contents }
+    let actions = PassthroughSubject<Action, Never>()
 
     var current: BrowserTab? { queue.indices.contains(index) ? queue[index] : nil }
+
+    init() {
+        reader.onCapture = { [weak self] message, webView in self?.handleCapture(message, from: webView) }
+        reader.menuItems = { [weak self] in self?.menuItems() ?? [] }
+        reader.onPDF = { [weak self] url in
+            guard let self, self.paper?.url != url.removingFragment, !self.pdfFailed.contains(url.removingFragment) else { return }
+            self.openPaper(url, followsWeb: true)
+        }
+        reader.$state
+            .map(\.url)
+            .removeDuplicates()
+            .sink { [weak self] url in
+                guard let self, let url else { return }
+                self.excerpt = nil
+                if self.paperFollowsWeb, let paper = self.paper, url.removingFragment != paper.url { self.paper = nil }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// The address of what's on screen: the PDF, the page you navigated to, or the tab.
+    var currentURL: URL? { paper?.url ?? reader.state.url ?? current?.readableURL }
+
+    var lastChat: Companion {
+        UserDefaults.standard.string(forKey: "lastChat").flatMap(Companion.init(rawValue:)).flatMap { $0 == .notes ? nil : $0 } ?? .chatGPT
+    }
+
+    var sourceTitle: String {
+        let title = current?.displayTitle.trimmed ?? ""
+        if let paperTitle = paper?.title, !paperTitle.isEmpty, title.isEmpty || title.lowercased().hasSuffix(".pdf") || title.hasPrefix("http") {
+            return paperTitle
+        }
+        return title.isEmpty ? (currentURL?.absoluteString ?? "Untitled") : title
+    }
+
+    var isPaper: Bool { paper != nil || BibTeX.isPaper(currentURL) }
+
+    /// arXiv abstract pages have a PDF one click away; PDFs have their abstract page.
+    var arxivSwitch: (pdf: Bool, url: URL)? {
+        guard let url = currentURL, let id = SourceKey.arxivID(url) else { return nil }
+        if paper != nil { return (false, URL(string: "https://arxiv.org/abs/" + id)!) }
+        return (true, URL(string: "https://arxiv.org/pdf/" + id)!)
+    }
+
+    private func load(_ url: URL) {
+        excerpt = nil
+        if url.looksLikePDF && !pdfFailed.contains(url.removingFragment) {
+            openPaper(url, followsWeb: false)
+        } else {
+            paper = nil
+            reader.load(url)
+        }
+    }
+
+    func openPaper(_ url: URL, followsWeb: Bool) {
+        let paper = PaperReader(url: url)
+        paper.onSelection = { [weak self, weak paper] partial in
+            guard let self, let paper, self.paper === paper else { return }
+            self.excerpt = partial.map { $0.excerpt(title: self.sourceTitle, url: paper.url) }
+        }
+        paper.view.onSelectionMoved = { [weak self] rect in self?.excerpt?.rect = rect }
+        paper.view.extraMenuItems = { [weak self] in self?.menuItems() ?? [] }
+        paperFollowsWeb = followsWeb
+        excerpt = nil
+        self.paper = paper
+        Task {
+            await paper.load()
+            guard paper.failure != nil, self.paper === paper else { return }
+            pdfFailed.insert(paper.url)
+            self.paper = nil
+            if !followsWeb { reader.load(url) }
+        }
+    }
+
+    /// Right-click on the page: the selection's actions first, then the page's.
+    private func menuItems() -> [NSMenuItem] {
+        var items: [NSMenuItem] = []
+        let send: (Action) -> () -> Void = { action in { [weak self] in self?.actions.send(action) } }
+        if excerpt != nil {
+            items.append(ActionMenuItem("Save to Note", symbol: "text.quote", handler: send(.save)))
+            for mode in Companion.allCases where mode != .notes {
+                items.append(ActionMenuItem("Ask \(mode.rawValue)", symbol: "bubble.left", handler: send(.ask(mode))))
+            }
+            items.append(.separator())
+        }
+        items.append(ActionMenuItem("Read Later", symbol: "bookmark", handler: send(.readLater)))
+        if isPaper { items.append(ActionMenuItem("Copy BibTeX", symbol: "quote.bubble", handler: send(.bibtex))) }
+        items.append(ActionMenuItem(paper != nil ? "Sections…" : "Headings…", symbol: "list.bullet.indent", handler: send(.contents)))
+        return items
+    }
+
+    /// arXiv: flip between the abstract page and the PDF.
+    func switchArxiv() {
+        guard let target = arxivSwitch else { return }
+        if target.pdf { openPaper(target.url, followsWeb: false) }
+        else {
+            paper = nil
+            excerpt = nil
+            if reader.state.url.flatMap(SourceKey.arxivID) == nil || reader.state.url?.path.hasPrefix("/pdf") == true {
+                reader.load(target.url)
+            }
+        }
+    }
+
+    func copyLink() {
+        guard let url = currentURL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+    }
+
+    private func handleCapture(_ message: [String: Any], from webView: WKWebView) {
+        guard paper == nil, let type = message["type"] as? String else { return }
+        let scale: CGFloat = {
+            guard let viewport = (message["viewport"] as? Double) ?? (message["viewport"] as? Int).map(Double.init), viewport > 0 else { return 1 }
+            return webView.bounds.width / CGFloat(viewport)
+        }()
+        // A window opened from a link sits under a 38-point header inside the pane.
+        let top: CGFloat = webView === reader.view ? 0 : 38
+        func rect() -> CGRect? {
+            guard let box = message["rect"] as? [String: Any] else { return nil }
+            func number(_ key: String) -> CGFloat { CGFloat((box[key] as? Double) ?? (box[key] as? Int).map(Double.init) ?? 0) }
+            return CGRect(x: number("x") * scale, y: number("y") * scale + top, width: number("w") * scale, height: number("h") * scale)
+        }
+        switch type {
+        case "selection":
+            if WebPage.debugCapture { NSLog("RD capture: selection rect=\(String(describing: rect())) empty=\(message["empty"] ?? false)") }
+            guard message["empty"] as? Bool != true, let raw = message["text"] as? String,
+                  let url = webView.url ?? reader.state.url ?? current?.readableURL else {
+                excerpt = nil
+                return
+            }
+            let kind: Excerpt.Kind = message["kind"] as? String == "code" ? .code(language: message["language"] as? String) : .prose
+            let text = kind == .prose ? Excerpt.tidy(raw) : raw.replacingOccurrences(of: "\u{00A0}", with: " ")
+            guard !text.trimmed.isEmpty else { excerpt = nil; return }
+            excerpt = Excerpt(text: text, plain: (message["plain"] as? String) ?? raw, kind: kind,
+                              section: message["section"] as? String, sourceTitle: sourceTitle,
+                              sourceURL: url.removingFragment, rect: rect())
+        case "selectionRect":
+            if excerpt != nil { excerpt?.rect = rect() }
+        default:
+            break
+        }
+    }
+
+    /// Drafts a question about the passage in a chat. Nothing is sent: the
+    /// excerpt and its source land in the composer, and the caret waits after it.
+    func ask(_ excerpt: Excerpt, in mode: Companion) async -> Bool {
+        choose(mode)
+        guard let page = chat(for: mode) else { return false }
+        for _ in 0..<50 where page.state.loading || page.state.url == nil {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        for attempt in 0..<8 {
+            if attempt > 0 { try? await Task.sleep(for: .milliseconds(450)) }
+            page.view.window?.makeFirstResponder(page.view)
+            let result = try? await page.view.callAsyncJavaScript(ChatDraft.insert, arguments: ["text": excerpt.prompt],
+                                                                 in: nil, contentWorld: .defaultClient)
+            if result as? Bool == true || (result as? NSNumber)?.boolValue == true { return true }
+        }
+        return false
+    }
 
     func start(_ tabs: [BrowserTab], at first: BrowserTab, in categoryID: String) {
         let next = tabs.filter { $0.readableURL != nil }
         guard let index = next.firstIndex(of: first) else { return }
-        let canKeepPage = current == first
+        let canKeepPage = current == first && !asleep
+        asleep = false
         self.categoryID = categoryID
         queue = next
         if canKeepPage { self.index = index }
@@ -44,7 +226,7 @@ final class Room: ObservableObject {
     func go(to newIndex: Int) {
         guard queue.indices.contains(newIndex), let url = queue[newIndex].readableURL else { return }
         index = newIndex
-        reader.load(url)
+        load(url)
     }
 
     /// Drops a tab from the queue and moves on to the next one on the shelf.
@@ -72,12 +254,33 @@ final class Room: ObservableObject {
     }
 
     func chat(for mode: Companion) -> WebPage? {
+        guard mode != .notes else { return nil }
+        chatOrder.removeAll { $0 == mode }
+        chatOrder.append(mode)
         if let page = chats[mode] { return page }
         guard let url = mode.url else { return nil }
         let page = WebPage()
         page.load(url)
         chats[mode] = page
+        while chatOrder.count > Self.liveChats {
+            let oldest = chatOrder.removeFirst()
+            chats[oldest]?.view.stopLoading()
+            chats[oldest] = nil
+        }
         return page
+    }
+
+    /// Back in the library for a while: let go of the page, the PDF and the chats.
+    /// Everything reloads (scroll position included) the next time you start reading.
+    func sleep() {
+        guard !asleep else { return }
+        asleep = true
+        excerpt = nil
+        paper = nil
+        for page in chats.values { page.view.stopLoading() }
+        chats = [:]
+        chatOrder = []
+        reader.unload()
     }
 
     func toggleNotes() {
@@ -100,6 +303,10 @@ struct DeskView: View {
     @AppStorage("fullscreenOnOpen") private var fullscreenOnOpen = false
     @AppStorage("closeInHelium") private var closeInHelium = true
     @AppStorage("readerFraction") private var readerFraction = 0.62
+    @AppStorage("resumeOnLaunch") private var resumeOnLaunch = true
+    @State private var resumed = false
+    @State private var showingContents = false
+    @State private var sleepTask: Task<Void, Never>?
     @State private var draggedFraction: Double?
     @State private var dividerHovered = false
     @State private var selectedCategory: String?
@@ -113,8 +320,7 @@ struct DeskView: View {
     @State private var toastTask: Task<Void, Never>?
     /// Drives the library → reader transition: false while the room is still arriving.
     @State private var revealed = false
-    @State private var hero: Hero?
-    @State private var heroTask: Task<Void, Never>?
+    @State private var openTask: Task<Void, Never>?
     @State private var transition = 0
     @State private var windowSize: CGSize = .zero
     /// The floating dock at the bottom of the page: hidden until the pointer comes near.
@@ -124,18 +330,10 @@ struct DeskView: View {
     @State private var dockMonitor: Any?
     @State private var bridge: DeskBridge?
 
-    private var dockVisible: Bool { dockHover || dockFlash || showingQueue }
+    private var dockVisible: Bool { dockHover || dockFlash || showingQueue || showingContents }
     private var titleBarHeight: CGFloat { fullscreen ? 0 : 28 }
 
-    struct Hero {
-        var image: NSImage?
-        var title: String
-        var site: String
-        var from: CGRect
-        var expanded = false
-    }
-
-    /// Where the reading pane sits, so the hero card can land exactly on it.
+    /// Where the reading pane sits (for the dock's hover zone).
     private var readerRect: CGRect {
         let top = titleBarHeight
         let width = Double(windowSize.width - 7)
@@ -149,30 +347,19 @@ struct DeskView: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             // The library stays alive underneath so coming back is instant and keeps its scroll position.
-            LibraryView(library: library, previews: previews, selectedCategory: $selectedCategory,
+            LibraryView(library: library, previews: previews, notes: vault.index, selectedCategory: $selectedCategory,
                         closeInHelium: closeInHelium, titleBarHeight: titleBarHeight, open: open)
                 .opacity(reading && revealed ? 0 : 1)
-                .scaleEffect(reading && revealed ? 0.965 : 1, anchor: .center)
                 .allowsHitTesting(!reading)
                 .disabled(reading)
                 .accessibilityHidden(reading)
             if reading, let source = room.current {
                 roomView(source)
             }
-            if let hero {
-                let rect = hero.expanded ? readerRect : hero.from
-                HeroCover(hero: hero)
-                    .frame(width: rect.width, height: rect.height)
-                    .clipShape(RoundedRectangle(cornerRadius: hero.expanded ? 0 : 6, style: .continuous))
-                    .shadow(color: .black.opacity(hero.expanded ? 0 : 0.5), radius: 30, y: 14)
-                    .position(x: rect.midX, y: rect.midY)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-                    .zIndex(1)
-            }
             if paletteOpen {
                 CommandPalette(library: library, previews: previews,
                                fullscreenOnOpen: fullscreenOnOpen, closeInHelium: closeInHelium,
+                               resumeOnLaunch: resumeOnLaunch,
                                close: { withAnimation(.easeOut(duration: 0.14)) { paletteOpen = false } },
                                openTab: { tab in open(library.category(for: tab).id, tab, nil) },
                                openShelf: showShelf, performCommand: performPaletteCommand)
@@ -212,6 +399,29 @@ struct DeskView: View {
                 self.bridge = bridge
             }
             if !library.loaded { library.refresh() }
+            if library.loaded { resumeIfNeeded() }
+            // Index the vault up front, so cards and pages can show the notes you already have.
+            if vault.root != nil { await vault.refresh() }
+            if WebPage.debugCapture {
+                try? await Task.sleep(for: .seconds(1))
+                if let tab = library.tabs.first(where: { $0.address.contains("paulgraham") }) { open(library.category(for: tab).id, tab, nil) }
+                try? await Task.sleep(for: .seconds(7))
+                NSLog("RD capture: excerpt=\(room.excerpt.map { "\($0.text.prefix(40)) rect \(String(describing: $0.rect))" } ?? "nil") reading=\(reading) revealed=\(revealed)")
+                let menu = NSMenu()
+                if let event = NSEvent.mouseEvent(with: .rightMouseDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) {
+                    room.reader.view.willOpenMenu(menu, with: event)
+                }
+                NSLog("RD capture: menu items → \(menu.items.map(\.title))")
+                room.excerpt = nil
+                _ = try? await room.reader.view.evaluateJavaScript("window.open(location.href, '_blank'); 1")
+                try? await Task.sleep(for: .seconds(8))
+                NSLog("RD capture: child excerpt=\(room.excerpt.map { "url \($0.sourceURL) rect \(String(describing: $0.rect))" } ?? "nil") opened=\(room.reader.openedPage != nil)")
+                if let child = room.reader.openedPage, let event = NSEvent.mouseEvent(with: .rightMouseDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) {
+                    let childMenu = NSMenu()
+                    child.view.willOpenMenu(childMenu, with: event)
+                    NSLog("RD capture: child menu items → \(childMenu.items.map(\.title))")
+                }
+            }
             if NoteRenderer.debug {
                 try? await Task.sleep(for: .seconds(1))
                 if let tab = library.tabs.first(where: { $0.readableURL != nil }) { open(library.category(for: tab).id, tab, nil) }
@@ -223,6 +433,28 @@ struct DeskView: View {
         .onAppear { fullscreen = NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             if !reading && library.loaded { library.refresh() }
+            if vault.root != nil { Task { await vault.refresh() } }
+        }
+        .onChange(of: library.loaded) { _, loaded in if loaded { resumeIfNeeded() } }
+        .onChange(of: room.current?.address) { _, address in
+            saveSession()
+            guard reading, let address else { return }
+            let count = vault.index.count(for: address)
+            if count > 0 && room.companion != .notes {
+                showToast(count == 1 ? "You have a note on this page, under Notes" : "You have \(count) notes on this page, under Notes")
+            }
+        }
+        .onChange(of: vault.selection) { _, _ in saveSession() }
+        .onReceive(room.actions) { action in
+            switch action {
+            case .save: saveHighlight()
+            case .ask(let mode): ask(mode)
+            case .readLater: readLater()
+            case .bibtex: copyBibTeX()
+            case .contents:
+                flashDock()
+                showingContents = true
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .openPalette)) { _ in
             withAnimation(.easeOut(duration: 0.14)) { paletteOpen.toggle() }
@@ -247,6 +479,102 @@ struct DeskView: View {
         case .editShelves: editingShelves = true
         case .toggleFullscreen: fullscreenOnOpen.toggle()
         case .toggleCloseInHelium: closeInHelium.toggle()
+        case .toggleResume: resumeOnLaunch.toggle()
+        case .continueReading: resume(ReadingMemory.session)
+        }
+    }
+
+    // MARK: Continue reading
+
+    /// On launch, put you back on the page (and note) you had open when you quit.
+    private func resumeIfNeeded() {
+        guard !resumed else { return }
+        resumed = true
+        // Sample data, or a failed Helium import, says nothing about whether your page is still open.
+        guard resumeOnLaunch, !NoteRenderer.debug, !library.sample, library.error == nil else { return }
+        resume(ReadingMemory.session)
+    }
+
+    private func resume(_ session: ReadingMemory.Session?) {
+        guard let session else { return }
+        let tab = library.tabs.first { $0.address == session.address }
+            ?? library.tabs.first { SourceKey.key(for: $0.address) == SourceKey.key(for: session.address) && SourceKey.key(for: session.address) != nil }
+        guard let tab else {
+            showToast("“\(session.title)” isn’t open in Helium any more")
+            if !library.sample && library.lastUpdated != nil { ReadingMemory.session = nil }
+            return
+        }
+        open(library.category(for: tab).id, tab, nil)
+        guard let path = session.notePath else { return }
+        Task {
+            if vault.notes.isEmpty { await vault.refresh() }
+            if let note = vault.note(atPath: path), vault.selection != note { await vault.open(note) }
+        }
+    }
+
+    private func saveSession() {
+        guard reading, !library.sample, let tab = room.current else { return }
+        ReadingMemory.session = ReadingMemory.Session(categoryID: room.categoryID, address: tab.address,
+                                                      title: tab.displayTitle, notePath: vault.selection?.path)
+    }
+
+    // MARK: Highlights, questions, papers
+
+    private func saveHighlight() {
+        guard let excerpt = room.excerpt, let tab = room.current else {
+            showToast("Select a passage on the page first")
+            return
+        }
+        guard vault.root != nil else {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) { room.choose(.notes) }
+            showToast("Connect your Obsidian vault to save highlights")
+            return
+        }
+        room.excerpt = nil
+        Task {
+            guard await vault.capture(excerpt.noteBlock, from: tab), let note = vault.selection else {
+                showToast(vault.error ?? "Couldn’t save to the note")
+                return
+            }
+            renderer.startEditingAtEnd(note, text: vault.text)
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) { room.choose(.notes) }
+            showToast("Saved to “\(note.name)”")
+        }
+    }
+
+    private func ask(_ mode: Companion) {
+        guard let excerpt = room.excerpt else {
+            showToast("Select a passage on the page first")
+            return
+        }
+        room.excerpt = nil
+        Task {
+            if await room.ask(excerpt, in: mode) { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(excerpt.prompt, forType: .string)
+            showToast("Couldn’t reach the \(mode.rawValue) box. The question is on your clipboard")
+        }
+    }
+
+    private func readLater() {
+        guard let tab = room.current else { return }
+        if library.isSaved(tab) {
+            showToast("Already on Read later")
+            return
+        }
+        library.saveForLater(tab, closeInHelium: closeInHelium)
+        showToast(closeInHelium && tab.windowID != SavedSource.windowID ? "Saved to Read later · closed in Helium" : "Saved to Read later")
+    }
+
+    private func copyBibTeX() {
+        guard let url = room.currentURL else { return }
+        let title = room.sourceTitle
+        showToast("Looking up BibTeX…")
+        Task {
+            let entry = await BibTeX.entry(for: url, title: title)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(entry.text, forType: .string)
+            showToast(entry.published ? "BibTeX copied" : "No published BibTeX. Copied a @misc entry")
         }
     }
 
@@ -262,7 +590,9 @@ struct DeskView: View {
             }
             return
         }
+        sleepTask?.cancel()
         room.start(tabs, at: first, in: categoryID)
+        saveSession()
         if room.companion != .notes { _ = room.chat(for: room.companion) }
         previews.paused = true
         transition += 1
@@ -274,26 +604,18 @@ struct DeskView: View {
         instant.disablesAnimations = true
         withTransaction(instant) {
             revealed = false
-            hero = origin.map { Hero(image: previews.images[first.address], title: first.displayTitle, site: first.sourceName, from: $0) }
             reading = true
         }
-        // 2. Next frame: the cover grows into the reading pane while the library
-        //    recedes and the side column slides in.
+        // 2. Next frame: a short crossfade. (A cover that grew into the page looked
+        //    nice in theory but stuttered while the page loaded underneath it.)
         DispatchQueue.main.async {
-            withAnimation(.spring(response: 0.5, dampingFraction: 0.9)) {
-                revealed = true
-                hero?.expanded = true
-            }
+            withAnimation(.easeOut(duration: 0.18)) { revealed = true }
         }
-        // 3. Once the real page is there, the cover dissolves into it.
-        heroTask?.cancel()
-        heroTask = Task { @MainActor in
+        // 3. Once the page has had a moment to load, go full screen if that's the setting.
+        openTask?.cancel()
+        openTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(560))
-            for _ in 0..<14 where room.reader.state.loading {
-                try? await Task.sleep(for: .milliseconds(100))
-            }
             guard !Task.isCancelled, transition == id else { return }
-            withAnimation(.easeOut(duration: 0.35)) { hero = nil }
             if fullscreenOnOpen, let window = NSApp.keyWindow, !window.styleMask.contains(.fullScreen) {
                 enteredFullScreen = true
                 window.toggleFullScreen(nil)
@@ -302,19 +624,26 @@ struct DeskView: View {
     }
 
     private func closeRoom() {
-        heroTask?.cancel()
-        hero = nil
+        if !library.sample { ReadingMemory.session = nil }
+        room.excerpt = nil
+        openTask?.cancel()
         transition += 1
         let id = transition
-        withAnimation(.easeOut(duration: 0.24)) { revealed = false }
+        withAnimation(.easeOut(duration: 0.16)) { revealed = false }
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await Task.sleep(for: .milliseconds(170))
             guard transition == id else { return }
             var instant = Transaction()
             instant.disablesAnimations = true
             withTransaction(instant) { reading = false }
         }
         previews.paused = false
+        sleepTask?.cancel()
+        sleepTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(300))
+            guard !Task.isCancelled, !reading else { return }
+            room.sleep()
+        }
         if enteredFullScreen, let window = NSApp.keyWindow, window.styleMask.contains(.fullScreen) {
             window.toggleFullScreen(nil)
         }
@@ -346,30 +675,6 @@ struct DeskView: View {
 
     // MARK: Reading room
 
-    /// The tapped card's cover, in flight from the grid to the reading pane.
-    private struct HeroCover: View {
-        let hero: Hero
-
-        var body: some View {
-            ZStack(alignment: .topLeading) {
-                Theme.surface
-                if let image = hero.image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                        .clipped()
-                } else {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text(hero.site).font(Theme.mono(11)).foregroundStyle(Theme.ink3)
-                        Text(hero.title).font(Theme.serif(30)).foregroundStyle(Theme.ink).lineLimit(5)
-                    }
-                    .padding(32)
-                }
-            }
-        }
-    }
-
     private func roomView(_ source: BrowserTab) -> some View {
         let category = library.category(withID: room.categoryID) ?? library.other
         return VStack(spacing: 0) {
@@ -383,7 +688,7 @@ struct DeskView: View {
                 let maximum = max(minimum, 1 - 360 / width)
                 let fraction = min(max(draggedFraction ?? readerFraction, minimum), maximum)
                 HStack(spacing: 0) {
-                    BrowserPane(page: room.reader, showsChrome: false)
+                    readerPane
                         .frame(width: CGFloat(width * fraction))
                         .overlay(alignment: .bottom) { dock(category).padding(.bottom, 18) }
                         .opacity(revealed ? 1 : 0)
@@ -393,7 +698,7 @@ struct DeskView: View {
                         companionHeader(category)
                         Group {
                             if room.companion == .notes {
-                                NotesPane(vault: vault, renderer: renderer, source: source)
+                                NotesPane(vault: vault, renderer: renderer, index: vault.index, source: source)
                             } else if let page = room.chat(for: room.companion) {
                                 BrowserPane(page: page, showsChrome: false).id(room.companion)
                             }
@@ -402,7 +707,6 @@ struct DeskView: View {
                         .clipped()
                     }
                     .background(Theme.ground)
-                    .offset(x: revealed ? 0 : 56)
                     .opacity(revealed ? 1 : 0)
                 }
                 .coordinateSpace(name: "split")
@@ -416,8 +720,43 @@ struct DeskView: View {
         .onChange(of: room.index) { _, _ in flashDock() }
     }
 
+    /// The page (or PDF), with the Save / Ask bar floating over whatever you've selected.
+    private var readerPane: some View {
+        ZStack {
+            BrowserPane(page: room.reader, showsChrome: false)
+            if let paper = room.paper {
+                PaperPane(paper: paper).id(ObjectIdentifier(paper))
+            }
+        }
+        .overlay {
+            GeometryReader { proxy in
+                if let excerpt = room.excerpt, let rect = excerpt.rect, revealed,
+                   rect.maxY > 0, rect.minY < proxy.size.height {
+                    SelectionBar(lastChat: room.lastChat, save: saveHighlight, ask: ask)
+                        .position(selectionBarPosition(rect, in: proxy.size))
+                        .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                }
+            }
+            .animation(.easeOut(duration: 0.12), value: room.excerpt == nil)
+        }
+    }
+
+    private func selectionBarPosition(_ rect: CGRect, in size: CGSize) -> CGPoint {
+        let half = CGSize(width: 150, height: 17)
+        let x = min(max(rect.midX, half.width + 12), max(half.width + 12, size.width - half.width - 12))
+        var y = rect.minY - half.height - 10
+        if y < half.height + 8 { y = rect.maxY + half.height + 10 }
+        y = min(max(y, half.height + 8), max(half.height + 8, size.height - half.height - 86))
+        return CGPoint(x: x, y: y)
+    }
+
     private var roomShortcuts: some View {
         ZStack {
+            ShortcutButton("Save highlight to note", "s", [.command, .shift]) { saveHighlight() }
+            ShortcutButton("Ask about this", "a", [.command, .shift]) { ask(room.lastChat) }
+            ShortcutButton("Read later", "l", [.command, .shift]) { readLater() }
+            ShortcutButton("Copy BibTeX", "b", [.command, .shift]) { copyBibTeX() }
+            ShortcutButton("Contents", "o", [.command, .shift]) { showingContents.toggle(); flashDock() }
             ShortcutButton("Back to library", "[", [.command, .shift]) { closeRoom() }
             ShortcutButton("Previous tab", .leftArrow, [.command, .option]) { room.go(to: room.index - 1) }
             ShortcutButton("Next tab", .rightArrow, [.command, .option]) { room.go(to: room.index + 1) }
@@ -426,7 +765,7 @@ struct DeskView: View {
             ShortcutButton("Page back", "[") { room.reader.view.goBack() }
             ShortcutButton("Page forward", "]") { room.reader.view.goForward() }
             ShortcutButton("Copy link", "c", [.command, .shift]) {
-                room.reader.copyLink()
+                room.copyLink()
                 showToast("Link copied")
             }
             ForEach(Array(Companion.allCases.enumerated()), id: \.element) { offset, mode in
@@ -465,7 +804,7 @@ struct DeskView: View {
     private func companionHeader(_ category: Category) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 0) {
-                CompanionTabs(selection: room.companion) { room.choose($0) }
+                CompanionTabs(selection: room.companion, index: vault.index, address: room.current?.address ?? "") { room.choose($0) }
                 if room.companion != .notes, let page = room.chat(for: room.companion) {
                     ChatControls(page: page).padding(.top, -6)
                 }
@@ -480,14 +819,25 @@ struct DeskView: View {
     // MARK: Floating dock
 
     private func dock(_ category: Category) -> some View {
-        ReaderDock(page: room.reader, shelf: category.name, index: room.index, count: room.queue.count,
-                   closeInHelium: closeInHelium, showingQueue: $showingQueue,
+        ReaderDock(page: room.reader, paper: room.paper, url: room.currentURL, shelf: category.name,
+                   index: room.index, count: room.queue.count,
+                   closeInHelium: closeInHelium, isPaper: room.isPaper,
+                   saved: room.current.map(library.isSaved) ?? false,
+                   arxivSwitch: room.arxivSwitch?.pdf,
+                   showingQueue: $showingQueue, showingContents: $showingContents,
                    back: { closeRoom() },
                    previous: { room.go(to: room.index - 1) },
                    next: { room.go(to: room.index + 1) },
                    done: { finish() },
-                   copied: { showToast("Link copied") },
-                   queue: { AnyView(queuePopover) })
+                   copyLink: {
+                       room.copyLink()
+                       showToast("Link copied")
+                   },
+                   readLater: readLater,
+                   bibtex: copyBibTeX,
+                   switchArxiv: { room.switchArxiv() },
+                   queue: { AnyView(queuePopover) },
+                   contents: { AnyView(ContentsList(room: room) { showingContents = false }) })
             .opacity(dockVisible ? 1 : 0)
             .offset(y: dockVisible ? 0 : 10)
             .allowsHitTesting(dockVisible)
@@ -572,20 +922,31 @@ struct DeskView: View {
     }
 }
 
-/// Floating controls for the page: library, shelf position, page history, Done.
+/// Floating controls for the page: library, shelf position, page history, paper tools, Done.
 private struct ReaderDock: View {
     @ObservedObject var page: WebPage
+    let paper: PaperReader?
+    let url: URL?
     let shelf: String
     let index: Int
     let count: Int
     let closeInHelium: Bool
+    let isPaper: Bool
+    let saved: Bool
+    /// arXiv: true offers the PDF, false offers the abstract page.
+    let arxivSwitch: Bool?
     @Binding var showingQueue: Bool
+    @Binding var showingContents: Bool
     let back: () -> Void
     let previous: () -> Void
     let next: () -> Void
     let done: () -> Void
-    let copied: () -> Void
+    let copyLink: () -> Void
+    let readLater: () -> Void
+    let bibtex: () -> Void
+    let switchArxiv: () -> Void
     let queue: () -> AnyView
+    let contents: () -> AnyView
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -618,15 +979,36 @@ private struct ReaderDock: View {
             .help("Every tab on this shelf")
             .popover(isPresented: $showingQueue, arrowEdge: .top) { queue() }
             DeskIcon("chevron.right", help: "Next tab (⌥⌘→)", action: next).disabled(index + 1 >= count)
+            separator
+            Button { showingContents.toggle() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "list.bullet.indent").font(.system(size: 12))
+                    if let paper { PaperPageLabel(paper: paper) }
+                }
+                .foregroundStyle(showingContents ? Theme.ink : Theme.ink3)
+                .padding(.horizontal, 6).frame(height: 28).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .help(paper != nil ? "Sections of this PDF" : "Headings on this page")
+            .popover(isPresented: $showingContents, arrowEdge: .top) { contents() }
+            if let arxivSwitch {
+                DeskIcon(arxivSwitch ? "doc.richtext" : "doc.plaintext",
+                         help: arxivSwitch ? "Read the PDF" : "Back to the abstract page", action: switchArxiv)
+            }
+            if isPaper {
+                DeskIcon("quote.bubble", help: "Copy BibTeX", action: bibtex)
+            }
+            DeskIcon(saved ? "bookmark.fill" : "bookmark", help: saved ? "On Read later" : "Read later", action: readLater)
+                .foregroundStyle(saved ? Theme.accent : Theme.ink3)
             if full {
                 separator
-                DeskIcon("arrow.uturn.left", help: "Page back (⌘[)") { page.view.goBack() }.disabled(!page.state.back)
-                DeskIcon("arrow.uturn.right", help: "Page forward (⌘])") { page.view.goForward() }.disabled(!page.state.forward)
-                DeskIcon("link", help: "Copy link (⇧⌘C)") {
-                    page.copyLink()
-                    copied()
+                if paper == nil {
+                    DeskIcon("arrow.uturn.left", help: "Page back (⌘[)") { page.view.goBack() }.disabled(!page.state.back)
+                    DeskIcon("arrow.uturn.right", help: "Page forward (⌘])") { page.view.goForward() }.disabled(!page.state.forward)
                 }
-                if let url = page.state.url {
+                DeskIcon("link", help: "Copy link (⇧⌘C)", action: copyLink)
+                if let url {
                     DeskIcon("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
                 }
             }
@@ -650,9 +1032,173 @@ private struct ReaderDock: View {
     }
 }
 
+private struct PaperPageLabel: View {
+    @ObservedObject var paper: PaperReader
+    var body: some View {
+        if paper.pageCount > 0 {
+            Text("p. \(paper.pageIndex + 1)/\(paper.pageCount)").font(Theme.mono(10.5, .medium)).foregroundStyle(Theme.ink2)
+        }
+    }
+}
+
+/// The floating bar over a selection: keep it in the page's note, or ask a chat about it.
+private struct SelectionBar: View {
+    let lastChat: Companion
+    let save: () -> Void
+    let ask: (Companion) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            BarButton(symbol: "text.quote", title: "Save to note", help: "Quote this in the page’s note, with a link back to it", action: save)
+            Rectangle().fill(Theme.rule).frame(width: 1, height: 16)
+            BarButton(symbol: "bubble.left", title: "Ask \(lastChat.rawValue)",
+                      help: "Draft a question about this in \(lastChat.rawValue). Nothing is sent") { ask(lastChat) }
+            Menu {
+                ForEach(Companion.allCases.filter { $0 != .notes }) { mode in
+                    Button("Ask \(mode.rawValue)") { ask(mode) }
+                }
+            } label: {
+                Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Theme.ink3).frame(width: 22, height: 28)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .accessibilityLabel("Ask another chat")
+        }
+        .padding(.horizontal, 3).padding(.vertical, 2)
+        .background(Capsule().fill(Theme.raised.opacity(0.98)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.11)))
+        .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
+        .fixedSize()
+        .environment(\.colorScheme, .dark)
+    }
+
+    private struct BarButton: View {
+        let symbol: String
+        let title: String
+        let help: String
+        let action: () -> Void
+        @State private var hovered = false
+
+        var body: some View {
+            Button(action: action) {
+                HStack(spacing: 6) {
+                    Image(systemName: symbol).font(.system(size: 11, weight: .medium))
+                    Text(title).font(Theme.sans(12, .medium))
+                }
+                .foregroundStyle(hovered ? Theme.ink : Theme.ink2)
+                .padding(.horizontal, 11).frame(height: 28)
+                .background(Capsule().fill(hovered ? Color.white.opacity(0.06) : .clear))
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovered = $0 }
+            .help(help)
+        }
+    }
+}
+
+/// Sections of the PDF, or headings of the page, to jump between.
+private struct ContentsList: View {
+    @ObservedObject var room: Room
+    let close: () -> Void
+    @State private var headings: [Heading] = []
+    @State private var loaded = false
+
+    struct Heading: Identifiable { let id: Int; let level: Int; let text: String }
+
+    var body: some View {
+        Group {
+            if let paper = room.paper {
+                PaperContents(paper: paper, close: close)
+            } else if !loaded {
+                ProgressView().controlSize(.small).frame(width: 320, height: 80)
+            } else if headings.isEmpty {
+                Self.empty("This page has no headings.")
+            } else {
+                list(headings.map { ($0.id, $0.level, $0.text, false) }) { id in
+                    room.reader.jump(toHeading: id)
+                    close()
+                }
+            }
+        }
+        .background(Theme.ground)
+        .preferredColorScheme(.dark)
+        .task {
+            guard room.paper == nil else { return }
+            let found = await room.reader.outline()
+            let minimum = found.map(\.level).min() ?? 1
+            headings = found.enumerated().map { Heading(id: $0.offset, level: $0.element.level - minimum + 1, text: $0.element.text) }
+            loaded = true
+        }
+    }
+
+    private struct PaperContents: View {
+        @ObservedObject var paper: PaperReader
+        let close: () -> Void
+
+        var body: some View {
+            if paper.sections.isEmpty {
+                ContentsList.empty(paper.pageCount > 0 ? "This PDF has no outline. \(paper.pageCount) pages." : "Still opening the PDF…")
+            } else {
+                let current = paper.section(forPage: paper.pageIndex)?.id
+                ContentsList.list(paper.sections.map { ($0.id, $0.level, $0.title, $0.id == current) },
+                                  trailing: { id in paper.sections.first { $0.id == id }.map { "\($0.pageIndex + 1)" } }) { id in
+                    if let section = paper.sections.first(where: { $0.id == id }) { paper.go(to: section) }
+                    close()
+                }
+            }
+        }
+    }
+
+    fileprivate static func empty(_ message: String) -> some View {
+        Text(message).font(Theme.serif(16, italic: true)).foregroundStyle(Theme.ink3)
+            .padding(20).frame(width: 320, alignment: .leading)
+    }
+
+    private func list(_ rows: [(Int, Int, String, Bool)], select: @escaping (Int) -> Void) -> some View {
+        Self.list(rows, trailing: { _ in nil }, select: select)
+    }
+
+    fileprivate static func list(_ rows: [(Int, Int, String, Bool)], trailing: @escaping (Int) -> String?,
+                                 select: @escaping (Int) -> Void) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(rows, id: \.0) { id, level, title, current in
+                        Button { select(id) } label: {
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                Text(title)
+                                    .font(level <= 1 ? Theme.serif(16, .medium) : Theme.sans(12.5, level == 2 ? .medium : .regular))
+                                    .foregroundStyle(current ? Theme.accent : level <= 2 ? Theme.ink : Theme.ink2)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.leading)
+                                Spacer(minLength: 8)
+                                if let page = trailing(id) {
+                                    Text(page).font(Theme.mono(10)).foregroundStyle(Theme.ink4)
+                                }
+                            }
+                            .padding(.leading, CGFloat(14 + (min(level, 4) - 1) * 14)).padding(.trailing, 14)
+                            .padding(.vertical, 6)
+                            .background(current ? Theme.raised : .clear)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .id(id)
+                    }
+                }
+                .padding(.vertical, 6)
+            }
+            .frame(width: 360, height: min(CGFloat(rows.count) * 34 + 14, 460))
+            .onAppear { if let current = rows.first(where: \.3)?.0 { proxy.scrollTo(current, anchor: .center) } }
+        }
+    }
+}
+
 /// Text tabs with a vermilion underline that slides to the active one.
 private struct CompanionTabs: View {
     let selection: Companion
+    @ObservedObject var index: NoteIndex
+    let address: String
     let choose: (Companion) -> Void
     @Namespace private var namespace
     @State private var hovered: Companion?
@@ -665,9 +1211,17 @@ private struct CompanionTabs: View {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) { choose(mode) }
                 } label: {
                     VStack(spacing: 8) {
-                        Text(mode.rawValue)
-                            .font(Theme.sans(13, selected ? .semibold : .regular))
-                            .foregroundStyle(selected ? Theme.ink : hovered == mode ? Theme.ink2 : Theme.ink3)
+                        HStack(alignment: .firstTextBaseline, spacing: 3) {
+                            Text(mode.rawValue)
+                                .font(Theme.sans(13, selected ? .semibold : .regular))
+                                .foregroundStyle(selected ? Theme.ink : hovered == mode ? Theme.ink2 : Theme.ink3)
+                            // Notes you already have on this page.
+                            if mode == .notes, case let count = index.count(for: address), count > 0 {
+                                Text("\(count)").font(Theme.mono(9.5, .medium)).foregroundStyle(Theme.accent)
+                                    .baselineOffset(5)
+                                    .help(count == 1 ? "You have a note on this page" : "You have \(count) notes on this page")
+                            }
+                        }
                         ZStack {
                             Rectangle().fill(.clear).frame(height: 2)
                             if selected {

@@ -57,7 +57,7 @@ final class DeskBridge {
 
     private func writeState() {
         let categories = library.categories.map { category -> [String: Any] in
-            ["id": category.id, "name": category.name, "isDefault": category.isOther,
+            ["id": category.id, "name": category.name, "isDefault": category.isOther, "madeByAgent": category.isAgentMade,
              "sites": category.domains, "keywords": category.keywords]
         }
         let tabs = library.tabs.map { tab -> [String: Any] in

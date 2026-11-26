@@ -2,6 +2,8 @@
 
 Reading Desk is a native macOS app for working through your open **Helium, Google Chrome, and Safari** tabs. It groups them into editorial shelves such as **Papers & research** and **Code & engineering**. Open any card to read the page or PDF on the left and use **ChatGPT, Claude, Gemini, or your Obsidian notes** on the right — in warm rag-paper light mode or print-black dark mode.
 
+> A fun, workflow-specific side project built for my own reading setup — started around Helium, and now compatible with Google Chrome and Safari too.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/library-dark.png">

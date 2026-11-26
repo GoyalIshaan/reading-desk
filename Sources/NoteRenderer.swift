@@ -9,9 +9,21 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
     let view: NoteEditorWebView
     weak var vault: Vault?
     private let scheme = DeskScheme()
+    /// Typed payload passed to `deskRender` in JS (replaces untyped `[String: Any]` dicts).
+    private struct RenderRequest {
+        let path: String
+        let markdown: String
+        let keepScroll: Bool
+        let attachments: [String]
+
+        var payload: [String: Any] {
+            ["markdown": markdown, "path": path, "keepScroll": keepScroll, "attachments": attachments]
+        }
+    }
+
     /// The page loads note.html, then says "ready". Until then the latest render waits here.
     private enum Page {
-        case loading(pending: [String: Any]?)
+        case loading(pending: RenderRequest?)
         case ready
     }
     private var page: Page = .loading(pending: nil)
@@ -67,16 +79,13 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
         let keep = shown?.path == note.path
         if keep && shown?.text == text { return }
         shown = (note.path, text)
-        let payload: [String: Any] = [
-            "markdown": text, "path": note.path, "keepScroll": keep,
-            "attachments": vault?.attachments ?? [],
-        ]
+        let request = RenderRequest(path: note.path, markdown: text, keepScroll: keep, attachments: vault?.attachments ?? [])
         switch page {
         case .ready:
-            call("deskRender", payload)
+            call("deskRender", request.payload)
             placeCaretIfAsked()
         case .loading:
-            page = .loading(pending: payload)
+            page = .loading(pending: request)
         }
     }
 
@@ -149,11 +158,11 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
         case "log":
             NSLog("ReadingDesk notes JS: \(body["message"] ?? "")")
         case "ready":
-            let waiting: [String: Any]? = if case .loading(let pending) = page { pending } else { nil }
+            let waiting: RenderRequest? = if case .loading(let pending) = page { pending } else { nil }
             page = .ready
             syncWebTheme()
             if let waiting {
-                call("deskRender", waiting)
+                call("deskRender", waiting.payload)
                 placeCaretIfAsked()
             }
         case "open":
@@ -217,7 +226,7 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         page = .loading(pending: shown.map {
-            ["markdown": $0.text, "path": $0.path, "keepScroll": false, "attachments": vault?.attachments ?? []]
+            RenderRequest(path: $0.path, markdown: $0.text, keepScroll: false, attachments: vault?.attachments ?? [])
         })
         webView.load(URLRequest(url: URL(string: "desk://app/note.html")!))
     }

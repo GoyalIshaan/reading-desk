@@ -6,11 +6,11 @@ struct LibraryView: View {
     /// Notes in the vault about each page, for the little ✎ count on cards.
     @ObservedObject var notes: NoteIndex
     @ObservedObject var appearance: AppearanceStore
-    @Binding var selectedCategory: String?
+    @Binding var selection: LibrarySelection
     let closeInBrowser: Bool
     let titleBarHeight: CGFloat
-    /// Shelf, tab to start on, and where the tapped card sits on screen (for the hero transition).
-    let open: (String, BrowserTab?, CGRect?) -> Void
+    /// Source, tab to start on, and where the tapped card sits on screen (for the hero transition).
+    let open: (LibrarySelection, BrowserTab?, CGRect?) -> Void
     var onToggleBookmark: (BrowserTab) -> Void = { _ in }
     var onRemoveBookmark: (Bookmark) -> Void = { _ in }
 
@@ -20,8 +20,6 @@ struct LibraryView: View {
     private let gutter: CGFloat = 28
     /// Searching lives in the ⌘⇧P palette now; the library always shows everything.
     private let query = ""
-
-    private var showingBookmarks: Bool { selectedCategory == Library.bookmarksID }
 
     private func filteredBookmarks() -> [Bookmark] {
         let q = bookmarkQuery.trimmed
@@ -56,7 +54,6 @@ struct LibraryView: View {
         let totals = library.totals(groups)
         let ordered = library.visibleChildren(of: nil, totals: totals)
         let shared = (images: previews.sharedImages, summaries: previews.sharedSummaries)
-        let selected = selectedCategory.flatMap(library.category(withID:))
         GeometryReader { geometry in
             let available = geometry.size.width - margin * 2
             let columns = max(1, min(5, Int((available + gutter) / (290 + gutter))))
@@ -81,39 +78,52 @@ struct LibraryView: View {
                     masthead(ordered, totals: totals)
                         .padding(.top, 30)
                     Hairline().padding(.top, 22)
-                    if showingBookmarks {
+                    switch selection {
+                    case .bookmarks:
                         let shown = filteredBookmarks()
                         bookmarksSummary(shown).padding(.vertical, 18)
                         bookmarksGrid(shown, columns: columns, width: columnWidth, shared: shared)
-                    } else if library.tabs.isEmpty {
-                        empty.padding(.top, 60)
-                    } else if let selected {
-                        let children = library.visibleChildren(of: selected.id, totals: totals)
-                        let all = matching(library.orderedTabs(in: selected.id, groups: groups, totals: totals))
-                        summary(all, category: selected).padding(.vertical, 18)
-                        if children.isEmpty {
-                            grid(all, columns: columns, width: columnWidth, shared: shared, readIn: selected.id, labelFrom: selected.id)
+                    case .all:
+                        if library.tabs.isEmpty {
+                            empty.padding(.top, 60)
+                        } else if !query.isEmpty {
+                            let tabs = matching(library.tabs)
+                            summary(tabs, category: nil).padding(.vertical, 18)
+                            grid(tabs, columns: columns, width: columnWidth, shared: shared, readIn: nil, labelFrom: nil)
                         } else {
-                            // One section per sub-shelf, then whatever is filed on the parent itself.
-                            ForEach(Array(children.enumerated()), id: \.element.id) { index, child in
-                                section(child, tabs: matching(library.orderedTabs(in: child.id, groups: groups, totals: totals)),
-                                        index: index, readIn: selected.id, columns: columns, width: columnWidth, shared: shared)
-                            }
-                            let direct = matching(groups[selected.id] ?? [])
-                            if !direct.isEmpty {
-                                section(selected, title: "Unsorted in \(selected.name)", tabs: direct, index: children.count,
-                                        readIn: selected.id, columns: columns, width: columnWidth, shared: shared)
+                            summary(library.tabs, category: nil).padding(.vertical, 18)
+                            ForEach(Array(ordered.enumerated()), id: \.element.id) { index, category in
+                                section(category, tabs: library.orderedTabs(in: category.id, groups: groups, totals: totals), index: index,
+                                        readIn: category.id, columns: columns, width: columnWidth, shared: shared)
                             }
                         }
-                    } else if !query.isEmpty {
-                        let tabs = matching(library.tabs)
-                        summary(tabs, category: nil).padding(.vertical, 18)
-                        grid(tabs, columns: columns, width: columnWidth, shared: shared, readIn: nil, labelFrom: nil)
-                    } else {
-                        summary(library.tabs, category: nil).padding(.vertical, 18)
-                        ForEach(Array(ordered.enumerated()), id: \.element.id) { index, category in
-                            section(category, tabs: library.orderedTabs(in: category.id, groups: groups, totals: totals), index: index,
-                                    readIn: category.id, columns: columns, width: columnWidth, shared: shared)
+                    case .shelf(let id):
+                        if library.tabs.isEmpty {
+                            empty.padding(.top, 60)
+                        } else if let selected = library.category(withID: id) {
+                            let children = library.visibleChildren(of: selected.id, totals: totals)
+                            let all = matching(library.orderedTabs(in: selected.id, groups: groups, totals: totals))
+                            summary(all, category: selected).padding(.vertical, 18)
+                            if children.isEmpty {
+                                grid(all, columns: columns, width: columnWidth, shared: shared, readIn: selected.id, labelFrom: selected.id)
+                            } else {
+                                // One section per sub-shelf, then whatever is filed on the parent itself.
+                                ForEach(Array(children.enumerated()), id: \.element.id) { index, child in
+                                    section(child, tabs: matching(library.orderedTabs(in: child.id, groups: groups, totals: totals)),
+                                            index: index, readIn: selected.id, columns: columns, width: columnWidth, shared: shared)
+                                }
+                                let direct = matching(groups[selected.id] ?? [])
+                                if !direct.isEmpty {
+                                    section(selected, title: "Unsorted in \(selected.name)", tabs: direct, index: children.count,
+                                            readIn: selected.id, columns: columns, width: columnWidth, shared: shared)
+                                }
+                            }
+                        } else {
+                            summary(library.tabs, category: nil).padding(.vertical, 18)
+                            ForEach(Array(ordered.enumerated()), id: \.element.id) { index, category in
+                                section(category, tabs: library.orderedTabs(in: category.id, groups: groups, totals: totals), index: index,
+                                        readIn: category.id, columns: columns, width: columnWidth, shared: shared)
+                            }
                         }
                     }
                 }
@@ -136,19 +146,26 @@ struct LibraryView: View {
         }
         .onChange(of: library.categories) { old, new in
             // If the open shelf was deleted, fall back to its parent.
-            guard let id = selectedCategory, id != Library.bookmarksID, !new.contains(where: { $0.id == id }) else { return }
+            guard case .shelf(let id) = selection, !new.contains(where: { $0.id == id }) else { return }
             let parent = old.first { $0.id == id }?.parentID
-            selectedCategory = parent.flatMap { parent in new.contains { $0.id == parent } ? parent : nil }
+            selection = parent.flatMap { parent in new.contains { $0.id == parent } ? .shelf(parent) : nil } ?? .all
         }
     }
 
     /// ⌘[ goes up one level.
     private func goUp() {
-        if showingBookmarks {
-            select(nil)
+        switch selection {
+        case .all:
             return
+        case .bookmarks:
+            select(.all)
+        case .shelf(let id):
+            if let parent = library.category(withID: id)?.parentID {
+                select(.shelf(parent))
+            } else {
+                select(.all)
+            }
         }
-        select(selectedCategory.flatMap { library.category(withID: $0)?.parentID })
     }
 
     /// Where the library came from, so it's never a mystery. Click to choose which browser(s) to read from.
@@ -180,14 +197,15 @@ struct LibraryView: View {
                     Button("Refresh tabs") { library.refresh() }
                 } label: {
                     HStack(spacing: 7) {
-                        Circle().fill(!library.connectedBrowsers.isEmpty && library.lastUpdated != nil ? Theme.connected : Theme.ink4)
+                        Circle().fill(library.hasLiveSync ? Theme.connected : Theme.ink4)
                             .frame(width: 6, height: 6)
                         Group {
-                            if library.updating && library.lastUpdated == nil {
+                            switch library.syncState {
+                            case .idle, .loading:
                                 Text("Reading \(library.activeSourceLabel)…")
-                            } else if let updated = library.lastUpdated, !library.connectedBrowsers.isEmpty {
-                                Text("\(library.activeSourceLabel) · \(library.rawCount) tabs · \(updated.formatted(date: .omitted, time: .shortened))")
-                            } else {
+                            case .synced(let browsers, let rawCount, let updated, _):
+                                Text("\(browsers.map(\.name).joined(separator: ", ")) · \(rawCount) tabs · \(updated.formatted(date: .omitted, time: .shortened))")
+                            case .disconnected:
                                 Text(library.browserSource == .all ? "No browser connected" : "\(library.browserSource.title) not connected")
                             }
                         }
@@ -212,7 +230,7 @@ struct LibraryView: View {
     /// The shelf index: big Garamond words with superscript counts, plus a smaller
     /// row of sub-shelves for each level of the current selection.
     private func masthead(_ ordered: [Category], totals: [String: Int]) -> some View {
-        let path = selectedCategory.flatMap { $0 == Library.bookmarksID ? nil : library.tree.path(of: $0) } ?? []
+        let path: [Category] = if case .shelf(let id) = selection { library.tree.path(of: id) } else { [] }
         let rows = path.enumerated().compactMap { depth, shelf -> (parent: Category, children: [Category], selected: String?)? in
             let children = library.visibleChildren(of: shelf.id, totals: totals)
             guard !children.isEmpty else { return nil }
@@ -220,15 +238,15 @@ struct LibraryView: View {
         }
         return VStack(alignment: .leading, spacing: 0) {
             FlowLayout(spacing: 30, lineSpacing: 2) {
-                ShelfWord(name: "All", count: library.tabs.count, selected: selectedCategory == nil) { select(nil) }
+                ShelfWord(name: "All", count: library.tabs.count, selected: selection == .all) { select(.all) }
                 ShelfWord(name: "Bookmarks", count: library.bookmarks.count,
-                          selected: showingBookmarks,
+                          selected: selection == .bookmarks,
                           mark: library.bookmarks.isEmpty ? "bookmark" : "bookmark.fill",
                           markHelp: "Pages you bookmarked to revisit anytime (⌥⌘B)",
-                          showZero: false) { select(Library.bookmarksID) }
+                          showZero: false) { select(.bookmarks) }
                 ForEach(ordered) { category in
                     ShelfWord(name: category.name, count: totals[category.id] ?? 0,
-                              selected: path.first?.id == category.id, agent: category.isAgentMade) { select(category.id) }
+                              selected: path.first?.id == category.id, agent: category.isAgentMade) { select(.shelf(category.id)) }
                 }
             }
             ForEach(Array(rows.enumerated()), id: \.element.parent.id) { level, row in
@@ -237,7 +255,7 @@ struct LibraryView: View {
                     FlowLayout(spacing: level == 0 ? 22 : 18, lineSpacing: 2) {
                         ForEach(row.children) { child in
                             ShelfWord(name: child.name, count: totals[child.id] ?? 0, selected: row.selected == child.id,
-                                      agent: child.isAgentMade, size: level == 0 ? 26 : 21) { select(child.id) }
+                                      agent: child.isAgentMade, size: level == 0 ? 26 : 21) { select(.shelf(child.id)) }
                         }
                     }
                 }
@@ -250,7 +268,7 @@ struct LibraryView: View {
     private func summary(_ tabs: [BrowserTab], category: Category?) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 14) {
             if let category, let parent = category.parentID.flatMap(library.category(withID:)) {
-                TextAction(title: parent.name, systemImage: "arrow.up") { select(parent.id) }
+                TextAction(title: parent.name, systemImage: "arrow.up") { select(.shelf(parent.id)) }
                     .help("Up to \(library.pathName(of: parent.id)) (⌘[)")
                 Text("·").font(Theme.mono(11)).foregroundStyle(Theme.ink4)
             }
@@ -265,7 +283,7 @@ struct LibraryView: View {
             if library.updating { ProgressView().controlSize(.mini) }
             Spacer()
             if let category, tabs.contains(where: { $0.readableURL != nil }) {
-                Button { open(category.id, nil, nil) } label: {
+                Button { open(.shelf(category.id), nil, nil) } label: {
                     HStack(spacing: 7) { Text("Begin reading"); Image(systemName: "arrow.right").font(.system(size: 10.5, weight: .semibold)) }
                 }
                 .buttonStyle(DeskButtonStyle(.primary))
@@ -288,7 +306,7 @@ struct LibraryView: View {
                 if let title {
                     Text(title).font(Theme.serif(30, italic: true)).foregroundStyle(Theme.ink2)
                 } else {
-                    Button { select(category.id) } label: {
+                    Button { select(.shelf(category.id)) } label: {
                         Text(category.name).font(Theme.serif(30)).foregroundStyle(Theme.ink)
                     }
                     .buttonStyle(.plain)
@@ -299,11 +317,11 @@ struct LibraryView: View {
                 }
                 Spacer()
                 if tabs.count > shown.count {
-                    TextAction(title: "All \(tabs.count)", systemImage: "arrow.right", trailing: true) { select(category.id) }
+                    TextAction(title: "All \(tabs.count)", systemImage: "arrow.right", trailing: true) { select(.shelf(category.id)) }
                         .padding(.trailing, 14)
                 }
                 if !unsorted, tabs.contains(where: { $0.readableURL != nil }) {
-                    Button { open(category.id, nil, nil) } label: { Text("Read shelf") }
+                    Button { open(.shelf(category.id), nil, nil) } label: { Text("Read shelf") }
                         .buttonStyle(DeskButtonStyle(.outline))
                 }
             }
@@ -353,7 +371,7 @@ struct LibraryView: View {
                        fallbackBrowser: library.preferredOpenBrowser,
                        noteCount: notes.count(for: tab.address), saved: library.isSaved(tab),
                        bookmarked: library.isBookmarked(tab),
-                       open: { _ in open(readIn ?? category.id, tab, nil) },
+                       open: { _ in open(.shelf(readIn ?? category.id), tab, nil) },
                        done: { library.finish(tab, closeInBrowser: closeInBrowser) },
                        readLater: { library.saveForLater(tab, closeInBrowser: closeInBrowser) },
                        removeFromLater: { library.removeFromLater(tab.address) },
@@ -393,7 +411,7 @@ struct LibraryView: View {
                 .overlay(Capsule().strokeBorder(Theme.rule))
             }
             if let first = tabs.first(where: { $0.readableURL != nil }) {
-                Button { open(Library.bookmarksID, first, nil) } label: {
+                Button { open(.bookmarks, first, nil) } label: {
                     HStack(spacing: 7) { Text("Begin reading"); Image(systemName: "arrow.right").font(.system(size: 10.5, weight: .semibold)) }
                 }
                 .buttonStyle(DeskButtonStyle(.primary))
@@ -444,7 +462,7 @@ struct LibraryView: View {
                             fallbackBrowser: library.preferredOpenBrowser,
                             noteCount: notes.count(for: tab.address),
                             onReadLater: library.isSaved(tab),
-                            open: { open(Library.bookmarksID, tab, nil) },
+                            open: { open(.bookmarks, tab, nil) },
                             remove: { onRemoveBookmark(bookmark) },
                             readLater: { library.saveForLater(tab, closeInBrowser: false) },
                             update: { title, note in library.updateBookmark(address: bookmark.address, title: title, note: note) })
@@ -468,8 +486,8 @@ struct LibraryView: View {
         }
     }
 
-    private func select(_ id: String?) {
-        withAnimation(.easeOut(duration: 0.2)) { selectedCategory = id }
+    private func select(_ next: LibrarySelection) {
+        withAnimation(.easeOut(duration: 0.2)) { selection = next }
     }
 
     static func roman(_ number: Int) -> String {

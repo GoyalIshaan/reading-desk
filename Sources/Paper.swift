@@ -16,16 +16,24 @@ final class PaperReader: NSObject, ObservableObject {
         var top: CGFloat?
     }
 
+    /// Explicit lifecycle of a PDF document: loading, loaded (with valid pageCount/sections), or failed.
+    enum LoadPhase: Equatable {
+        case loading
+        case loaded(pageCount: Int, title: String?, sections: [Section])
+        case failed(String)
+    }
+
     let url: URL
     /// Optional 0-based page parsed from a `#page=N` fragment on the opening URL.
     private let requestedPage: Int?
     let view = DeskPDFView()
-    @Published private(set) var loading = true
-    @Published private(set) var failure: String?
+    @Published private(set) var phase: LoadPhase = .loading
     @Published private(set) var pageIndex = 0
-    @Published private(set) var pageCount = 0
-    @Published private(set) var sections: [Section] = []
-    @Published private(set) var title: String?
+
+    var pageCount: Int { if case .loaded(let count, _, _) = phase { count } else { 0 } }
+    var sections: [Section] { if case .loaded(_, _, let sections) = phase { sections } else { [] } }
+    var title: String? { if case .loaded(_, let title, _) = phase { title } else { nil } }
+    var isFailed: Bool { if case .failed = phase { true } else { false } }
 
     /// A finished selection (mouse up), or nil when it's cleared.
     var onSelection: ((Excerpt.Partial?) -> Void)?
@@ -72,9 +80,7 @@ final class PaperReader: NSObject, ObservableObject {
     }
 
     func load() async {
-        loading = true
-        failure = nil
-        defer { loading = false }
+        phase = .loading
         do {
             let document: PDFDocument?
             let targetURL = url
@@ -103,9 +109,9 @@ final class PaperReader: NSObject, ObservableObject {
             try Task.checkCancellation()
             guard let document, document.pageCount > 0 else { throw CocoaError(.fileReadCorruptFile) }
             view.document = document
-            pageCount = document.pageCount
-            title = (document.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String)?.trimmed
-            sections = flatten(document)
+            let loadedTitle = (document.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String)?.trimmed
+            let loadedSections = flatten(document)
+            phase = .loaded(pageCount: document.pageCount, title: loadedTitle, sections: loadedSections)
             let startPage = requestedPage ?? ReadingMemory.page(for: url)
             if let startPage, startPage > 0, let page = document.page(at: min(startPage, document.pageCount - 1)) {
                 // Wait a turn so the view has laid out before jumping.
@@ -117,7 +123,7 @@ final class PaperReader: NSObject, ObservableObject {
         } catch let error as URLError where error.code == .cancelled {
             return
         } catch {
-            failure = error.localizedDescription
+            phase = .failed(error.localizedDescription)
         }
     }
 
@@ -180,8 +186,8 @@ final class PaperReader: NSObject, ObservableObject {
         let index = document.index(for: page)
         let top = selection.bounds(for: page).maxY
         onSelection?(Excerpt.Partial(text: Excerpt.tidy(raw, fromPDF: true), plain: raw, kind: .prose,
-                                     section: section(forPage: index, y: top)?.title, page: index + 1,
-                                     pageLabel: page.label, rect: rect(of: selection)))
+                                     section: section(forPage: index, y: top)?.title,
+                                     location: .pdf(page: index + 1, label: page.label), rect: rect(of: selection)))
     }
 
     func refreshSelectionRect() {
@@ -257,7 +263,7 @@ struct PaperPane: View {
         ZStack {
             Theme.ground
             PaperSurface(paper: paper)
-            if paper.loading {
+            if case .loading = paper.phase {
                 VStack(spacing: 10) {
                     ProgressView().controlSize(.small)
                     Text("Opening the PDF…").font(Theme.serif(18, italic: true)).foregroundStyle(Theme.ink3)
@@ -276,12 +282,11 @@ extension Excerpt {
         var plain: String
         var kind: Kind
         var section: String?
-        var page: Int?
-        var pageLabel: String?
+        var location: Location
         var rect: CGRect?
 
         func excerpt(title: String, url: URL) -> Excerpt {
-            Excerpt(text: text, plain: plain, kind: kind, section: section, page: page, pageLabel: pageLabel,
+            Excerpt(text: text, plain: plain, kind: kind, section: section, location: location,
                     sourceTitle: title, sourceURL: url.removingFragment, rect: rect)
         }
     }

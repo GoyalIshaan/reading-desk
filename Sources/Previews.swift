@@ -35,11 +35,15 @@ final class Previews: ObservableObject {
 
     /// While reading, background fetching and snapshotting stop so the reader stays smooth.
     var paused = false
+    private enum FlushSchedule {
+        case idle
+        case scheduled(fast: Bool, task: Task<Void, Never>)
+    }
+
     private var pendingInfo: [String: PagePreview] = [:]
     private var pendingImages: [String: NSImage] = [:]
     private var pendingIcons: [String: NSImage] = [:]
-    private var flushTask: Task<Void, Never>?
-    private var flushFast = false
+    private var flushSchedule: FlushSchedule = .idle
     private var requested: Set<String> = []
     private var iconRequested: Set<String> = []
     private let directory: URL
@@ -113,23 +117,24 @@ final class Previews: ObservableObject {
     }
 
     private func scheduleFlush(fast: Bool) {
-        if fast && !flushFast {
-            flushTask?.cancel()
-            flushTask = nil
+        switch flushSchedule {
+        case .scheduled(let currentlyFast, let existing):
+            guard fast && !currentlyFast else { return }
+            existing.cancel()
+        case .idle:
+            break
         }
-        guard flushTask == nil else { return }
-        flushFast = fast
         let delay: Duration = fast ? .milliseconds(35) : .milliseconds(300)
-        flushTask = Task {
+        let task = Task {
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
             flushPending()
         }
+        flushSchedule = .scheduled(fast: fast, task: task)
     }
 
     private func flushPending() {
-        flushTask = nil
-        flushFast = false
+        flushSchedule = .idle
         let infoChanged = !pendingInfo.isEmpty
         if infoChanged {
             info.merge(pendingInfo) { $1 }

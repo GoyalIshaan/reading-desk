@@ -22,13 +22,27 @@ struct CommandPalette: View {
     let close: () -> Void
     let openTab: (BrowserTab) -> Void
     let openBookmark: (Bookmark) -> Void
-    let openShelf: (String) -> Void
+    let openSelection: (LibrarySelection) -> Void
     let performCommand: (Command) -> Void
+
+    /// Couples the entries array with its matching SearchIndex so search hits can never
+    /// index into a newer or older entries array during an asynchronous rebuild.
+    private enum IndexState {
+        case empty
+        case entriesOnly([IndexedEntry])
+        case ready(entries: [IndexedEntry], index: SearchIndex)
+
+        var entries: [IndexedEntry] {
+            switch self {
+            case .empty: []
+            case .entriesOnly(let entries), .ready(let entries, _): entries
+            }
+        }
+    }
 
     @State private var query = ""
     @State private var selection = 0
-    @State private var index = SearchIndex(documents: [])
-    @State private var indexedEntries: [IndexedEntry] = []
+    @State private var indexState: IndexState = .empty
     @State private var indexTask: Task<Void, Never>?
     @State private var results: [Item] = []
     /// Set by arrow keys only. Hover changes the selection without scrolling the list.
@@ -78,7 +92,7 @@ struct CommandPalette: View {
         /// `path` / `shelf` hold the full shelf path, e.g. "Parent › Child".
         enum Kind {
             case command(Command, title: String, symbol: String)
-            case shelf(id: String, symbol: String, path: String, count: Int)
+            case shelf(target: LibrarySelection, symbol: String, path: String, count: Int)
             case bookmark(Bookmark)
             case tab(BrowserTab, shelf: String, bookmarked: Bool)
         }
@@ -91,7 +105,12 @@ struct CommandPalette: View {
         var id: String {
             switch kind {
             case .command(let command, _, _): "command:" + command.rawValue
-            case .shelf(let id, _, _, _): "shelf:" + id
+            case .shelf(let target, _, _, _):
+                switch target {
+                case .all: "shelf:all"
+                case .bookmarks: "shelf:bookmarks"
+                case .shelf(let id): "shelf:" + id
+                }
             case .bookmark(let bookmark): "bookmark:" + bookmark.address
             case .tab(let tab, _, _): "tab:" + tab.id
             }
@@ -120,7 +139,7 @@ struct CommandPalette: View {
         }
         let entries: [IndexedEntry] = tabs.map { .tab($0, bookmarked: library.isBookmarked($0)) }
             + standaloneBookmarks.map { .bookmark($0) }
-        indexedEntries = entries
+        indexState = .entriesOnly(entries)
         let documents: [[SearchIndex.Field: String]] = entries.map { entry in
             switch entry {
             case .tab(let tab, let bookmarked):
@@ -158,8 +177,7 @@ struct CommandPalette: View {
         indexTask = Task {
             let built = await Task.detached(priority: .userInitiated) { SearchIndex(documents: documents) }.value
             guard !Task.isCancelled else { return }
-            index = built
-            indexedEntries = entries
+            indexState = .ready(entries: entries, index: built)
             if !query.trimmingCharacters(in: .whitespaces).isEmpty {
                 runSearch(keepSelection: true)
             }
@@ -199,11 +217,11 @@ struct CommandPalette: View {
         let totals = library.totals(library.grouped())
         var shelves = library.tree.flattened().compactMap { row -> Item? in
             let count = totals[row.category.id] ?? 0
-            return count > 0 ? Item(kind: .shelf(id: row.category.id, symbol: row.category.symbol,
+            return count > 0 ? Item(kind: .shelf(target: .shelf(row.category.id), symbol: row.category.symbol,
                                                  path: library.pathName(of: row.category.id), count: count)) : nil
         }
         if !library.bookmarks.isEmpty {
-            shelves.insert(Item(kind: .shelf(id: Library.bookmarksID, symbol: "bookmark.fill",
+            shelves.insert(Item(kind: .shelf(target: .bookmarks, symbol: "bookmark.fill",
                                              path: "Bookmarks", count: library.bookmarks.count)), at: 0)
         }
         func entryItem(_ entry: IndexedEntry, words: Set<String> = [], snippet: String? = nil) -> Item {
@@ -217,7 +235,7 @@ struct CommandPalette: View {
         }
         if trimmed.isEmpty {
             let recentBookmarks = library.bookmarks.prefix(8).map { Item(kind: .bookmark($0), snippet: $0.note) }
-            let recentTabs = indexedEntries.compactMap { entry -> Item? in
+            let recentTabs = indexState.entries.compactMap { entry -> Item? in
                 guard case .tab = entry else { return nil }
                 return entryItem(entry)
             }
@@ -228,9 +246,14 @@ struct CommandPalette: View {
                 let words = SearchIndex.words(in: path)
                 return terms.allSatisfy { term in words.contains { $0.hasPrefix(term) } }
             }
-            let hits = index.search(trimmed).compactMap { hit -> Item? in
-                guard indexedEntries.indices.contains(hit.index) else { return nil }
-                return entryItem(indexedEntries[hit.index], words: hit.words, snippet: hit.snippet)
+            let hits: [Item] = switch indexState {
+            case .empty, .entriesOnly:
+                []
+            case .ready(let entries, let searchIndex):
+                searchIndex.search(trimmed).compactMap { hit -> Item? in
+                    guard entries.indices.contains(hit.index) else { return nil }
+                    return entryItem(entries[hit.index], words: hit.words, snippet: hit.snippet)
+                }
             }
             let matchingBookmarks = hits.filter { $0.section == .bookmarks }
             let matchingTabs = hits.filter { $0.section == .tabs }
@@ -451,8 +474,8 @@ struct CommandPalette: View {
             close()
             performCommand(command)
             return
-        case .shelf(let id, _, _, _):
-            openShelf(id)
+        case .shelf(let target, _, _, _):
+            openSelection(target)
         case .bookmark(let bookmark):
             if inBrowser, let url = bookmark.tab.readableURL {
                 Browsers.open(url, in: library.preferredOpenBrowser)
@@ -495,10 +518,10 @@ private struct PaletteRow: View, Equatable {
                 if let detail = item.detail {
                     Text(detail).font(Theme.sans(12)).foregroundStyle(Theme.ink3).lineLimit(1).truncationMode(.middle)
                 }
-            case .shelf(let id, let symbol, let path, let count):
+            case .shelf(let target, let symbol, let path, let count):
                 Image(systemName: symbol)
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(selected || id == Library.bookmarksID ? Theme.accent : Theme.ink3)
+                    .foregroundStyle(selected || target == .bookmarks ? Theme.accent : Theme.ink3)
                     .frame(width: 18, height: 18)
                 Text(Self.shelfPath(path)).lineLimit(1).truncationMode(.head)
                 Spacer(minLength: 8)

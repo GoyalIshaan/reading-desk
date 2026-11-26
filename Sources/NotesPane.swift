@@ -42,24 +42,26 @@ struct NotesPane: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 Hairline()
             }
-            if vault.root == nil {
+            switch vault.pane {
+            case .disconnected:
                 connect
-            } else if vault.showPicker || vault.selection == nil {
+            case .picker:
                 picker
-            } else if let note = vault.selection {
+            case .editor(_, let note, let mode):
                 earlierNotes(besides: note)
                 ZStack(alignment: .bottomTrailing) {
-                    if vault.preview {
+                    switch mode {
+                    case .livePreview:
                         NoteWebView(renderer: renderer)
                             .onAppear { renderer.show(note, text: vault.text) }
                             .onChange(of: vault.documentVersion) { _, _ in renderer.show(note, text: vault.text) }
                             .onChange(of: note) { _, next in renderer.show(next, text: vault.text) }
-                    } else {
+                    case .source:
                         MarkdownEditor(text: vault.text, version: vault.documentVersion, attach: vault.attach) { vault.edit($0) }
                             .id(note.id)
                     }
-                    if vault.isDirty || vault.status != .saved {
-                        Text(vault.status.label).font(Theme.mono(10)).foregroundStyle(Theme.ink4)
+                    if let status = vault.status, vault.isDirty || status != .saved {
+                        Text(status.label).font(Theme.mono(10)).foregroundStyle(Theme.ink4)
                             .padding(.horizontal, 14).padding(.vertical, 10)
                             .accessibilityIdentifier("save-status")
                     }
@@ -68,7 +70,7 @@ struct NotesPane: View {
         }
         .background(Theme.notes)
         .background {
-            ShortcutButton("Toggle source mode", "e") { if vault.selection != nil { vault.preview.toggle() } }
+            ShortcutButton("Toggle source mode", "e") { vault.toggleEditorMode() }
             ShortcutButton("Save", "s") { Task { await vault.flush() } }
         }
         .task {
@@ -85,19 +87,22 @@ struct NotesPane: View {
 
     private var header: some View {
         HStack(spacing: 2) {
-            if vault.root != nil {
-                DeskIcon(vault.showPicker ? "doc.text" : "sidebar.left", help: vault.showPicker ? "Back to note" : "All notes") {
-                    if vault.selection != nil || !vault.showPicker { vault.showPicker.toggle() }
-                }
-                .disabled(vault.showPicker && vault.selection == nil)
+            switch vault.pane {
+            case .disconnected:
+                EmptyView()
+            case .picker(_, let openNote):
+                DeskIcon("doc.text", help: "Back to note") { vault.togglePicker() }
+                    .disabled(openNote == nil)
+            case .editor:
+                DeskIcon("sidebar.left", help: "All notes") { vault.togglePicker() }
             }
             breadcrumb.padding(.leading, 4)
             Spacer(minLength: 6)
-            if vault.root != nil {
-                if vault.selection != nil && !vault.showPicker {
-                    DeskIcon(vault.preview ? "chevron.left.forwardslash.chevron.right" : "text.book.closed",
-                             help: vault.preview ? "Source mode (⌘E)" : "Live preview (⌘E)") {
-                        vault.preview.toggle()
+            if vault.pane != .disconnected {
+                if case .editor(_, _, let mode) = vault.pane {
+                    DeskIcon(mode == .livePreview ? "chevron.left.forwardslash.chevron.right" : "text.book.closed",
+                             help: mode == .livePreview ? "Source mode (⌘E)" : "Live preview (⌘E)") {
+                        vault.toggleEditorMode()
                     }
                 }
                 DeskIcon("square.and.pencil", help: "New note for this page") {
@@ -109,7 +114,7 @@ struct NotesPane: View {
                     Button("Refresh notes") { Task { await vault.refresh() } }
                     Button("Choose another vault…") { Task { await vault.chooseFolder() } }
                     Button("Open in Obsidian") { vault.openInObsidian() }
-                    if let note = vault.selection, !vault.showPicker, !vault.isSourceNote(note, for: source) {
+                    if case .editor(_, let note, _) = vault.pane, !vault.isSourceNote(note, for: source) {
                         Button("Save this page’s highlights here") { vault.linkSelection(to: source) }
                     }
                     if vault.selection != nil { Button("Reload note from disk…") { requestReload() } }
@@ -125,23 +130,27 @@ struct NotesPane: View {
     }
 
     @ViewBuilder private var breadcrumb: some View {
-        if let root = vault.root {
+        switch vault.pane {
+        case .disconnected:
+            Text("Obsidian").font(Theme.sans(12, .medium)).foregroundStyle(Theme.ink3)
+        case .picker(let root, _):
+            Text(root.lastPathComponent)
+                .foregroundStyle(Theme.ink3)
+                .font(Theme.sans(12, .medium))
+                .lineLimit(1)
+        case .editor(let root, let note, _):
             HStack(spacing: 5) {
                 Text(root.lastPathComponent).foregroundStyle(Theme.ink3)
-                if let note = vault.selection, !vault.showPicker {
-                    let parts = note.path.split(separator: "/").map(String.init)
-                    ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
-                        Text("/").foregroundStyle(Theme.ink4)
-                        Text(index == parts.count - 1 ? part.replacingOccurrences(of: ".md", with: "") : part)
-                            .foregroundStyle(index == parts.count - 1 ? Theme.ink : Theme.ink3)
-                    }
+                let parts = note.path.split(separator: "/").map(String.init)
+                ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
+                    Text("/").foregroundStyle(Theme.ink4)
+                    Text(index == parts.count - 1 ? part.replacingOccurrences(of: ".md", with: "") : part)
+                        .foregroundStyle(index == parts.count - 1 ? Theme.ink : Theme.ink3)
                 }
             }
             .font(Theme.sans(12, .medium))
             .lineLimit(1)
             .truncationMode(.head)
-        } else {
-            Text("Obsidian").font(Theme.sans(12, .medium)).foregroundStyle(Theme.ink3)
         }
     }
 

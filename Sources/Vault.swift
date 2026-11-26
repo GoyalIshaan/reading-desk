@@ -88,28 +88,24 @@ private actor VaultFiles {
 
 @MainActor
 final class Vault: ObservableObject {
-    @Published private(set) var root: URL?
-    @Published private(set) var notes: [Note] = []
-    @Published private(set) var attachments: [String] = []
-    @Published private(set) var selection: Note?
-    /// Plain (not @Published) so typing doesn't re-render DeskView/LibraryView/NotesPane on every keystroke.
-    /// External replacements (open, reload, capture, toggleTask) bump `documentVersion` instead.
-    var text = ""
-    @Published private(set) var documentVersion = 0
-    /// Where the open note is in its save cycle. Was a free-form string the UI compared against.
+    enum EditorMode: Equatable {
+        case livePreview
+        case source
+
+        mutating func toggle() { self = self == .livePreview ? .source : .livePreview }
+    }
+
+    /// Save lifecycle of the currently open note. Only exists while a note is open.
     enum SaveState: Equatable {
-        /// No note open.
-        case none
         case saved
         /// Typed since the last save; an autosave is pending.
         case editing
         case saving
-        /// The last write failed (see `error`); the text is still in memory.
+        /// The last write failed (see `error`); the draft is still in memory.
         case unsaved
 
         var label: String {
             switch self {
-            case .none: ""
             case .saved: "Saved"
             case .editing: "Editing…"
             case .saving: "Saving…"
@@ -118,30 +114,63 @@ final class Vault: ObservableObject {
         }
     }
 
-    @Published private(set) var status: SaveState = .none
+    /// Explicit UI state of the Notes pane: disconnected, picking a note, or editing one.
+    enum Pane: Equatable {
+        case disconnected
+        case picker(root: URL, openNote: Note?)
+        case editor(root: URL, note: Note, mode: EditorMode)
+
+        var root: URL? {
+            switch self {
+            case .disconnected: nil
+            case .picker(let root, _), .editor(let root, _, _): root
+            }
+        }
+    }
+
+    /// Couples the open note with its buffer, last-saved snapshot, and editor mode so
+    /// text/savedText/dirty state can never exist without an open note.
+    private struct OpenNote {
+        let note: Note
+        var text: String
+        var savedText: String
+        var mode: EditorMode
+        var saveState: SaveState
+
+        var isDirty: Bool { text != savedText }
+    }
+
+    @Published private(set) var pane: Pane = .disconnected
+    @Published private(set) var notes: [Note] = []
+    @Published private(set) var attachments: [String] = []
+    @Published private(set) var documentVersion = 0
+    @Published private(set) var status: SaveState?
     @Published private(set) var error: String?
     /// Blocks concurrent open/create/reload/switch-vault mutations.
     @Published private(set) var busy = false
     /// Background vault enumeration (`refresh()`), kept separate from `busy` so a refresh never swallows a note click.
     @Published private(set) var scanning = false
-    @Published var showPicker = true
-    @Published var preview = true
 
-    private var savedText = ""
+    /// Plain (not @Published) so typing doesn't re-render DeskView/LibraryView/NotesPane on every keystroke.
+    /// External replacements (open, reload, capture, toggleTask) bump `documentVersion` instead.
+    private var openNote: OpenNote?
     private var autosave: Task<Void, Never>?
     private var saveTask: Task<Bool, Never>?
     private let files = VaultFiles()
     /// Which notes mention which pages, for highlights and "earlier notes on this page".
     let index = NoteIndex()
 
-    var isDirty: Bool { selection != nil && savedText != text }
+    var root: URL? { pane.root }
+    var selection: Note? { openNote?.note }
+    var text: String { openNote?.text ?? "" }
+    var isDirty: Bool { openNote?.isDirty ?? false }
 
     init() {
         let arguments = ProcessInfo.processInfo.arguments
         if let flag = arguments.firstIndex(of: "--vault"), arguments.indices.contains(flag + 1) {
-            root = URL(fileURLWithPath: arguments[flag + 1], isDirectory: true)
+            pane = .picker(root: URL(fileURLWithPath: arguments[flag + 1], isDirectory: true), openNote: nil)
         } else if let path = UserDefaults.standard.string(forKey: "vaultPath") {
-            root = URL(fileURLWithPath: path, isDirectory: true)
+            pane = .picker(root: URL(fileURLWithPath: path, isDirectory: true), openNote: nil)
         }
     }
 
@@ -149,6 +178,25 @@ final class Vault: ObservableObject {
         let obsidian = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Mobile Documents/iCloud~md~obsidian/Documents/Dev", isDirectory: true)
         return FileManager.default.fileExists(atPath: obsidian.path) ? obsidian : nil
+    }
+
+    func togglePicker() {
+        switch pane {
+        case .disconnected:
+            return
+        case .picker(let root, _):
+            guard let openNote else { return }
+            pane = .editor(root: root, note: openNote.note, mode: openNote.mode)
+        case .editor(let root, let note, _):
+            pane = .picker(root: root, openNote: note)
+        }
+    }
+
+    func toggleEditorMode() {
+        guard case .editor(let root, let note, var mode) = pane else { return }
+        mode.toggle()
+        openNote?.mode = mode
+        pane = .editor(root: root, note: note, mode: mode)
     }
 
     func chooseFolder() async {
@@ -169,17 +217,15 @@ final class Vault: ObservableObject {
         guard await flush() else { return }
         do {
             let results = try await files.index(url)
-            root = url
+            autosave?.cancel()
+            autosave = nil
+            openNote = nil
             notes = results.notes
             attachments = results.attachments
-            selection = nil
-            text = ""
-            savedText = ""
             documentVersion += 1
-            status = .none
+            status = nil
             error = nil
-            preview = false
-            showPicker = true
+            pane = .picker(root: url, openNote: nil)
             UserDefaults.standard.set(url.path, forKey: "vaultPath")
             Task { await index.rebuild(results.notes) }
         } catch { self.error = error.localizedDescription }
@@ -200,37 +246,34 @@ final class Vault: ObservableObject {
     }
 
     func open(_ note: Note) async {
-        guard !busy else { return }
+        guard let root, !busy else { return }
         busy = true
         defer { busy = false }
         guard await flush() else { return }
-        preview = true
-        await read(note)
+        await read(note, root: root, mode: .livePreview)
     }
 
     func reload() async {
-        guard let selection, !busy else { return }
+        guard let root, let current = openNote, !busy else { return }
         autosave?.cancel()
         busy = true
         defer { busy = false }
         if let saveTask { _ = await saveTask.value }
-        await read(selection)
+        await read(current.note, root: root, mode: current.mode)
     }
 
-    private func read(_ note: Note) async {
+    private func read(_ note: Note, root: URL, mode: EditorMode) async {
         do {
             let content = try await files.read(note.url)
-            text = content
-            savedText = content
-            selection = note
+            openNote = OpenNote(note: note, text: content, savedText: content, mode: mode, saveState: .saved)
             documentVersion += 1
             status = .saved
             error = nil
-            showPicker = false
+            pane = .editor(root: root, note: note, mode: mode)
         } catch { self.error = error.localizedDescription }
     }
 
-    func create(_ title: String, source: BrowserTab?, openInPreview: Bool = false) async {
+    func create(_ title: String, source: BrowserTab?, mode: EditorMode = .source) async {
         guard let root, !busy else { return }
         busy = true
         defer { busy = false }
@@ -242,8 +285,7 @@ final class Vault: ObservableObject {
                 index.add(note.path, isSource: true, for: source.address)
                 if let key = SourceKey.key(for: source.address) { ReadingMemory.setNotePath(note.path, for: key) }
             }
-            preview = openInPreview
-            await read(note)
+            await read(note, root: root, mode: mode)
         } catch { self.error = error.localizedDescription }
     }
 
@@ -287,7 +329,7 @@ final class Vault: ObservableObject {
     /// Appends a quote to the page's note (creating the note if it has none) and
     /// leaves the note open in live preview, ready for the caret to land under it.
     func capture(_ block: String, from tab: BrowserTab) async -> Bool {
-        guard root != nil else { return false }
+        guard let root else { return false }
         // A rescan runs every time the app comes forward. `create` and `open` skip while
         // it's busy, which used to drop the highlight; wait for it instead.
         await settle()
@@ -295,7 +337,7 @@ final class Vault: ObservableObject {
         var note = sourceNote(for: tab)
         await settle()
         if note == nil {
-            await create(String(tab.displayTitle.prefix(120)), source: tab, openInPreview: true)
+            await create(String(tab.displayTitle.prefix(120)), source: tab, mode: .livePreview)
             note = selection
         } else if let note, selection != note {
             await open(note)
@@ -308,8 +350,8 @@ final class Vault: ObservableObject {
         documentVersion += 1
         if let key = SourceKey.key(for: tab.address) { ReadingMemory.setNotePath(note.path, for: key) }
         index.add(note.path, isSource: true, for: tab.address)
-        preview = true
-        showPicker = false
+        openNote?.mode = .livePreview
+        pane = .editor(root: root, note: note, mode: .livePreview)
         return true
     }
 
@@ -319,7 +361,9 @@ final class Vault: ObservableObject {
     }
 
     func edit(_ value: String) {
-        text = value
+        guard openNote != nil else { return }
+        openNote?.text = value
+        openNote?.saveState = .editing
         if status != .editing { status = .editing }
         autosave?.cancel()
         autosave = Task { [weak self] in
@@ -339,24 +383,35 @@ final class Vault: ObservableObject {
         while let saveTask {
             if await saveTask.value == false { return false }
         }
-        guard let note = selection, isDirty else {
-            if selection != nil { status = .saved }
+        guard let current = openNote else { return true }
+        guard current.isDirty else {
+            openNote?.saveState = .saved
+            status = .saved
             return true
         }
-        let value = text
-        let baseline = savedText
+        let note = current.note
+        let value = current.text
+        let baseline = current.savedText
+        openNote?.saveState = .saving
         status = .saving
         let task = Task {
             defer { saveTask = nil }
             do {
                 try await files.write(value, replacing: baseline, at: note.url)
-                savedText = value
-                status = isDirty ? .editing : .saved
+                if openNote?.note == note {
+                    openNote?.savedText = value
+                    let next: SaveState = (openNote?.isDirty == true) ? .editing : .saved
+                    openNote?.saveState = next
+                    status = next
+                }
                 error = nil
                 return true
             } catch {
                 self.error = error.localizedDescription
-                status = .unsaved
+                if openNote?.note == note {
+                    openNote?.saveState = .unsaved
+                    status = .unsaved
+                }
                 return false
             }
         }
@@ -365,13 +420,14 @@ final class Vault: ObservableObject {
     }
 
     func contents(of note: Note) async -> String? {
-        if note == selection { return text }
+        if let openNote, openNote.note == note { return openNote.text }
         return try? await files.read(note.url)
     }
 
     /// Flips the checkbox on one line of the open note (from a click in reading view).
     func toggleTask(atLine line: Int) {
-        var lines = text.components(separatedBy: "\n")
+        guard let current = openNote else { return }
+        var lines = current.text.components(separatedBy: "\n")
         guard lines.indices.contains(line),
               let range = lines[line].range(of: #"^([ \t]*[-*+][ \t]+|[ \t]*\d+[.)][ \t]+)\[(.)\]"#, options: .regularExpression) else { return }
         let marker = lines[line][range]

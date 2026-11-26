@@ -360,7 +360,24 @@ enum BrowserSource: String, CaseIterable, Identifiable, Hashable {
     }
 }
 
+/// What the library window is currently showing: every shelf, Bookmarks, or one shelf.
+/// Replaces `String?` + the `"__bookmarks__"` magic sentinel so Bookmarks can never be
+/// mistaken for a shelf ID.
+enum LibrarySelection: Equatable, Hashable {
+    case all
+    case bookmarks
+    case shelf(String)
+}
+
 struct BrowserTab: Decodable, Identifiable, Hashable {
+    /// Where a tab came from. Only `.browser` tabs can be focused or closed in a browser.
+    enum Origin: Hashable {
+        case browser(Browser, windowID: String, tabID: String)
+        case readLater
+        case bookmark
+        case sample
+    }
+
     struct Copy: Hashable {
         let browser: Browser
         let windowID: String
@@ -371,9 +388,7 @@ struct BrowserTab: Decodable, Identifiable, Hashable {
     }
 
     let id: String
-    let rawID: String
-    let windowID: String
-    let browser: Browser?
+    let origin: Origin
     let title: String
     let address: String
     var windowOrder = 0
@@ -382,13 +397,24 @@ struct BrowserTab: Decodable, Identifiable, Hashable {
     /// Other browser tabs showing the same address. Closed together on Done.
     var duplicates: [Copy] = []
 
+    var browser: Browser? {
+        if case .browser(let browser, _, _) = origin { browser } else { nil }
+    }
+
+    var isLiveBrowserTab: Bool {
+        if case .browser = origin { true } else { false }
+    }
+
     private enum CodingKeys: String, CodingKey { case id, windowID, browser, title, address, windowOrder, tabOrder, active }
 
-    init(id: String, windowID: String, title: String, address: String, browser: Browser? = nil) {
-        self.rawID = id
-        self.windowID = windowID
-        self.browser = browser
-        self.id = browser.map { "\($0.rawValue):\(windowID):\(id)" } ?? id
+    init(origin: Origin, title: String, address: String) {
+        self.origin = origin
+        self.id = switch origin {
+        case .browser(let browser, let windowID, let tabID): "\(browser.rawValue):\(windowID):\(tabID)"
+        case .readLater: "later:" + address
+        case .bookmark: "bookmark:" + address
+        case .sample: "sample:" + address
+        }
         self.title = title
         self.address = address
     }
@@ -397,11 +423,9 @@ struct BrowserTab: Decodable, Identifiable, Hashable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let decodedID = try container.decode(String.self, forKey: .id)
         let decodedWindow = try container.decode(String.self, forKey: .windowID)
-        let decodedBrowser = try container.decodeIfPresent(Browser.self, forKey: .browser)
-        rawID = decodedID
-        windowID = decodedWindow
-        browser = decodedBrowser
-        id = decodedBrowser.map { "\($0.rawValue):\(decodedWindow):\(decodedID)" } ?? decodedID
+        let decodedBrowser = try container.decode(Browser.self, forKey: .browser)
+        origin = .browser(decodedBrowser, windowID: decodedWindow, tabID: decodedID)
+        id = "\(decodedBrowser.rawValue):\(decodedWindow):\(decodedID)"
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
         address = try container.decodeIfPresent(String.self, forKey: .address) ?? ""
         windowOrder = try container.decodeIfPresent(Int.self, forKey: .windowOrder) ?? 0
@@ -410,11 +434,16 @@ struct BrowserTab: Decodable, Identifiable, Hashable {
     }
 
     var copies: [Copy] {
-        let own = browser.map { [Copy(browser: $0, windowID: windowID, id: rawID, address: address)] } ?? []
+        let own: [Copy] = switch origin {
+        case .browser(let browser, let windowID, let tabID):
+            [Copy(browser: browser, windowID: windowID, id: tabID, address: address)]
+        case .readLater, .bookmark, .sample:
+            []
+        }
         return own + duplicates
     }
 
-    var copyKey: String { browser.map { "\($0.rawValue):\(windowID):\(rawID)" } ?? id }
+    var copyKey: String { id }
 
     /// Distinct browser names where this tab is currently open.
     var browserLabel: String {
@@ -490,8 +519,8 @@ enum Browsers {
     }
 
     static func focus(_ tab: BrowserTab) async throws {
-        guard let browser = tab.browser else { return }
-        _ = try await run(browser, arguments: ["focus", tab.windowID, tab.rawID, tab.address])
+        guard case .browser(let browser, let windowID, let tabID) = tab.origin else { return }
+        _ = try await run(browser, arguments: ["focus", windowID, tabID, tab.address])
     }
 
     static func close(_ copies: [BrowserTab.Copy]) async throws {
@@ -524,11 +553,20 @@ final class Library: ObservableObject {
     @Published private(set) var finishedToday: Int
     /// Shelves where Claude files new tabs into sub-shelves.
     @Published private(set) var autoSortShelves: Set<String>
+    /// Browser connection lifecycle. Keeps connected browsers, tab counts, timestamps, and
+    /// partial warnings coupled so the UI and session-resume logic can never see contradictions.
+    enum SyncState: Equatable {
+        case idle
+        case loading
+        case synced(browsers: [Browser], rawCount: Int, updated: Date, warning: String?)
+        case disconnected(reason: String)
+    }
+
+    @Published private(set) var syncState: SyncState = .idle
     @Published private(set) var updating = false
+    /// Transient action errors (e.g., failing to close or focus a tab) plus sync errors/warnings.
     @Published var error: String?
     @Published private(set) var loaded = false
-    @Published private(set) var lastUpdated: Date?
-    @Published private(set) var rawCount = 0
     @Published var browserSource: BrowserSource {
         didSet {
             defaults.set(browserSource.rawValue, forKey: "browserSource.v1")
@@ -537,9 +575,23 @@ final class Library: ObservableObject {
             refresh()
         }
     }
-    /// Browsers that contributed tabs on the latest refresh.
-    @Published private(set) var connectedBrowsers: [Browser] = []
-    @Published var sample = ProcessInfo.processInfo.arguments.contains("--sample")
+    let sample = ProcessInfo.processInfo.arguments.contains("--sample")
+
+    var connectedBrowsers: [Browser] {
+        if case .synced(let browsers, _, _, _) = syncState { browsers } else { [] }
+    }
+
+    var rawCount: Int {
+        if case .synced(_, let count, _, _) = syncState { count } else { 0 }
+    }
+
+    var lastUpdated: Date? {
+        if case .synced(_, _, let updated, _) = syncState { updated } else { nil }
+    }
+
+    var hasLiveSync: Bool {
+        if case .synced = syncState { true } else { false }
+    }
 
     var activeSourceLabel: String {
         if !connectedBrowsers.isEmpty { return connectedBrowsers.map(\.name).joined(separator: ", ") }
@@ -551,7 +603,7 @@ final class Library: ObservableObject {
         if browserSource != .all { return browserSource.browsers.first }
         return connectedBrowsers.first ?? Browser.allCases.first(where: \.isRunning)
     }
-    /// Pages saved to Read later, newest first. They outlive their Helium tabs.
+    /// Pages saved to Read later, newest first. They outlive their browser tabs.
     @Published private(set) var later: [SavedSource] { didSet { laterAddresses = Set(later.map(\.address)); filingCache = nil } }
     /// Cached: `category(for:)` checks it for every tab on every render.
     private var laterAddresses: Set<String> = []
@@ -559,7 +611,6 @@ final class Library: ObservableObject {
     @Published private(set) var bookmarks: [Bookmark] { didSet { rebuildBookmarkLookup() } }
     private var bookmarkAddresses: Set<String> = []
     private var bookmarkKeys: Set<String> = []
-    static let bookmarksID = "__bookmarks__"
     /// Memoized filing results so LibraryView redraws don't re-run every rule across every tab.
     private struct FilingCache {
         let byAddress: [String: Category]
@@ -636,6 +687,7 @@ final class Library: ObservableObject {
             return
         }
         updating = true
+        if case .idle = syncState { syncState = .loading }
         error = nil
         let source = browserSource
         refreshTask = Task {
@@ -647,11 +699,12 @@ final class Library: ObservableObject {
             let targets = source.browsers.filter(\.isRunning)
             guard !targets.isEmpty else {
                 // Saved Read later pages outlive browser tabs, so keep them visible even when closed.
-                connectedBrowsers = []
-                tabs = withSaved([])
-                error = source == .all
+                let reason = source == .all
                     ? "Open Helium, Chrome, or Safari to import open tabs."
                     : "Open \(source.title) to import its tabs."
+                syncState = .disconnected(reason: reason)
+                tabs = withSaved([])
+                error = reason
                 return
             }
 
@@ -683,18 +736,16 @@ final class Library: ObservableObject {
             let succeeded = Browser.allCases.filter { results[$0] != nil }
             if !succeeded.isEmpty {
                 let imported = succeeded.flatMap { results[$0] ?? [] }
-                connectedBrowsers = succeeded
-                rawCount = imported.count
+                let warning = failures.isEmpty ? nil : failures.joined(separator: " ")
+                syncState = .synced(browsers: succeeded, rawCount: imported.count, updated: .now, warning: warning)
                 tabs = withSaved(Self.merge(imported.filter { !finished.contains($0.copyKey) }))
-                lastUpdated = .now
                 pruneAgentShelves()
-                if !failures.isEmpty {
-                    self.error = failures.joined(separator: " ")
-                }
+                self.error = warning
             } else {
-                connectedBrowsers = []
+                let reason = failures.joined(separator: " ")
+                syncState = .disconnected(reason: reason)
                 if tabs.isEmpty { tabs = withSaved([]) }
-                self.error = failures.joined(separator: " ")
+                self.error = reason
             }
         }
     }
@@ -711,8 +762,8 @@ final class Library: ObservableObject {
         }
         for tab in sorted where !tab.isInternal {
             if var existing = byAddress[tab.address] {
-                if let browser = tab.browser {
-                    existing.duplicates.append(BrowserTab.Copy(browser: browser, windowID: tab.windowID, id: tab.rawID, address: tab.address))
+                if case .browser(let browser, let windowID, let tabID) = tab.origin {
+                    existing.duplicates.append(BrowserTab.Copy(browser: browser, windowID: windowID, id: tabID, address: tab.address))
                 }
                 byAddress[tab.address] = existing
             } else {
@@ -731,15 +782,17 @@ final class Library: ObservableObject {
 
     func isSaved(_ tab: BrowserTab) -> Bool { laterAddresses.contains(tab.address) }
 
-    /// Puts a page on the Read later shelf and, optionally, closes its browser tab(s).
-    func saveForLater(_ tab: BrowserTab, closeInBrowser: Bool) {
-        guard tab.readableURL != nil else { return }
+    /// Puts a page on the Read later shelf and, optionally, closes its open browser tab(s).
+    /// Returns true if open browser tabs are actually being closed.
+    @discardableResult
+    func saveForLater(_ tab: BrowserTab, closeInBrowser: Bool) -> Bool {
+        guard tab.readableURL != nil else { return false }
         if !isSaved(tab) {
             later.insert(SavedSource(address: tab.address, title: tab.displayTitle, saved: .now), at: 0)
             saveLater()
         }
-        let copies = tab.copies.filter { $0.windowID != SavedSource.windowID && !closed.contains($0.key) }
-        guard closeInBrowser, !sample, !copies.isEmpty else { return }
+        let copies = tab.copies.filter { !closed.contains($0.key) }
+        guard closeInBrowser, !sample, !copies.isEmpty else { return false }
         copies.forEach { finished.insert($0.key); closed.insert($0.key) }
         if let index = tabs.firstIndex(where: { $0.address == tab.address }),
            let saved = later.first(where: { $0.address == tab.address }) {
@@ -750,13 +803,14 @@ final class Library: ObservableObject {
             do { try await Browsers.close(copies) }
             catch { self.error = "Couldn’t close the tab in \(label): \(error.localizedDescription)" }
         }
+        return true
     }
 
-    /// Takes a page off Read later. If its Helium tab is still open it goes back to its usual shelf.
+    /// Takes a page off Read later. If its browser tab is still open it goes back to its usual shelf.
     func removeFromLater(_ address: String) {
         later.removeAll { $0.address == address }
         saveLater()
-        tabs.removeAll { $0.windowID == SavedSource.windowID && $0.address == address }
+        tabs.removeAll { $0.origin == .readLater && $0.address == address }
     }
 
     private func saveLater() {
@@ -854,7 +908,7 @@ final class Library: ObservableObject {
         finishedToday = (defaults.string(forKey: "finished.day") == today ? finishedToday : 0) + 1
         defaults.set(today, forKey: "finished.day")
         defaults.set(finishedToday, forKey: "finished.count")
-        let copies = tab.copies.filter { $0.windowID != SavedSource.windowID && !closed.contains($0.key) }
+        let copies = tab.copies.filter { !closed.contains($0.key) }
         guard closeInBrowser, !sample, !copies.isEmpty else { return }
         copies.forEach { closed.insert($0.key) }
         let label = tab.browserLabel
@@ -1030,9 +1084,9 @@ final class Library: ObservableObject {
     }
 
     func assign(_ tab: BrowserTab, to id: String?) {
-        if id == Category.laterID { return saveForLater(tab, closeInBrowser: false) }
-        // A saved page with no open browser tab only exists on Read later, so it stays there.
-        guard tab.windowID != SavedSource.windowID else { return }
+        if id == Category.laterID { saveForLater(tab, closeInBrowser: false); return }
+        // A saved or bookmarked page without a live tab doesn't move to other shelves.
+        guard tab.origin != .readLater && tab.origin != .bookmark else { return }
         if isSaved(tab) {
             later.removeAll { $0.address == tab.address }
             saveLater()
@@ -1160,7 +1214,7 @@ final class Library: ObservableObject {
         ("Research notes · Google Docs", "https://docs.google.com/"),
         ("Compiler design lecture · YouTube", "https://www.youtube.com/"),
         ("Paul Graham — How to Do Great Work", "https://paulgraham.com/greatwork.html"),
-    ].enumerated().map { index, entry in
-        BrowserTab(id: String(index), windowID: "1", title: entry.0, address: entry.1)
+    ].map { entry in
+        BrowserTab(origin: .sample, title: entry.0, address: entry.1)
     }
 }

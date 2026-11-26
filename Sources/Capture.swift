@@ -6,15 +6,20 @@ import Foundation
 struct Excerpt: Equatable {
     enum Kind: Equatable { case prose, code(language: String?) }
 
+    /// Where the excerpt came from: PDF page labels cannot exist without a page number.
+    enum Location: Equatable {
+        case web
+        /// 1-based PDF page, and the label printed on it (which can be "iv" or "12").
+        case pdf(page: Int, label: String?)
+    }
+
     /// Markdown-ready text: math is already `$…$` / `$$…$$`.
     var text: String
     /// The text as rendered on the page, for the scroll-to-text link.
     var plain: String
     var kind: Kind = .prose
     var section: String?
-    /// 1-based PDF page, and the label printed on it (which can be "iv" or "12").
-    var page: Int?
-    var pageLabel: String?
+    var location: Location = .web
     var sourceTitle: String
     var sourceURL: URL
     /// Where the selection sits, in the reading pane's coordinates (top-left origin).
@@ -23,22 +28,24 @@ struct Excerpt: Equatable {
     /// A link back to exactly this passage: `#page=N` for PDFs, a text fragment for web pages.
     var link: URL {
         guard var components = URLComponents(url: sourceURL, resolvingAgainstBaseURL: false) else { return sourceURL }
-        if let page {
+        switch location {
+        case .pdf(let page, _):
             components.fragment = "page=\(page)"
             return components.url ?? sourceURL
+        case .web:
+            let words = plain.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard !words.isEmpty, case .prose = kind else { return sourceURL }
+            let directive: String
+            if words.count <= 8 {
+                directive = Self.fragmentEncode(words.joined(separator: " "))
+            } else {
+                directive = Self.fragmentEncode(words.prefix(4).joined(separator: " ")) + ","
+                    + Self.fragmentEncode(words.suffix(4).joined(separator: " "))
+            }
+            components.fragment = nil
+            guard let base = components.url?.absoluteString else { return sourceURL }
+            return URL(string: base + "#:~:text=" + directive) ?? sourceURL
         }
-        let words = plain.split(whereSeparator: \.isWhitespace).map(String.init)
-        guard !words.isEmpty, case .prose = kind else { return sourceURL }
-        let directive: String
-        if words.count <= 8 {
-            directive = Self.fragmentEncode(words.joined(separator: " "))
-        } else {
-            directive = Self.fragmentEncode(words.prefix(4).joined(separator: " ")) + ","
-                + Self.fragmentEncode(words.suffix(4).joined(separator: " "))
-        }
-        components.fragment = nil
-        guard let base = components.url?.absoluteString else { return sourceURL }
-        return URL(string: base + "#:~:text=" + directive) ?? sourceURL
     }
 
     private static let fragmentSafe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~")
@@ -51,7 +58,9 @@ struct Excerpt: Equatable {
         var parts: [String] = []
         if let section = section?.trimmed, !section.isEmpty,
            section.caseInsensitiveCompare(sourceTitle.trimmed) != .orderedSame { parts.append(section) }
-        if let page { parts.append("p. " + (pageLabel?.trimmed.isEmpty == false ? pageLabel! : String(page))) }
+        if case .pdf(let page, let label) = location {
+            parts.append("p. " + (label?.trimmed.nonEmpty ?? String(page)))
+        }
         return parts
     }
 
@@ -78,7 +87,9 @@ struct Excerpt: Equatable {
         var place: [String] = []
         if let section = section?.trimmed, !section.isEmpty,
            section.caseInsensitiveCompare(sourceTitle.trimmed) != .orderedSame { place.append("in the section “\(section)”") }
-        if let page { place.append("on page " + (pageLabel?.trimmed.isEmpty == false ? pageLabel! : String(page))) }
+        if case .pdf(let page, let label) = location {
+            place.append("on page " + (label?.trimmed.nonEmpty ?? String(page)))
+        }
         if !place.isEmpty { context += ", " + place.joined(separator: ", ") }
         context += ". Here’s the passage I’m asking about:"
         let passage: String

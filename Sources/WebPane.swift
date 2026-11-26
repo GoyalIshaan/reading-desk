@@ -3,21 +3,29 @@ import WebKit
 
 @MainActor
 final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
+    enum LoadStatus: Equatable {
+        case idle
+        case loading
+        case failed(String)
+    }
+
     struct State: Equatable {
         var url: URL?
         var title: String?
         var back = false
         var forward = false
-        var loading = false
+        var status: LoadStatus = .idle
+
+        var loading: Bool { if case .loading = status { true } else { false } }
     }
 
     @Published private(set) var state = State()
-    @Published private(set) var failure: String?
-    @Published private(set) var openedPage: WebPage?
+    /// Stack of in-pane popups opened via `window.open`; top of stack is displayed.
+    @Published private(set) var openedPages: [WebPage] = []
+    var openedPage: WebPage? { openedPages.last }
 
     private var observations: [NSKeyValueObservation] = []
     private weak var opener: WebPage?
-    private var openedPages: [WebPage] = []
     private var requested: URL?
     private var suppliedConfiguration: WKWebViewConfiguration?
     /// The reading pane reports selections and scroll position; chat panes don't.
@@ -76,20 +84,22 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
 
     private func update() {
         let pageTitle = view.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let status: LoadStatus = switch state.status {
+        case .failed(let message) where !view.isLoading: .failed(message)
+        default: view.isLoading ? .loading : .idle
+        }
         let next = State(url: view.url ?? requested, title: pageTitle?.isEmpty == false ? pageTitle : nil,
-                         back: view.canGoBack, forward: view.canGoForward, loading: view.isLoading)
+                         back: view.canGoBack, forward: view.canGoForward, status: status)
         if next != state { state = next }
     }
 
     func load(_ url: URL) {
-        if openedPage != nil {
+        if !openedPages.isEmpty {
             for child in openedPages { child.view.stopLoading() }
             openedPages.removeAll()
-            openedPage = nil
         }
-        failure = nil
         requested = url
-        let next = State(url: url, title: nil, back: view.canGoBack, forward: view.canGoForward, loading: true)
+        let next = State(url: url, title: nil, back: view.canGoBack, forward: view.canGoForward, status: .loading)
         if next != state { state = next }
         if url.isFileURL {
             view.loadFileURL(url, allowingReadAccessTo: url)
@@ -102,14 +112,14 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     func unload() {
         for child in openedPages { child.view.stopLoading() }
         openedPages.removeAll()
-        openedPage = nil
         view.stopLoading()
         view.loadHTMLString("", baseURL: nil)
         requested = nil
+        state = State()
     }
 
     func retry() {
-        if failure != nil, let url = state.url ?? requested { load(url) }
+        if case .failed = state.status, let url = state.url ?? requested { load(url) }
         else { view.reload() }
     }
 
@@ -120,7 +130,7 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        failure = nil
+        state.status = .loading
         update()
     }
 
@@ -173,12 +183,12 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     private func fail(_ error: Error) {
         let nsError = error as NSError
         if nsError.code == NSURLErrorCancelled || (nsError.domain == "WebKitErrorDomain" && nsError.code == 102) { return }
-        failure = error.localizedDescription
+        state.status = .failed(error.localizedDescription)
         update()
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        failure = "The page stopped responding."
+        state.status = .failed("The page stopped responding.")
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
@@ -234,7 +244,6 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         child.menuItems = { [weak self] in self?.menuItems?() ?? [] }
         let childView = child.view
         openedPages.append(child)
-        openedPage = child
         return childView
     }
 
@@ -246,7 +255,6 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         guard openedPages.contains(where: { $0 === page }) else { return }
         page.view.stopLoading()
         openedPages.removeAll { $0 === page }
-        if openedPage === page { openedPage = openedPages.last }
         onDismissOpened?()
     }
 
@@ -319,12 +327,15 @@ struct BrowserPane: View {
     var body: some View {
         ZStack(alignment: .topTrailing) {
             WebSurface(page: page)
-            if let failure = page.failure {
+            switch page.state.status {
+            case .failed(let failure):
                 FailureView(page: page, message: failure)
-            } else if page.state.loading {
+            case .loading:
                 LoadingStreak()
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .allowsHitTesting(false)
+            case .idle:
+                EmptyView()
             }
             if showsChrome {
                 // Bottom-right: site nav bars live at the top, so this rarely covers anything.

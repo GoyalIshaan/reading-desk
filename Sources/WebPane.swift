@@ -5,6 +5,7 @@ import WebKit
 final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
     struct State: Equatable {
         var url: URL?
+        var title: String?
         var back = false
         var forward = false
         var loading = false
@@ -66,6 +67,7 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
             })
         }
         watch(\.url)
+        watch(\.title)
         watch(\.canGoBack)
         watch(\.canGoForward)
         watch(\.isLoading)
@@ -73,8 +75,9 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     }()
 
     private func update() {
-        let next = State(url: view.url ?? requested, back: view.canGoBack,
-                         forward: view.canGoForward, loading: view.isLoading)
+        let pageTitle = view.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let next = State(url: view.url ?? requested, title: pageTitle?.isEmpty == false ? pageTitle : nil,
+                         back: view.canGoBack, forward: view.canGoForward, loading: view.isLoading)
         if next != state { state = next }
     }
 
@@ -86,7 +89,7 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         }
         failure = nil
         requested = url
-        let next = State(url: url, back: view.canGoBack, forward: view.canGoForward, loading: true)
+        let next = State(url: url, title: nil, back: view.canGoBack, forward: view.canGoForward, loading: true)
         if next != state { state = next }
         if url.isFileURL {
             view.loadFileURL(url, allowingReadAccessTo: url)
@@ -306,6 +309,8 @@ struct WebSurface: NSViewRepresentable {
 struct BrowserPane: View {
     @ObservedObject var page: WebPage
     var showsChrome = true
+    var isBookmarked: ((URL) -> Bool)? = nil
+    var onBookmark: ((URL, String?) -> Void)? = nil
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -328,7 +333,7 @@ struct BrowserPane: View {
         .accessibilityHidden(page.openedPage != nil)
         .overlay {
             if let opened = page.openedPage {
-                InPanePage(page: opened) { page.dismiss(opened) }
+                InPanePage(page: opened, isBookmarked: isBookmarked, onBookmark: onBookmark) { page.dismiss(opened) }
                     .id(ObjectIdentifier(opened))
             }
         }
@@ -337,26 +342,37 @@ struct BrowserPane: View {
 
 private struct InPanePage: View {
     @ObservedObject var page: WebPage
+    var isBookmarked: ((URL) -> Bool)? = nil
+    var onBookmark: ((URL, String?) -> Void)? = nil
     let close: () -> Void
 
     var body: some View {
+        let url = page.state.url
+        let bookmarked = url.flatMap { isBookmarked?($0) } ?? false
         VStack(spacing: 0) {
             HStack(spacing: 3) {
                 DeskIcon("chevron.left", help: "Go back") { page.view.goBack() }
                     .disabled(!page.state.back)
                 DeskIcon("chevron.right", help: "Go forward") { page.view.goForward() }
                     .disabled(!page.state.forward)
-                Text(page.state.url?.host ?? "New page")
+                Text(page.state.title ?? page.state.url?.host ?? "New page")
                     .font(Theme.sans(12, .medium))
                     .foregroundStyle(Theme.ink2)
                     .lineLimit(1)
                 Spacer(minLength: 4)
+                if let url, let onBookmark {
+                    DeskIcon(bookmarked ? "bookmark.fill" : "bookmark",
+                             help: bookmarked ? "Remove bookmark (⌘D)" : "Bookmark this page (⌘D)") {
+                        onBookmark(url, page.state.title)
+                    }
+                    .foregroundStyle(bookmarked ? Theme.accent : Theme.ink3)
+                }
                 DeskIcon("xmark", help: "Close this page", action: close)
             }
             .padding(.horizontal, 10)
             .frame(height: 37)
             Hairline()
-            BrowserPane(page: page, showsChrome: false)
+            BrowserPane(page: page, showsChrome: false, isBookmarked: isBookmarked, onBookmark: onBookmark)
         }
         .background(Theme.ground)
     }

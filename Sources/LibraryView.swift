@@ -10,11 +10,30 @@ struct LibraryView: View {
     let titleBarHeight: CGFloat
     /// Shelf, tab to start on, and where the tapped card sits on screen (for the hero transition).
     let open: (String, BrowserTab?, CGRect?) -> Void
+    var onToggleBookmark: (BrowserTab) -> Void = { _ in }
+    var onRemoveBookmark: (Bookmark) -> Void = { _ in }
+
+    @State private var bookmarkQuery = ""
 
     private let margin: CGFloat = 48
     private let gutter: CGFloat = 28
     /// Searching lives in the ⌘⇧P palette now; the library always shows everything.
     private let query = ""
+
+    private var showingBookmarks: Bool { selectedCategory == Library.bookmarksID }
+
+    private func filteredBookmarks() -> [Bookmark] {
+        let q = bookmarkQuery.trimmed
+        guard !q.isEmpty else { return library.bookmarks }
+        return library.bookmarks.filter { item in
+            let preview = previews.info[item.address]
+            return item.title.localizedCaseInsensitiveContains(q)
+                || item.address.localizedCaseInsensitiveContains(q)
+                || (item.note?.localizedCaseInsensitiveContains(q) ?? false)
+                || (preview?.summary?.localizedCaseInsensitiveContains(q) ?? false)
+                || (preview?.siteName?.localizedCaseInsensitiveContains(q) ?? false)
+        }
+    }
 
     private func matching(_ tabs: [BrowserTab]) -> [BrowserTab] {
         query.isEmpty ? tabs : tabs.filter { tab in
@@ -56,7 +75,11 @@ struct LibraryView: View {
                     masthead(ordered, totals: totals)
                         .padding(.top, 30)
                     Hairline().padding(.top, 22)
-                    if library.tabs.isEmpty {
+                    if showingBookmarks {
+                        let shown = filteredBookmarks()
+                        bookmarksSummary(shown).padding(.vertical, 18)
+                        bookmarksGrid(shown, columns: columns, width: columnWidth, shared: shared)
+                    } else if library.tabs.isEmpty {
                         empty.padding(.top, 60)
                     } else if let selected {
                         let children = library.visibleChildren(of: selected.id, totals: totals)
@@ -107,7 +130,7 @@ struct LibraryView: View {
         }
         .onChange(of: library.categories) { old, new in
             // If the open shelf was deleted, fall back to its parent.
-            guard let id = selectedCategory, !new.contains(where: { $0.id == id }) else { return }
+            guard let id = selectedCategory, id != Library.bookmarksID, !new.contains(where: { $0.id == id }) else { return }
             let parent = old.first { $0.id == id }?.parentID
             selectedCategory = parent.flatMap { parent in new.contains { $0.id == parent } ? parent : nil }
         }
@@ -115,6 +138,10 @@ struct LibraryView: View {
 
     /// ⌘[ goes up one level.
     private func goUp() {
+        if showingBookmarks {
+            select(nil)
+            return
+        }
         select(selectedCategory.flatMap { library.category(withID: $0)?.parentID })
     }
 
@@ -149,7 +176,7 @@ struct LibraryView: View {
     /// The shelf index: big Garamond words with superscript counts, plus a smaller
     /// row of sub-shelves for each level of the current selection.
     private func masthead(_ ordered: [Category], totals: [String: Int]) -> some View {
-        let path = selectedCategory.map { library.tree.path(of: $0) } ?? []
+        let path = selectedCategory.flatMap { $0 == Library.bookmarksID ? nil : library.tree.path(of: $0) } ?? []
         let rows = path.enumerated().compactMap { depth, shelf -> (parent: Category, children: [Category], selected: String?)? in
             let children = library.visibleChildren(of: shelf.id, totals: totals)
             guard !children.isEmpty else { return nil }
@@ -158,6 +185,11 @@ struct LibraryView: View {
         return VStack(alignment: .leading, spacing: 0) {
             FlowLayout(spacing: 30, lineSpacing: 2) {
                 ShelfWord(name: "All", count: library.tabs.count, selected: selectedCategory == nil) { select(nil) }
+                ShelfWord(name: "Bookmarks", count: library.bookmarks.count,
+                          selected: showingBookmarks,
+                          mark: library.bookmarks.isEmpty ? "bookmark" : "bookmark.fill",
+                          markHelp: "Pages you bookmarked to revisit anytime (⌥⌘B)",
+                          showZero: false) { select(Library.bookmarksID) }
                 ForEach(ordered) { category in
                     ShelfWord(name: category.name, count: totals[category.id] ?? 0,
                               selected: path.first?.id == category.id, agent: category.isAgentMade) { select(category.id) }
@@ -282,13 +314,101 @@ struct LibraryView: View {
                        shelves: library.tree, currentCategory: category.id,
                        readIn: readIn, closeInHelium: closeInHelium,
                        noteCount: notes.count(for: tab.address), saved: library.isSaved(tab),
+                       bookmarked: library.isBookmarked(tab),
                        open: { _ in open(readIn ?? category.id, tab, nil) },
                        done: { library.finish(tab, closeInHelium: closeInHelium) },
                        readLater: { library.saveForLater(tab, closeInHelium: closeInHelium) },
                        removeFromLater: { library.removeFromLater(tab.address) },
+                       toggleBookmark: { onToggleBookmark(tab) },
                        assign: { library.assign(tab, to: $0) },
                        fileSite: { library.fileSite(of: tab, in: $0) })
             .equatable()
+            .onAppear { previews.request(tab) }
+    }
+
+    private func bookmarksSummary(_ bookmarks: [Bookmark]) -> some View {
+        let tabs = bookmarks.map(\.tab)
+        return HStack(alignment: .center, spacing: 14) {
+            Text(bookmarks.count == 1 ? "1 bookmark" : "\(bookmarks.count) bookmarks")
+                .font(Theme.mono(11)).foregroundStyle(Theme.ink2)
+            if let time = readingTime(tabs) {
+                Text("≈ \(time) of reading").font(Theme.mono(11)).foregroundStyle(Theme.ink3)
+            }
+            Spacer()
+            if !library.bookmarks.isEmpty {
+                HStack(spacing: 7) {
+                    Image(systemName: "magnifyingglass").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.ink4)
+                    TextField("Filter bookmarks…", text: $bookmarkQuery)
+                        .textFieldStyle(.plain)
+                        .font(Theme.sans(12.5))
+                        .foregroundStyle(Theme.ink)
+                        .frame(width: 190)
+                    if !bookmarkQuery.isEmpty {
+                        Button { bookmarkQuery = "" } label: {
+                            Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundStyle(Theme.ink3)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 10).frame(height: 30)
+                .background(Capsule().fill(Theme.surface))
+                .overlay(Capsule().strokeBorder(Theme.rule))
+            }
+            if let first = tabs.first(where: { $0.readableURL != nil }) {
+                Button { open(Library.bookmarksID, first, nil) } label: {
+                    HStack(spacing: 7) { Text("Begin reading"); Image(systemName: "arrow.right").font(.system(size: 10.5, weight: .semibold)) }
+                }
+                .buttonStyle(DeskButtonStyle(.primary))
+                .keyboardShortcut(.return, modifiers: .command)
+                .help("Open your bookmarks in the reader (⌘↩)")
+            }
+        }
+    }
+
+    private func bookmarksGrid(_ bookmarks: [Bookmark], columns: Int, width: CGFloat,
+                               shared: (images: Set<String>, summaries: Set<String>)) -> some View {
+        Group {
+            if library.bookmarks.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("No bookmarks yet.").font(Theme.serif(40)).foregroundStyle(Theme.ink)
+                    Text("Press ⌘D or click the bookmark icon while reading any page worth keeping. Bookmarks stay here even after you mark a tab done.")
+                        .font(Theme.sans(13.5)).foregroundStyle(Theme.ink3)
+                        .frame(maxWidth: 520, alignment: .leading)
+                }
+                .padding(.top, 42)
+            } else if bookmarks.isEmpty {
+                Text("No bookmarks match “\(bookmarkQuery)”.")
+                    .font(Theme.serif(20, italic: true)).foregroundStyle(Theme.ink3).padding(.vertical, 30)
+            } else {
+                HStack(alignment: .top, spacing: gutter) {
+                    ForEach(0..<columns, id: \.self) { column in
+                        LazyVStack(alignment: .leading, spacing: 34) {
+                            ForEach(Array(bookmarks.enumerated()).filter { $0.offset % columns == column }, id: \.element.id) { _, entry in
+                                bookmarkCard(entry, width: width, shared: shared)
+                            }
+                        }
+                        .frame(width: width)
+                    }
+                }
+            }
+        }
+    }
+
+    private func bookmarkCard(_ bookmark: Bookmark, width: CGFloat,
+                              shared: (images: Set<String>, summaries: Set<String>)) -> some View {
+        let tab = bookmark.tab
+        var preview = previews.info[tab.address]
+        var image = previews.images[tab.address]
+        if let url = preview?.imageURL, shared.images.contains(url), preview?.isPDF != true { image = nil }
+        if let summary = preview?.summary, shared.summaries.contains(summary) { preview?.summary = nil }
+        return BookmarkCard(bookmark: bookmark, preview: preview, image: image,
+                            icon: previews.icons[tab.host], width: width,
+                            noteCount: notes.count(for: tab.address),
+                            onReadLater: library.isSaved(tab),
+                            open: { open(Library.bookmarksID, tab, nil) },
+                            remove: { onRemoveBookmark(bookmark) },
+                            readLater: { library.saveForLater(tab, closeInHelium: false) },
+                            update: { title, note in library.updateBookmark(address: bookmark.address, title: title, note: note) })
             .onAppear { previews.request(tab) }
     }
 
@@ -324,6 +444,9 @@ private struct ShelfWord: View {
     let count: Int
     let selected: Bool
     var agent = false
+    var mark: String? = nil
+    var markHelp: String? = nil
+    var showZero = true
     var size: CGFloat = 42
     let action: () -> Void
     @State private var hovered = false
@@ -335,24 +458,31 @@ private struct ShelfWord: View {
                     .font(Theme.serif(size, italic: selected))
                     .tracking(-0.6 * size / 42)
                     .foregroundStyle(selected ? Theme.ink : hovered ? Theme.ink2 : Theme.ink3.opacity(0.7))
-                if agent {
+                if let mark {
+                    Image(systemName: mark).font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(selected ? Theme.accent : count > 0 ? Theme.accent.opacity(0.75) : Theme.ink4)
+                        .padding(.top, 10)
+                        .help(markHelp ?? "")
+                } else if agent {
                     // Shelves an agent made: same type, a small mark so you know who filed them.
                     Image(systemName: "sparkle").font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(selected ? Theme.accent : Theme.ink4)
                         .padding(.top, 10)
                         .help("Sorted by an agent. This shelf goes away once its tabs are read.")
                 }
-                Text("\(count)")
-                    .font(Theme.mono(size < 30 ? 10 : 11, .medium))
-                    .foregroundStyle(selected ? Theme.accent : Theme.ink4)
-                    .padding(.top, size * 9 / 42)
+                if count > 0 || showZero {
+                    Text("\(count)")
+                        .font(Theme.mono(size < 30 ? 10 : 11, .medium))
+                        .foregroundStyle(selected ? Theme.accent : Theme.ink4)
+                        .padding(.top, size * 9 / 42)
+                }
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hovered = $0 }
         .animation(.easeOut(duration: 0.15), value: hovered)
-        .accessibilityLabel("\(name), \(count) tabs")
+        .accessibilityLabel("\(name), \(count) items")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
@@ -371,11 +501,13 @@ struct TabCard: View, Equatable {
     var closeInHelium = true
     var noteCount = 0
     var saved = false
+    var bookmarked = false
     /// Called with the card's cover frame in window coordinates.
     let open: (CGRect) -> Void
     let done: () -> Void
     var readLater: () -> Void = {}
     var removeFromLater: () -> Void = {}
+    var toggleBookmark: () -> Void = {}
     let assign: (String?) -> Void
     let fileSite: (String) -> Void
 
@@ -386,6 +518,7 @@ struct TabCard: View, Equatable {
             && lhs.currentCategory == rhs.currentCategory && lhs.readIn == rhs.readIn
             && lhs.closeInHelium == rhs.closeInHelium
             && lhs.noteCount == rhs.noteCount && lhs.saved == rhs.saved
+            && lhs.bookmarked == rhs.bookmarked
             && lhs.shelves == rhs.shelves
     }
 
@@ -426,6 +559,12 @@ struct TabCard: View, Equatable {
                             .help("Open \(tab.copies.count) times in Helium. Done closes every copy.")
                     }
                     Spacer(minLength: 6)
+                    if bookmarked {
+                        Image(systemName: "bookmark.fill")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(Theme.accent)
+                            .help("Bookmarked")
+                    }
                     if noteCount > 0 {
                         HStack(spacing: 3) {
                             Image(systemName: "pencil.line").font(.system(size: 9, weight: .medium))
@@ -490,10 +629,18 @@ struct TabCard: View, Equatable {
     private var actions: some View {
         HStack(spacing: 2) {
             CardAction(symbol: "checkmark", help: "Mark done") { done() }
+            if tab.readableURL != nil {
+                CardAction(symbol: bookmarked ? "bookmark.fill" : "bookmark",
+                           help: bookmarked ? "Remove bookmark" : "Bookmark",
+                           active: bookmarked) { toggleBookmark() }
+            }
             if tab.readableURL != nil && !saved {
-                CardAction(symbol: "bookmark", help: "Read later") { readLater() }
+                CardAction(symbol: "clock", help: "Read later") { readLater() }
             }
             Menu {
+                if tab.readableURL != nil {
+                    Button(bookmarked ? "Remove bookmark" : "Bookmark") { toggleBookmark() }
+                }
                 if saved {
                     Button("Remove from Read later") { removeFromLater() }
                 } else if tab.readableURL != nil {
@@ -568,6 +715,7 @@ private struct ShelfMenuItems: View {
 private struct CardAction: View {
     let symbol: String
     let help: String
+    var active = false
     let action: () -> Void
     @State private var hovered = false
 
@@ -575,13 +723,221 @@ private struct CardAction: View {
         Button(action: action) {
             Image(systemName: symbol).font(.system(size: 11, weight: .semibold))
                 .frame(width: 28, height: 28)
-                .foregroundStyle(hovered ? Theme.accentInk : Theme.ink)
+                .foregroundStyle(hovered ? Theme.accentInk : active ? Theme.accent : Theme.ink)
                 .background(Circle().fill(hovered ? Theme.accent : .clear))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .onHover { hovered = $0 }
         .help(help)
+    }
+}
+
+/// A saved bookmark card: same editorial look as TabCard, plus saved date,
+/// optional personal note, and edit/remove controls (never marked Done).
+private struct BookmarkCard: View {
+    let bookmark: Bookmark
+    let preview: PagePreview?
+    let image: NSImage?
+    let icon: NSImage?
+    let width: CGFloat
+    var noteCount = 0
+    var onReadLater = false
+    let open: () -> Void
+    let remove: () -> Void
+    let readLater: () -> Void
+    let update: (String, String?) -> Void
+
+    @State private var hovered = false
+    @State private var editing = false
+
+    private var tab: BrowserTab { bookmark.tab }
+
+    private var title: String {
+        let savedTitle = bookmark.title.trimmed
+        if !savedTitle.isEmpty { return savedTitle }
+        return preview?.title ?? tab.displayTitle
+    }
+
+    private var coverHeight: CGFloat {
+        if image != nil, let aspect = preview?.aspect { return width * min(max(aspect, 0.42), 0.85) }
+        return width * 0.58
+    }
+
+    private var post: XPost? { image == nil ? XPost(tab: tab, preview: preview) : nil }
+
+    private var savedLabel: String {
+        if Calendar.current.isDateInToday(bookmark.saved) { return "Today" }
+        if Calendar.current.isDateInYesterday(bookmark.saved) { return "Yesterday" }
+        let sameYear = Calendar.current.component(.year, from: bookmark.saved) == Calendar.current.component(.year, from: .now)
+        return bookmark.saved.formatted(sameYear ? .dateTime.month(.abbreviated).day() : .dateTime.month(.abbreviated).day().year())
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            cover
+                .frame(width: width, height: coverHeight)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.white.opacity(hovered || editing ? 0.14 : 0.06)))
+                .overlay(alignment: .topTrailing) { if hovered || editing { actions.padding(8).transition(.opacity) } }
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 7) {
+                    Favicon(icon: icon, site: tab.sourceName, size: 14)
+                    Text(preview?.siteName ?? tab.sourceName)
+                        .font(Theme.mono(10.5)).foregroundStyle(Theme.ink3).lineLimit(1)
+                    Spacer(minLength: 6)
+                    if noteCount > 0 {
+                        HStack(spacing: 3) {
+                            Image(systemName: "pencil.line").font(.system(size: 9, weight: .medium))
+                            Text("\(noteCount)").font(Theme.mono(10.5))
+                        }
+                        .foregroundStyle(Theme.accent.opacity(0.85))
+                        .help(noteCount == 1 ? "You have a note on this page" : "You have \(noteCount) notes on this page")
+                    }
+                    if preview?.isPDF == true {
+                        Text("PDF · \(savedLabel)").font(Theme.mono(10.5)).foregroundStyle(Theme.ink4)
+                    } else if let minutes = preview?.minutes {
+                        Text("\(minutes) min · \(savedLabel)").font(Theme.mono(10.5)).foregroundStyle(Theme.ink4)
+                    } else {
+                        Text(savedLabel).font(Theme.mono(10.5)).foregroundStyle(Theme.ink4)
+                    }
+                }
+                Text(post?.byline ?? title)
+                    .font(Theme.serif(20, .medium))
+                    .lineSpacing(-1)
+                    .foregroundStyle(hovered ? Color.white : Theme.ink)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let note = bookmark.note?.trimmed, !note.isEmpty {
+                    Text(note)
+                        .font(Theme.sans(12.5))
+                        .lineSpacing(3)
+                        .foregroundStyle(Theme.ink2)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, 10)
+                        .overlay(alignment: .leading) {
+                            Rectangle().fill(Theme.accent.opacity(0.75)).frame(width: 2)
+                        }
+                } else if post == nil, let summary = preview?.summary, summary.caseInsensitiveCompare(title) != .orderedSame {
+                    Text(summary)
+                        .font(Theme.sans(12.5))
+                        .lineSpacing(3)
+                        .foregroundStyle(Theme.ink3)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.top, 13)
+        }
+        .frame(width: width, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture { open() }
+        .onHover { inside in withAnimation(.easeOut(duration: 0.16)) { hovered = inside } }
+        .help(bookmark.address)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { open() }
+        .accessibilityAction(named: "Remove bookmark", remove)
+    }
+
+    @ViewBuilder private var cover: some View {
+        if let post {
+            PostCover(post: post, hovered: hovered)
+        } else if let image {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: width, height: coverHeight, alignment: .top)
+                .clipped()
+                .overlay(Theme.ground.opacity(hovered ? 0 : 0.14))
+        } else {
+            TypeCover(site: tab.sourceName, icon: icon, loading: preview == nil && tab.readableURL != nil)
+        }
+    }
+
+    private var actions: some View {
+        HStack(spacing: 2) {
+            CardAction(symbol: "note.text", help: bookmark.note == nil ? "Add note" : "Edit note") { editing = true }
+                .popover(isPresented: $editing, arrowEdge: .bottom) {
+                    BookmarkEditorPopover(title: bookmark.title, note: bookmark.note ?? "") { newTitle, newNote in
+                        update(newTitle, newNote)
+                        editing = false
+                    } cancel: {
+                        editing = false
+                    }
+                }
+            CardAction(symbol: "bookmark.fill", help: "Remove bookmark", active: true) { remove() }
+            Menu {
+                Button("Edit bookmark…") { editing = true }
+                if !onReadLater {
+                    Button("Add to Read later") { readLater() }
+                }
+                Divider()
+                if let url = tab.readableURL {
+                    Button("Open in Helium") { Helium.open(url) }
+                    Button("Copy link") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+                    }
+                }
+                Divider()
+                Button("Remove bookmark", role: .destructive) { remove() }
+            } label: {
+                Image(systemName: "ellipsis").font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.ink).frame(width: 28, height: 28)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        }
+        .padding(2)
+        .background(Capsule().fill(Theme.ground.opacity(0.82)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.1)))
+    }
+}
+
+private struct BookmarkEditorPopover: View {
+    @State var title: String
+    @State var note: String
+    let save: (String, String?) -> Void
+    let cancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Edit bookmark").font(Theme.serif(20))
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Title").font(Theme.mono(10.5)).foregroundStyle(Theme.ink3)
+                TextField("Title", text: $title)
+                    .textFieldStyle(.plain)
+                    .font(Theme.sans(13))
+                    .padding(9)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Theme.surface))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.rule))
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Note (optional)").font(Theme.mono(10.5)).foregroundStyle(Theme.ink3)
+                TextField("Why you saved this…", text: $note, axis: .vertical)
+                    .lineLimit(2...5)
+                    .textFieldStyle(.plain)
+                    .font(Theme.sans(12.5))
+                    .padding(9)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Theme.surface))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.rule))
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", action: cancel)
+                    .buttonStyle(DeskButtonStyle(.outline))
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { save(title, note.trimmed.nonEmpty) }
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 340)
+        .background(Theme.ground)
+        .foregroundStyle(Theme.ink)
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -931,7 +1287,7 @@ private struct ShelfForm: View {
                         Button("Keep this shelf") { library.keep(category.id) }.buttonStyle(DeskButtonStyle(.outline))
                     }
                 case .readLater:
-                    Text("Pages you save with Read later (the bookmark on a card or in the reader, or right-click a page). They stay here after their Helium tab closes, until you mark them done.")
+                    Text("Pages you save with Read later (the clock on a card or in the reader, or right-click a page). They stay here after their Helium tab closes, until you mark them done.")
                         .font(Theme.sans(13)).foregroundStyle(Theme.ink3).fixedSize(horizontal: false, vertical: true)
                 case .user:
                     field("Inside", hint: "Sub-shelves are checked before the shelf they sit in, so a tab lands on the deepest shelf that matches.") {

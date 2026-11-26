@@ -143,6 +143,22 @@ struct SavedSource: Codable, Hashable {
     }
 }
 
+/// A page bookmarked to keep and revisit anytime. Unlike Read later,
+/// marking a tab Done never removes a bookmark — it stays until you remove it.
+struct Bookmark: Codable, Identifiable, Hashable {
+    var address: String
+    var title: String
+    var saved: Date
+    var note: String? = nil
+
+    var id: String { address }
+    static let windowID = "bookmark"
+
+    var tab: BrowserTab {
+        BrowserTab(id: Self.windowID + ":" + address, windowID: Self.windowID, title: title, address: address)
+    }
+}
+
 /// Today as `2026-11-24`, in the local time zone (ISO 8601 formatting defaults to UTC).
 func localDay(_ date: Date = .now) -> String {
     let parts = Calendar.current.dateComponents([.year, .month, .day], from: date)

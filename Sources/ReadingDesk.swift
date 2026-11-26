@@ -47,6 +47,8 @@ final class Room: ObservableObject {
     /// its own, and no swipe or back button can lead to another tab (say, one marked done).
     @Published private(set) var reader = WebPage(captures: true)
     private var readerURL: AnyCancellable?
+    /// Tracks the web view's current URL so DeskView updates bookmark status when navigating within a tab.
+    @Published private(set) var pageURL: URL?
     /// Set while the source is a PDF, which reads in PDFKit instead of the web view.
     @Published private var pdf: OpenPaper?
     /// In-flight PDF download/parse; cancelled when switching tabs or closing the room.
@@ -64,9 +66,11 @@ final class Room: ObservableObject {
     private var pdfFailed: Set<URL> = []
     /// The PDF being read, if any, and whether it closes when the web page moves on.
     var paper: PaperReader? { pdf?.reader }
+    var isBookmarks: Bool { categoryID == Library.bookmarksID }
+    var isCurrentBookmarked: (() -> Bool)?
 
     /// What the right-click menu asks for; DeskView carries it out.
-    enum Action { case save, ask(Companion), readLater, bibtex, contents }
+    enum Action { case save, ask(Companion), toggleBookmark, readLater, bibtex, contents }
     let actions = PassthroughSubject<Action, Never>()
 
     var current: BrowserTab? { queue.indices.contains(index) ? queue[index] : nil }
@@ -85,7 +89,9 @@ final class Room: ObservableObject {
             .map(\.url)
             .removeDuplicates()
             .sink { [weak self] url in
-                guard let self, let url else { return }
+                guard let self else { return }
+                self.pageURL = url
+                guard let url else { return }
                 self.excerpt = nil
                 if let pdf = self.pdf, pdf.origin == .followsWeb, url.removingFragment != pdf.reader.url {
                     self.paperTask?.cancel()
@@ -109,7 +115,23 @@ final class Room: ObservableObject {
     }
 
     /// The address of what's on screen: the PDF, the page you navigated to, or the tab.
-    var currentURL: URL? { paper?.url ?? reader.state.url ?? current?.readableURL }
+    var currentURL: URL? { paper?.url ?? reader.state.url ?? pageURL ?? current?.readableURL }
+
+    /// The exact page currently being viewed (including an in-pane popup or link you clicked into).
+    var activePage: (url: URL, title: String)? {
+        if let opened = reader.openedPage, let url = opened.state.url {
+            let title = opened.state.title?.trimmed.nonEmpty ?? url.host ?? url.absoluteString
+            return (url, title)
+        }
+        if let paper {
+            return (paper.url, sourceTitle)
+        }
+        guard let url = reader.state.url ?? pageURL ?? current?.readableURL else { return nil }
+        let navigatedAway = current?.readableURL.map { SourceKey.key(for: $0) != SourceKey.key(for: url) } ?? false
+        let liveTitle = reader.state.title?.trimmed.nonEmpty
+        let title = navigatedAway ? (liveTitle ?? url.host ?? url.absoluteString) : (liveTitle ?? sourceTitle)
+        return (url, title)
+    }
 
     var lastChat: Companion {
         UserDefaults.standard.string(forKey: "lastChat").flatMap(Companion.init(rawValue:)).flatMap { $0 == .notes ? nil : $0 } ?? .chatGPT
@@ -177,7 +199,11 @@ final class Room: ObservableObject {
             }
             items.append(.separator())
         }
-        items.append(ActionMenuItem("Read Later", symbol: "bookmark", handler: send(.readLater)))
+        let bookmarked = isCurrentBookmarked?() ?? false
+        items.append(ActionMenuItem(bookmarked ? "Remove Bookmark" : "Bookmark Page",
+                                    symbol: bookmarked ? "bookmark.fill" : "bookmark",
+                                    handler: send(.toggleBookmark)))
+        items.append(ActionMenuItem("Read Later", symbol: "clock", handler: send(.readLater)))
         if isPaper { items.append(ActionMenuItem("Copy BibTeX", symbol: "quote.bubble", handler: send(.bibtex))) }
         items.append(ActionMenuItem(paper != nil ? "Sections…" : "Headings…", symbol: "list.bullet.indent", handler: send(.contents)))
         return items
@@ -393,9 +419,18 @@ struct DeskView: View {
     @State private var selectedCategory: String?
     /// Library ↔ reader. `reading` and `revealed` are read off this, so they can't disagree.
     @State private var phase: RoomPhase = .library
+    struct Toast: Equatable {
+        let id = UUID()
+        let message: String
+        var actionLabel: String? = nil
+        var action: (() -> Void)? = nil
+
+        static func == (lhs: Toast, rhs: Toast) -> Bool { lhs.id == rhs.id }
+    }
+
     @State private var enteredFullScreen = false
     @State private var fullscreen = false
-    @State private var toast: String?
+    @State private var toast: Toast?
     @State private var paletteOpen = false
     @State private var editingShelves = false
     @State private var toastTask: Task<Void, Never>?
@@ -437,7 +472,8 @@ struct DeskView: View {
         ZStack(alignment: .bottom) {
             // The library stays alive underneath so coming back is instant and keeps its scroll position.
             LibraryView(library: library, previews: previews, notes: vault.index, selectedCategory: $selectedCategory,
-                        closeInHelium: closeInHelium, titleBarHeight: titleBarHeight, open: open)
+                        closeInHelium: closeInHelium, titleBarHeight: titleBarHeight, open: open,
+                        onToggleBookmark: toggleBookmark(for:), onRemoveBookmark: removeBookmark(_:))
                 .opacity(reading && revealed ? 0 : 1)
                 .allowsHitTesting(!reading && !paletteOpen)
                 .disabled(reading || paletteOpen)
@@ -450,23 +486,38 @@ struct DeskView: View {
                 CommandPalette(library: library, previews: previews,
                                fullscreenOnOpen: fullscreenOnOpen, closeInHelium: closeInHelium,
                                resumeOnLaunch: resumeOnLaunch,
+                               reading: reading,
+                               currentBookmarked: library.isBookmarked(room.activePage?.url),
                                close: { withAnimation(.easeOut(duration: 0.14)) { paletteOpen = false } },
                                openTab: { tab in open(library.category(for: tab).id, tab, nil) },
+                               openBookmark: { bookmark in open(Library.bookmarksID, bookmark.tab, nil) },
                                openShelf: showShelf, performCommand: performPaletteCommand)
                     .transition(.opacity)
                     .zIndex(2)
             }
             if let toast {
-                Text(toast)
-                    .font(Theme.sans(12.5, .medium))
-                    .foregroundStyle(Theme.ink)
-                    .padding(.horizontal, 18).frame(height: 36)
-                    .background(Capsule().fill(Theme.raised))
-                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.08)))
-                    .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
-                    .padding(.bottom, reading ? 84 : 26)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                    .allowsHitTesting(false)
+                HStack(spacing: 12) {
+                    Text(toast.message)
+                        .font(Theme.sans(12.5, .medium))
+                        .foregroundStyle(Theme.ink)
+                    if let label = toast.actionLabel, let action = toast.action {
+                        Button(label) {
+                            action()
+                            toastTask?.cancel()
+                            withAnimation(.easeOut(duration: 0.2)) { self.toast = nil }
+                        }
+                        .buttonStyle(.plain)
+                        .font(Theme.sans(12.5, .semibold))
+                        .foregroundStyle(Theme.accent)
+                    }
+                }
+                .padding(.horizontal, 18).frame(height: 36)
+                .background(Capsule().fill(Theme.raised))
+                .overlay(Capsule().strokeBorder(Color.white.opacity(0.08)))
+                .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
+                .padding(.bottom, reading ? 84 : 26)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .allowsHitTesting(toast.action != nil)
             }
         }
         .frame(minWidth: 920, minHeight: 580)
@@ -483,6 +534,9 @@ struct DeskView: View {
         .preferredColorScheme(.dark)
         .sheet(isPresented: $editingShelves) { ShelvesEditor(library: library) }
         .task {
+            room.isCurrentBookmarked = { [weak library, weak room] in
+                library?.isBookmarked(room?.activePage?.url) ?? false
+            }
             if bridge == nil {
                 let bridge = DeskBridge(library: library)
                 bridge.start()
@@ -539,6 +593,7 @@ struct DeskView: View {
             switch action {
             case .save: saveHighlight()
             case .ask(let mode): ask(mode)
+            case .toggleBookmark: toggleBookmark()
             case .readLater: readLater()
             case .bibtex: copyBibTeX()
             case .contents:
@@ -550,6 +605,12 @@ struct DeskView: View {
         .onChange(of: library.autoSortShelves) { _, _ in autoSortIfNeeded() }
         .onReceive(NotificationCenter.default.publisher(for: .openPalette)) { _ in
             withAnimation(.easeOut(duration: 0.14)) { paletteOpen.toggle() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openBookmarks)) { _ in
+            showShelf(Library.bookmarksID)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleBookmark)) { _ in
+            if reading { toggleBookmark() }
         }
         .onReceive(Timer.publish(every: 45, on: .main, in: .common).autoconnect()) { _ in
             // Keep the library in step with Helium while it's on screen.
@@ -567,6 +628,8 @@ struct DeskView: View {
 
     private func performPaletteCommand(_ command: CommandPalette.Command) {
         switch command {
+        case .toggleBookmark: toggleBookmark()
+        case .showBookmarks: showShelf(Library.bookmarksID)
         case .allShelves: showShelf(nil)
         case .refresh: library.refresh()
         case .editShelves: editingShelves = true
@@ -591,14 +654,23 @@ struct DeskView: View {
 
     private func resume(_ session: ReadingMemory.Session?) {
         guard let session else { return }
-        let tab = library.tabs.first { $0.address == session.address }
-            ?? library.tabs.first { SourceKey.key(for: $0.address) == SourceKey.key(for: session.address) && SourceKey.key(for: session.address) != nil }
-        guard let tab else {
+        let target: (categoryID: String, tab: BrowserTab)?
+        if session.categoryID == Library.bookmarksID, let bookmark = library.bookmark(for: session.address) {
+            target = (Library.bookmarksID, bookmark.tab)
+        } else if let tab = library.tabs.first(where: { $0.address == session.address })
+            ?? library.tabs.first(where: { SourceKey.key(for: $0.address) == SourceKey.key(for: session.address) && SourceKey.key(for: session.address) != nil }) {
+            target = (library.category(for: tab).id, tab)
+        } else if let bookmark = library.bookmark(for: session.address) {
+            target = (Library.bookmarksID, bookmark.tab)
+        } else {
+            target = nil
+        }
+        guard let target else {
             showToast("“\(session.title)” isn’t open in Helium any more")
             if !library.sample && library.lastUpdated != nil { ReadingMemory.session = nil }
             return
         }
-        open(library.category(for: tab).id, tab, nil)
+        open(target.categoryID, target.tab, nil)
         guard let path = session.notePath else { return }
         Task {
             if vault.notes.isEmpty { await vault.refresh() }
@@ -647,6 +719,45 @@ struct DeskView: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(excerpt.prompt, forType: .string)
             showToast("Couldn’t reach the \(mode.rawValue) box. The question is on your clipboard")
+        }
+    }
+
+    private func toggleBookmark() {
+        guard let page = room.activePage else { return }
+        toggleBookmark(url: page.url, title: page.title)
+    }
+
+    private func toggleBookmark(url: URL, title: String?) {
+        let address = url.removingFragment.absoluteString
+        let resolvedTitle = title?.trimmed.nonEmpty ?? url.host ?? address
+        let result = library.toggleBookmark(address: address, title: resolvedTitle)
+        if result.added {
+            showToast("Bookmarked")
+        } else {
+            let removed = result.bookmark
+            showToast("Removed from Bookmarks", for: 4, actionLabel: "Undo") {
+                library.restoreBookmark(removed)
+            }
+        }
+    }
+
+    private func toggleBookmark(for tab: BrowserTab) {
+        guard tab.readableURL != nil else { return }
+        let result = library.toggleBookmark(address: tab.address, title: tab.displayTitle)
+        if result.added {
+            showToast("Bookmarked")
+        } else {
+            let removed = result.bookmark
+            showToast("Removed from Bookmarks", for: 4, actionLabel: "Undo") {
+                library.restoreBookmark(removed)
+            }
+        }
+    }
+
+    private func removeBookmark(_ bookmark: Bookmark) {
+        guard let removed = library.removeBookmark(address: bookmark.address) else { return }
+        showToast("Removed from Bookmarks", for: 4, actionLabel: "Undo") {
+            library.restoreBookmark(removed)
         }
     }
 
@@ -749,8 +860,9 @@ struct DeskView: View {
     }
 
     private func open(_ categoryID: String, _ tab: BrowserTab?, _ origin: CGRect?) {
+        let isBookmarks = categoryID == Library.bookmarksID
         // Includes sub-shelves, in the same order as the library page.
-        let tabs = library.orderedTabs(in: categoryID)
+        let tabs = isBookmarks ? library.bookmarks.map(\.tab) : library.orderedTabs(in: categoryID)
         guard let first = tab ?? tabs.first(where: { $0.readableURL != nil }) else { return }
         guard first.readableURL != nil else {
             if !library.sample {
@@ -762,7 +874,7 @@ struct DeskView: View {
             return
         }
         sleepTask?.cancel()
-        room.start(tabs, at: first, in: categoryID, named: library.pathName(of: categoryID))
+        room.start(tabs, at: first, in: categoryID, named: isBookmarks ? "Bookmarks" : library.pathName(of: categoryID))
         saveSession()
         if room.companion != .notes { _ = room.chat(for: room.companion) }
         previews.paused = true
@@ -829,6 +941,10 @@ struct DeskView: View {
 
     private func finish() {
         guard let tab = room.current else { return }
+        if room.isBookmarks {
+            showToast("Bookmarks stay saved · press ⌘D to remove")
+            return
+        }
         library.finish(tab, closeInHelium: closeInHelium)
         if room.remove(tab) {
             showToast("Done · \(room.queue.count) left on this shelf")
@@ -840,9 +956,12 @@ struct DeskView: View {
     }
 
     /// Pass `seconds: nil` to keep the toast up until the next one replaces it.
-    private func showToast(_ message: String, for seconds: Double? = 2.2) {
+    private func showToast(_ message: String, for seconds: Double? = 2.2,
+                           actionLabel: String? = nil, action: (() -> Void)? = nil) {
         toastTask?.cancel()
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) { toast = message }
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+            toast = Toast(message: message, actionLabel: actionLabel, action: action)
+        }
         guard let seconds else { return }
         toastTask = Task {
             try? await Task.sleep(for: .seconds(seconds))
@@ -901,7 +1020,10 @@ struct DeskView: View {
     /// The page (or PDF), with the Save / Ask bar floating over whatever you've selected.
     private var readerPane: some View {
         ZStack {
-            BrowserPane(page: room.reader, showsChrome: false).id(ObjectIdentifier(room.reader))
+            BrowserPane(page: room.reader, showsChrome: false,
+                        isBookmarked: { library.isBookmarked($0) },
+                        onBookmark: { url, title in toggleBookmark(url: url, title: title) })
+                .id(ObjectIdentifier(room.reader))
             if let paper = room.paper {
                 PaperPane(paper: paper).id(ObjectIdentifier(paper))
             }
@@ -1021,11 +1143,14 @@ struct DeskView: View {
 
     private func dock() -> some View {
         // Fall back to the saved name if the shelf was deleted while reading.
-        let shelf = library.category(withID: room.categoryID) == nil ? room.shelfName : library.pathName(of: room.categoryID)
+        let shelf = room.isBookmarks ? "Bookmarks"
+            : library.category(withID: room.categoryID) == nil ? room.shelfName : library.pathName(of: room.categoryID)
         return ReaderDock(page: room.reader, paper: room.paper, url: room.currentURL, shelf: shelf,
                    index: room.index, count: room.queue.count,
                    closeInHelium: closeInHelium, isPaper: room.isPaper,
+                   isBookmarks: room.isBookmarks,
                    saved: room.current.map(library.isSaved) ?? false,
+                   bookmarked: library.isBookmarked(room.activePage?.url),
                    arxivSwitch: room.arxivSwitch?.pdf,
                    showingQueue: $popover.showing(.queue), showingContents: $popover.showing(.contents),
                    back: { closeRoom() },
@@ -1036,6 +1161,7 @@ struct DeskView: View {
                        room.copyLink()
                        showToast("Link copied")
                    },
+                   toggleBookmark: toggleBookmark,
                    readLater: readLater,
                    bibtex: copyBibTeX,
                    switchArxiv: { room.switchArxiv() },
@@ -1139,7 +1265,9 @@ private struct ReaderDock: View {
     let count: Int
     let closeInHelium: Bool
     let isPaper: Bool
+    let isBookmarks: Bool
     let saved: Bool
+    let bookmarked: Bool
     /// arXiv: true offers the PDF, false offers the abstract page.
     let arxivSwitch: Bool?
     @Binding var showingQueue: Bool
@@ -1149,6 +1277,7 @@ private struct ReaderDock: View {
     let next: () -> Void
     let done: () -> Void
     let copyLink: () -> Void
+    let toggleBookmark: () -> Void
     let readLater: () -> Void
     let bibtex: () -> Void
     let switchArxiv: () -> Void
@@ -1206,8 +1335,14 @@ private struct ReaderDock: View {
             if isPaper {
                 DeskIcon("quote.bubble", help: "Copy BibTeX", action: bibtex)
             }
-            DeskIcon(saved ? "bookmark.fill" : "bookmark", help: saved ? "On Read later" : "Read later", action: readLater)
-                .foregroundStyle(saved ? Theme.accent : Theme.ink3)
+            DeskIcon(bookmarked ? "bookmark.fill" : "bookmark",
+                     help: bookmarked ? "Remove bookmark (⌘D)" : "Bookmark this page (⌘D)",
+                     tint: bookmarked ? Theme.accent : nil,
+                     action: toggleBookmark)
+            DeskIcon(saved ? "clock.fill" : "clock",
+                     help: saved ? "On Read later" : "Read later (⇧⌘L)",
+                     tint: saved ? Theme.accent : nil,
+                     action: readLater)
             if full { separator }
             // The narrow dock keeps these once there's history, so you can always get back.
             if paper == nil && (full || page.state.back || page.state.forward) {
@@ -1220,13 +1355,15 @@ private struct ReaderDock: View {
                     DeskIcon("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
                 }
             }
-            Button(action: done) {
-                HStack(spacing: 6) { Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)); Text("Done") }
+            if !isBookmarks {
+                Button(action: done) {
+                    HStack(spacing: 6) { Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)); Text("Done") }
+                }
+                .buttonStyle(DeskButtonStyle(.primary))
+                .fixedSize()
+                .padding(.leading, 6)
+                .help(closeInHelium ? "Close this tab in Helium and open the next (⇧⌘D)" : "Mark read and open the next (⇧⌘D)")
             }
-            .buttonStyle(DeskButtonStyle(.primary))
-            .fixedSize()
-            .padding(.leading, 6)
-            .help(closeInHelium ? "Close this tab in Helium and open the next (⇧⌘D)" : "Mark read and open the next (⇧⌘D)")
         }
         .padding(.leading, 5).padding(.trailing, 5).padding(.vertical, 5)
         .background(Capsule().fill(Theme.raised.opacity(0.96)))
@@ -1504,6 +1641,10 @@ struct ReadingDeskApp: App {
             CommandMenu("Library") {
                 Button("Command Palette…") { NotificationCenter.default.post(name: .openPalette, object: nil) }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
+                Button("Show Bookmarks") { NotificationCenter.default.post(name: .openBookmarks, object: nil) }
+                    .keyboardShortcut("b", modifiers: [.command, .option])
+                Button("Bookmark Current Page") { NotificationCenter.default.post(name: .toggleBookmark, object: nil) }
+                    .keyboardShortcut("d", modifiers: .command)
                 Divider()
                 Button("Refresh Helium Tabs") { library.refresh() }.keyboardShortcut("r", modifiers: [.command, .shift])
             }

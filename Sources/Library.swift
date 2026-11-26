@@ -78,7 +78,7 @@ struct Category: Codable, Identifiable, Hashable {
     var isLater: Bool { role == .readLater }
     var isAgentMade: Bool { role == .agent }
 
-    static let later = Category(id: laterID, name: "Read later", symbol: "bookmark", hue: 0.08)
+    static let later = Category(id: laterID, name: "Read later", symbol: "clock", hue: 0.08)
 
     /// Site rules accept three forms:
     /// - `arxiv.org`  matches the domain and any subdomain
@@ -416,6 +416,11 @@ final class Library: ObservableObject {
     @Published private(set) var later: [SavedSource] { didSet { laterAddresses = Set(later.map(\.address)); filingCache = nil } }
     /// Cached: `category(for:)` checks it for every tab on every render.
     private var laterAddresses: Set<String> = []
+    /// Permanent bookmarks, newest first. Never removed when marking a tab Done.
+    @Published private(set) var bookmarks: [Bookmark] { didSet { rebuildBookmarkLookup() } }
+    private var bookmarkAddresses: Set<String> = []
+    private var bookmarkKeys: Set<String> = []
+    static let bookmarksID = "__bookmarks__"
     /// Memoized filing results so LibraryView redraws don't re-run every rule across every tab.
     private struct FilingCache {
         let byAddress: [String: Category]
@@ -443,6 +448,9 @@ final class Library: ObservableObject {
             loadedCategories.append(Category.defaults.last!)
         }
         if !loadedCategories.contains(where: \.isLater) { loadedCategories.insert(Category.later, at: 0) }
+        if let index = loadedCategories.firstIndex(where: \.isLater), loadedCategories[index].symbol == "bookmark" {
+            loadedCategories[index].symbol = "clock"
+        }
         // "Everything else" sat right next to "Everything" in the index; the catch-all is now "Unsorted".
         if let index = loadedCategories.firstIndex(where: \.isOther), loadedCategories[index].name == "Everything else" {
             loadedCategories[index].name = "Unsorted"
@@ -453,6 +461,10 @@ final class Library: ObservableObject {
         let saved = store.data(forKey: "readLater.v1").flatMap { try? JSONDecoder().decode([SavedSource].self, from: $0) } ?? []
         later = saved
         laterAddresses = Set(saved.map(\.address))  // didSet doesn't run during init
+        let loadedBookmarks = store.data(forKey: "bookmarks.v1").flatMap { try? JSONDecoder().decode([Bookmark].self, from: $0) } ?? []
+        bookmarks = loadedBookmarks
+        bookmarkAddresses = Set(loadedBookmarks.map(\.address))
+        bookmarkKeys = Set(loadedBookmarks.compactMap { SourceKey.key(for: $0.address) })
 
         if let saved = store.dictionary(forKey: "assignments.v2") as? [String: String] {
             assignments = saved
@@ -562,6 +574,84 @@ final class Library: ObservableObject {
 
     private func saveLater() {
         if let data = try? JSONEncoder().encode(later) { defaults.set(data, forKey: "readLater.v1") }
+    }
+
+    // MARK: Bookmarks
+
+    private func rebuildBookmarkLookup() {
+        bookmarkAddresses = Set(bookmarks.map(\.address))
+        bookmarkKeys = Set(bookmarks.compactMap { SourceKey.key(for: $0.address) })
+    }
+
+    func isBookmarked(_ address: String) -> Bool {
+        if bookmarkAddresses.contains(address) { return true }
+        if let key = SourceKey.key(for: address), bookmarkKeys.contains(key) { return true }
+        return false
+    }
+
+    func isBookmarked(_ url: URL?) -> Bool {
+        guard let url else { return false }
+        return isBookmarked(url.removingFragment.absoluteString) || isBookmarked(url.absoluteString)
+    }
+
+    func isBookmarked(_ tab: BrowserTab) -> Bool {
+        isBookmarked(tab.address)
+    }
+
+    func bookmark(for address: String) -> Bookmark? {
+        if let exact = bookmarks.first(where: { $0.address == address }) { return exact }
+        guard let key = SourceKey.key(for: address) else { return nil }
+        return bookmarks.first { SourceKey.key(for: $0.address) == key }
+    }
+
+    @discardableResult
+    func addBookmark(address: String, title: String, note: String? = nil) -> Bookmark {
+        let cleanAddress = URL(string: address)?.removingFragment.absoluteString ?? address
+        let cleanTitle = title.trimmed.isEmpty ? cleanAddress : title.trimmed
+        if let existing = bookmark(for: cleanAddress) { return existing }
+        let cleanNote = note?.trimmed.nonEmpty
+        let entry = Bookmark(address: cleanAddress, title: cleanTitle, saved: .now, note: cleanNote)
+        bookmarks.insert(entry, at: 0)
+        saveBookmarks()
+        return entry
+    }
+
+    @discardableResult
+    func removeBookmark(address: String) -> Bookmark? {
+        let key = SourceKey.key(for: address)
+        guard let index = bookmarks.firstIndex(where: {
+            $0.address == address || (key != nil && SourceKey.key(for: $0.address) == key)
+        }) else { return nil }
+        let removed = bookmarks.remove(at: index)
+        saveBookmarks()
+        return removed
+    }
+
+    func restoreBookmark(_ entry: Bookmark) {
+        guard !isBookmarked(entry.address) else { return }
+        bookmarks.insert(entry, at: 0)
+        bookmarks.sort { $0.saved > $1.saved }
+        saveBookmarks()
+    }
+
+    @discardableResult
+    func toggleBookmark(address: String, title: String) -> (added: Bool, bookmark: Bookmark) {
+        if let removed = removeBookmark(address: address) {
+            return (false, removed)
+        }
+        return (true, addBookmark(address: address, title: title))
+    }
+
+    func updateBookmark(address: String, title: String, note: String?) {
+        guard let index = bookmarks.firstIndex(where: { $0.address == address }) else { return }
+        let cleanTitle = title.trimmed
+        if !cleanTitle.isEmpty { bookmarks[index].title = cleanTitle }
+        bookmarks[index].note = note?.trimmed.nonEmpty
+        saveBookmarks()
+    }
+
+    private func saveBookmarks() {
+        if let data = try? JSONEncoder().encode(bookmarks) { defaults.set(data, forKey: "bookmarks.v1") }
     }
 
     /// Marks a tab as read: hides it here and, optionally, closes it in Helium.

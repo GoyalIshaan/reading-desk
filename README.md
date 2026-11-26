@@ -104,9 +104,11 @@ Reading Desk indexes the links in your vault. A card with notes about its page s
 
 PDFs open in a native PDF reader. **Contents** (the list icon in the dock, or right-click → Sections…) jumps between the PDF’s sections, or the headings of a web page. The dock shows the page you’re on, and Reading Desk remembers it. On a paper (arXiv, OpenReview, a DOI, ACL, NeurIPS, PMLR, PDFs), **Copy BibTeX** (in the dock or the right-click menu) fetches the published entry, or builds a `@misc` entry when there isn’t one. On arXiv, the dock flips between the abstract page and the PDF.
 
-## Read later and continuing
+## Bookmarks, Read later, and continuing
 
-**Read later** (the bookmark in the dock, a card’s hover button, or right-click on the page) moves a page to the *Read later* shelf and, if *Close Helium tabs when marked done* is on, closes its Helium tab. The page stays on the shelf until you mark it done. Remove it from a card’s `…` menu.
+**Bookmarks** (**⌘D**, the bookmark icon in the dock or on a card, or right-click on the page) permanently save any page you are viewing — including PDFs or links you clicked into while reading. Unlike **Read later**, marking a tab **Done** never removes a bookmark. Open **Bookmarks** from the top of the library, press **⌥⌘B**, or search them anytime in **⇧⌘P**. Hover a bookmark card to attach an optional note or remove it.
+
+**Read later** (**⇧⌘L**, the clock in the dock, a card’s hover button, or right-click on the page) moves a page to the *Read later* shelf and, if *Close Helium tabs when marked done* is on, closes its Helium tab. The page stays on the shelf until you mark it done. Remove it from a card’s `…` menu.
 
 Quit while reading and Reading Desk reopens the same page at the same scroll position (or PDF page), with the same companion and note. Turn this off with ⇧⌘P → **Reopen where I left off on launch**, or jump back any time with **Continue where I left off**.
 
@@ -114,7 +116,10 @@ Quit while reading and Reading Desk reopens the same page at the same scroll pos
 
 | Shortcut | Action |
 | --- | --- |
-| ⇧⌘P | Search tabs and shelves or run a command |
+| ⇧⌘P | Search tabs, bookmarks, and shelves or run a command |
+| ⌘D | Bookmark or remove bookmark for the page you’re viewing |
+| ⌥⌘B | Open Bookmarks |
+| ⇧⌘L | Save the current tab to Read later |
 | ⇧⌘R | Refresh Helium tabs |
 | ⌘[ | Go up one shelf level in the library (to all shelves from a top-level shelf), or go back on the current webpage while reading |
 | ⌘] | Go forward on the current webpage |

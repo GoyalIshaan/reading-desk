@@ -101,6 +101,15 @@ final class DeskBridge {
                 "active": tab.active,
             ]
         }
+        let bookmarks = library.bookmarks.map { bookmark -> [String: Any] in
+            var entry: [String: Any] = [
+                "title": bookmark.title,
+                "url": bookmark.address,
+                "saved": Self.iso.string(from: bookmark.saved),
+            ]
+            if let note = bookmark.note { entry["note"] = note }
+            return entry
+        }
         let state: [String: Any] = [
             "updated": Self.iso.string(from: .now),
             "appRunning": true,
@@ -109,6 +118,7 @@ final class DeskBridge {
             "commandsDir": commandsDir.path,
             "categories": categories,
             "tabs": tabs,
+            "bookmarks": bookmarks,
             "log": Array(log.suffix(25)),
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: state, options: [.prettyPrinted, .sortedKeys]) else { return }

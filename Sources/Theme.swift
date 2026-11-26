@@ -89,13 +89,15 @@ struct DeskButtonStyle: ButtonStyle {
 struct DeskIcon: View {
     let symbol: String
     let help: String
+    var tint: Color? = nil
     let action: () -> Void
     @State private var hovered = false
     @Environment(\.isEnabled) private var enabled
 
-    init(_ symbol: String, help: String, action: @escaping () -> Void) {
+    init(_ symbol: String, help: String, tint: Color? = nil, action: @escaping () -> Void) {
         self.symbol = symbol
         self.help = help
+        self.tint = tint
         self.action = action
     }
 
@@ -107,7 +109,7 @@ struct DeskIcon: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(enabled ? (hovered ? Theme.ink : Theme.ink3) : Theme.ink4)
+        .foregroundStyle(enabled ? (tint ?? (hovered ? Theme.ink : Theme.ink3)) : Theme.ink4)
         .onHover { hovered = $0 }
         .help(help)
         .accessibilityLabel(help)

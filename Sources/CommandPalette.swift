@@ -15,6 +15,8 @@ struct CommandPalette: View {
     let fullscreenOnOpen: Bool
     let closeInHelium: Bool
     var resumeOnLaunch = true
+    var appearance: AppAppearance = .system
+    var isDark = true
     var reading = false
     var currentBookmarked = false
     let close: () -> Void
@@ -42,9 +44,9 @@ struct CommandPalette: View {
     }
 
     enum Command: String, CaseIterable {
-        case toggleBookmark, showBookmarks, continueReading, allShelves, refresh, editShelves, organize, toggleFullscreen, toggleCloseInHelium, toggleResume
+        case toggleBookmark, showBookmarks, continueReading, allShelves, refresh, editShelves, organize, toggleAppearance, useSystemAppearance, toggleFullscreen, toggleCloseInHelium, toggleResume
 
-        func label(currentBookmarked: Bool) -> (title: String, symbol: String, keywords: String) {
+        func label(currentBookmarked: Bool, isDark: Bool) -> (title: String, symbol: String, keywords: String) {
             switch self {
             case .toggleBookmark:
                 (currentBookmarked ? "Remove bookmark" : "Bookmark this page",
@@ -56,6 +58,13 @@ struct CommandPalette: View {
             case .editShelves: ("Edit shelves and filing rules", "books.vertical", "manage categories autofiling")
             case .organize: ("Sort this shelf with Claude", "wand.and.stars",
                              "agent ai organize file categorize subshelves nested auto triage")
+            case .toggleAppearance:
+                (isDark ? "Switch to light mode" : "Switch to dark mode",
+                 isDark ? "sun.max" : "moon",
+                 "appearance theme color scheme light dark mode day night")
+            case .useSystemAppearance:
+                ("Match system appearance", "circle.lefthalf.filled",
+                 "appearance theme color scheme system automatic light dark mode")
             case .toggleFullscreen: ("Enter full screen when reading", "arrow.up.left.and.arrow.down.right", "fullscreen settings reading options")
             case .toggleCloseInHelium: ("Close Helium tabs when marked done", "xmark.circle", "keep tabs open settings reading options")
             case .continueReading: ("Continue where I left off", "book", "resume last session reopen")
@@ -165,7 +174,7 @@ struct CommandPalette: View {
         let commands = Command.allCases.compactMap { command -> Item? in
             if command == .continueReading && ReadingMemory.session == nil { return nil }
             if command == .toggleBookmark && !reading { return nil }
-            let label = command.label(currentBookmarked: currentBookmarked)
+            let label = command.label(currentBookmarked: currentBookmarked, isDark: isDark)
             if !trimmed.isEmpty {
                 guard !terms.isEmpty else { return nil }
                 let words = SearchIndex.words(in: label.title + " " + label.keywords)
@@ -174,6 +183,8 @@ struct CommandPalette: View {
             let detail: String? = switch command {
             case .toggleBookmark: "⌘D"
             case .showBookmarks: library.bookmarks.isEmpty ? "⌥⌘B" : "\(library.bookmarks.count) · ⌥⌘B"
+            case .toggleAppearance: "⇧⌘T"
+            case .useSystemAppearance: appearance == .system ? "On" : "Off"
             case .toggleFullscreen: fullscreenOnOpen ? "On" : "Off"
             case .toggleCloseInHelium: closeInHelium ? "On" : "Off"
             case .toggleResume: resumeOnLaunch ? "On" : "Off"
@@ -235,7 +246,7 @@ struct CommandPalette: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            Color.black.opacity(0.5)
+            Theme.scrim
                 .ignoresSafeArea()
                 .onTapGesture(perform: close)
             VStack(spacing: 0) {
@@ -246,11 +257,11 @@ struct CommandPalette: View {
                 footer
             }
             .frame(width: 640)
-            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Theme.surface))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.08)))
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Theme.palette))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Theme.borderFloating))
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .compositingGroup()
-            .shadow(color: .black.opacity(0.5), radius: 30, y: 16)
+            .shadow(color: Theme.shadow, radius: 30, y: 16)
             .padding(.top, 110)
         }
         .defaultFocus($focused, true, priority: .userInitiated)
@@ -454,6 +465,7 @@ private struct PaletteRow: View, Equatable {
     let item: CommandPalette.Item
     let selected: Bool
     let icon: NSImage?
+    @Environment(\.colorScheme) private var colorScheme
 
     static func == (a: Self, b: Self) -> Bool {
         a.item.id == b.item.id && a.selected == b.selected && a.icon === b.icon

@@ -19,6 +19,7 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
     private var shown: (path: String, text: String)?
     /// Set after a highlight: once the note re-renders, put the caret on the last line.
     private var caretToEnd = false
+    private var isDark: Bool?
 
     override init() {
         // With macOS "smart quotes and dashes" on, typing `---` saves an em dash, so no
@@ -40,10 +41,23 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
         controller.add(WeakHandler(self), name: "desk")
         view.navigationDelegate = self
         view.setValue(false, forKey: "drawsBackground")
-        view.underPageBackgroundColor = NSColor(Theme.notes)
+        view.underPageBackgroundColor = Theme.nsNotes
         view.isInspectable = ProcessInfo.processInfo.arguments.contains("--inspect")
         scheme.root = { [weak self] in self?.vault?.root }
         view.load(URLRequest(url: URL(string: "desk://app/note.html")!))
+    }
+
+    func applyTheme(isDark: Bool) {
+        self.isDark = isDark
+        view.underPageBackgroundColor = Theme.nsNotes
+        guard ready else { return }
+        syncWebTheme()
+    }
+
+    private func syncWebTheme() {
+        guard let isDark else { return }
+        let theme = isDark ? "dark" : "light"
+        view.evaluateJavaScript("document.documentElement.dataset.theme = '\(theme)'")
     }
 
     static let debug = ProcessInfo.processInfo.arguments.contains("--debug-notes")
@@ -137,6 +151,7 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
         case "ready":
             let waiting: [String: Any]? = if case .loading(let pending) = page { pending } else { nil }
             page = .ready
+            syncWebTheme()
             if let waiting {
                 call("deskRender", waiting)
                 placeCaretIfAsked()
@@ -291,6 +306,11 @@ private final class DeskScheme: NSObject, WKURLSchemeHandler {
 
 struct NoteWebView: NSViewRepresentable {
     let renderer: NoteRenderer
+    @Environment(\.colorScheme) private var colorScheme
+
     func makeNSView(context: Context) -> WKWebView { renderer.view }
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        _ = colorScheme
+        nsView.underPageBackgroundColor = Theme.nsNotes
+    }
 }

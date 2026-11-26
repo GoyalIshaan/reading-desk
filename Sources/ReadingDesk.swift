@@ -402,6 +402,7 @@ struct DeskView: View {
     @ObservedObject var library: Library
     @ObservedObject var room: Room
     @ObservedObject var vault: Vault
+    @ObservedObject var appearance: AppearanceStore
     /// Not observed here: preview updates should only re-render the library, never the reading room.
     let previews: Previews
     let renderer: NoteRenderer
@@ -471,7 +472,7 @@ struct DeskView: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             // The library stays alive underneath so coming back is instant and keeps its scroll position.
-            LibraryView(library: library, previews: previews, notes: vault.index, selectedCategory: $selectedCategory,
+            LibraryView(library: library, previews: previews, notes: vault.index, appearance: appearance, selectedCategory: $selectedCategory,
                         closeInHelium: closeInHelium, titleBarHeight: titleBarHeight, open: open,
                         onToggleBookmark: toggleBookmark(for:), onRemoveBookmark: removeBookmark(_:))
                 .opacity(reading && revealed ? 0 : 1)
@@ -486,6 +487,7 @@ struct DeskView: View {
                 CommandPalette(library: library, previews: previews,
                                fullscreenOnOpen: fullscreenOnOpen, closeInHelium: closeInHelium,
                                resumeOnLaunch: resumeOnLaunch,
+                               appearance: appearance.mode, isDark: appearance.isDark,
                                reading: reading,
                                currentBookmarked: library.isBookmarked(room.activePage?.url),
                                close: { withAnimation(.easeOut(duration: 0.14)) { paletteOpen = false } },
@@ -512,9 +514,9 @@ struct DeskView: View {
                     }
                 }
                 .padding(.horizontal, 18).frame(height: 36)
-                .background(Capsule().fill(Theme.raised))
-                .overlay(Capsule().strokeBorder(Color.white.opacity(0.08)))
-                .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
+                .background(Capsule().fill(Theme.floating))
+                .overlay(Capsule().strokeBorder(Theme.borderFloating))
+                .shadow(color: Theme.shadow, radius: 18, y: 8)
                 .padding(.bottom, reading ? 84 : 26)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .allowsHitTesting(toast.action != nil)
@@ -531,7 +533,7 @@ struct DeskView: View {
         .ignoresSafeArea()
         .foregroundStyle(Theme.ink)
         .background(Theme.ground)
-        .preferredColorScheme(.dark)
+        .onChange(of: appearance.isDark) { _, isDark in renderer.applyTheme(isDark: isDark) }
         .sheet(isPresented: $editingShelves) { ShelvesEditor(library: library) }
         .task {
             room.isCurrentBookmarked = { [weak library, weak room] in
@@ -634,6 +636,9 @@ struct DeskView: View {
         case .refresh: library.refresh()
         case .editShelves: editingShelves = true
         case .organize: organizeShelf()
+        case .toggleAppearance: appearance.toggle()
+        case .useSystemAppearance:
+            appearance.mode = appearance.mode == .system ? (appearance.isDark ? .dark : .light) : .system
         case .toggleFullscreen: fullscreenOnOpen.toggle()
         case .toggleCloseInHelium: closeInHelium.toggle()
         case .toggleResume: resumeOnLaunch.toggle()
@@ -1230,7 +1235,7 @@ struct DeskView: View {
                                 }
                                 .frame(width: 84, height: 54)
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
-                                .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(index == room.index ? Theme.accent : Color.white.opacity(0.06), lineWidth: index == room.index ? 1.5 : 1))
+                                .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(index == room.index ? Theme.accent : Theme.border, lineWidth: index == room.index ? 1.5 : 1))
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(tab.displayTitle).font(Theme.serif(15.5, .medium)).foregroundStyle(Theme.ink).lineLimit(2)
                                     Text(tab.sourceName).font(Theme.mono(10)).foregroundStyle(Theme.ink3)
@@ -1251,7 +1256,6 @@ struct DeskView: View {
             .background(Theme.ground)
             .onAppear { proxy.scrollTo(room.index, anchor: .center) }
         }
-        .preferredColorScheme(.dark)
     }
 }
 
@@ -1366,9 +1370,9 @@ private struct ReaderDock: View {
             }
         }
         .padding(.leading, 5).padding(.trailing, 5).padding(.vertical, 5)
-        .background(Capsule().fill(Theme.raised.opacity(0.96)))
-        .overlay(Capsule().strokeBorder(Color.white.opacity(0.09)))
-        .shadow(color: .black.opacity(0.45), radius: 22, y: 10)
+        .background(Capsule().fill(Theme.floating.opacity(0.96)))
+        .overlay(Capsule().strokeBorder(Theme.borderFloating))
+        .shadow(color: Theme.shadow, radius: 22, y: 10)
         .fixedSize()
     }
 
@@ -1410,11 +1414,10 @@ private struct SelectionBar: View {
             .accessibilityLabel("Ask another chat")
         }
         .padding(.horizontal, 3).padding(.vertical, 2)
-        .background(Capsule().fill(Theme.raised.opacity(0.98)))
-        .overlay(Capsule().strokeBorder(Color.white.opacity(0.11)))
-        .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
+        .background(Capsule().fill(Theme.floating.opacity(0.98)))
+        .overlay(Capsule().strokeBorder(Theme.borderFloating))
+        .shadow(color: Theme.shadow, radius: 16, y: 6)
         .fixedSize()
-        .environment(\.colorScheme, .dark)
     }
 
     private struct BarButton: View {
@@ -1432,7 +1435,7 @@ private struct SelectionBar: View {
                 }
                 .foregroundStyle(hovered ? Theme.ink : Theme.ink2)
                 .padding(.horizontal, 11).frame(height: 28)
-                .background(Capsule().fill(hovered ? Color.white.opacity(0.06) : .clear))
+                .background(Capsule().fill(hovered ? Theme.hoverWash : .clear))
                 .contentShape(Capsule())
             }
             .buttonStyle(.plain)
@@ -1467,7 +1470,6 @@ private struct ContentsList: View {
             }
         }
         .background(Theme.ground)
-        .preferredColorScheme(.dark)
         .task {
             guard room.paper == nil else { return }
             let found = await room.reader.outline()
@@ -1591,6 +1593,16 @@ private struct CompanionTabs: View {
 @MainActor
 final class DeskDelegate: NSObject, NSApplicationDelegate {
     weak var vault: Vault?
+    weak var appearance: AppearanceStore?
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        if let appearance {
+            appearance.start()
+        } else {
+            let saved = UserDefaults.standard.string(forKey: AppearanceStore.storageKey).flatMap(AppAppearance.init(rawValue:)) ?? .system
+            NSApp.appearance = saved.nsAppearance
+        }
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
@@ -1624,13 +1636,17 @@ struct ReadingDeskApp: App {
     @StateObject private var vault = Vault()
     @StateObject private var previews = Previews()
     @StateObject private var renderer = NoteRenderer()
+    @StateObject private var appearance = AppearanceStore()
 
     var body: some Scene {
         Window("Reading Desk", id: "desk") {
-            DeskView(library: library, room: room, vault: vault, previews: previews, renderer: renderer)
+            DeskView(library: library, room: room, vault: vault, appearance: appearance, previews: previews, renderer: renderer)
                 .onAppear {
                     delegate.vault = vault
+                    delegate.appearance = appearance
                     renderer.vault = vault
+                    appearance.start()
+                    renderer.applyTheme(isDark: appearance.isDark)
                 }
         }
         .defaultSize(width: 1320, height: 860)
@@ -1638,6 +1654,26 @@ struct ReadingDeskApp: App {
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .toolbar) {
+                Button(appearance.isDark ? "Switch to Light Mode" : "Switch to Dark Mode") {
+                    appearance.toggle()
+                }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                Menu("Appearance") {
+                    ForEach(AppAppearance.allCases) { option in
+                        Button {
+                            appearance.mode = option
+                        } label: {
+                            if appearance.mode == option {
+                                Label(option.title, systemImage: "checkmark")
+                            } else {
+                                Text(option.title)
+                            }
+                        }
+                    }
+                }
+                Divider()
+            }
             CommandMenu("Library") {
                 Button("Command Palette…") { NotificationCenter.default.post(name: .openPalette, object: nil) }
                     .keyboardShortcut("p", modifiers: [.command, .shift])

@@ -39,7 +39,7 @@ final class PaperReader: NSObject, ObservableObject {
         view.autoScales = true
         view.displayMode = .singlePageContinuous
         view.displaysPageBreaks = true
-        view.backgroundColor = NSColor(Theme.ground)
+        view.backgroundColor = Theme.nsGround
         view.pageShadowsEnabled = false
         view.onMouseUp = { [weak self] in self?.reportSelection() }
         let center = NotificationCenter.default
@@ -241,8 +241,13 @@ final class DeskPDFView: PDFView {
 
 struct PaperSurface: NSViewRepresentable {
     let paper: PaperReader
+    @Environment(\.colorScheme) private var colorScheme
+
     func makeNSView(context: Context) -> DeskPDFView { paper.view }
-    func updateNSView(_ nsView: DeskPDFView, context: Context) {}
+    func updateNSView(_ nsView: DeskPDFView, context: Context) {
+        _ = colorScheme
+        nsView.backgroundColor = Theme.nsGround
+    }
 }
 
 struct PaperPane: View {

@@ -5,6 +5,7 @@ struct LibraryView: View {
     @ObservedObject var previews: Previews
     /// Notes in the vault about each page, for the little ✎ count on cards.
     @ObservedObject var notes: NoteIndex
+    @ObservedObject var appearance: AppearanceStore
     @Binding var selectedCategory: String?
     let closeInHelium: Bool
     let titleBarHeight: CGFloat
@@ -63,7 +64,12 @@ struct LibraryView: View {
             ScrollView {
                 // Lazy, so only the sections on screen are laid out and drawn.
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    sourceStatus.frame(height: 28)
+                    HStack(spacing: 0) {
+                        sourceStatus
+                        Spacer(minLength: 12)
+                        AppearanceToggle(appearance: appearance)
+                    }
+                    .frame(height: 28)
                     if let error = library.error {
                         HStack(spacing: 8) {
                             Text(error).font(Theme.sans(12.5)).foregroundStyle(Theme.error).textSelection(.enabled)
@@ -153,7 +159,7 @@ struct LibraryView: View {
                     .padding(.horizontal, 7).padding(.vertical, 3)
                     .overlay(Capsule().strokeBorder(Theme.accent.opacity(0.5)))
             } else {
-                Circle().fill(library.error == nil && library.lastUpdated != nil ? Color(hex: 0x6FCF8E) : Theme.ink4)
+                Circle().fill(library.error == nil && library.lastUpdated != nil ? Theme.connected : Theme.ink4)
                     .frame(width: 6, height: 6)
                 Group {
                     if library.updating && library.lastUpdated == nil {
@@ -439,6 +445,30 @@ struct LibraryView: View {
     }
 }
 
+private struct AppearanceToggle: View {
+    @ObservedObject var appearance: AppearanceStore
+
+    var body: some View {
+        DeskIcon(appearance.isDark ? "sun.max" : "moon",
+                 help: appearance.isDark ? "Switch to light mode (⇧⌘T)" : "Switch to dark mode (⇧⌘T)") {
+            appearance.toggle()
+        }
+        .contextMenu {
+            ForEach(AppAppearance.allCases) { option in
+                Button {
+                    appearance.mode = option
+                } label: {
+                    if appearance.mode == option {
+                        Label(option.title, systemImage: "checkmark")
+                    } else {
+                        Text(option.title)
+                    }
+                }
+            }
+        }
+    }
+}
+
 private struct ShelfWord: View {
     let name: String
     let count: Int
@@ -543,7 +573,7 @@ struct TabCard: View, Equatable {
             cover
                 .frame(width: width, height: coverHeight)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.white.opacity(hovered ? 0.14 : 0.06)))
+                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(hovered ? Theme.borderHover : Theme.border))
                 .overlay(alignment: .topTrailing) { if hovered { actions.padding(8).transition(.opacity) } }
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 7) {
@@ -584,7 +614,7 @@ struct TabCard: View, Equatable {
                 Text(post?.byline ?? title)
                     .font(Theme.serif(20, .medium))
                     .lineSpacing(-1)
-                    .foregroundStyle(hovered ? Color.white : Theme.ink)
+                    .foregroundStyle(hovered ? Theme.inkStrong : Theme.ink)
                     .lineLimit(4)
                     .fixedSize(horizontal: false, vertical: true)
                 if post == nil, let summary = preview?.summary, summary.caseInsensitiveCompare(title) != .orderedSame {
@@ -620,7 +650,7 @@ struct TabCard: View, Equatable {
                 .clipped()
                 // A flat dim instead of saturation/brightness filters: filters make every
                 // visible cover re-render off-screen on each scroll frame.
-                .overlay(Theme.ground.opacity(hovered ? 0 : 0.14))
+                .overlay(hovered ? Color.clear : Theme.imageVeil)
         } else {
             TypeCover(site: tab.sourceName, icon: icon, loading: preview == nil && tab.readableURL != nil)
         }
@@ -670,8 +700,9 @@ struct TabCard: View, Equatable {
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
         }
         .padding(2)
-        .background(Capsule().fill(Theme.ground.opacity(0.82)))
-        .overlay(Capsule().strokeBorder(Color.white.opacity(0.1)))
+        .background(Capsule().fill(Theme.floating.opacity(0.92)))
+        .overlay(Capsule().strokeBorder(Theme.borderFloating))
+        .shadow(color: Theme.shadow, radius: 10, y: 3)
     }
 }
 
@@ -778,7 +809,7 @@ private struct BookmarkCard: View {
             cover
                 .frame(width: width, height: coverHeight)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.white.opacity(hovered || editing ? 0.14 : 0.06)))
+                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(hovered || editing ? Theme.borderHover : Theme.border))
                 .overlay(alignment: .topTrailing) { if hovered || editing { actions.padding(8).transition(.opacity) } }
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 7) {
@@ -805,7 +836,7 @@ private struct BookmarkCard: View {
                 Text(post?.byline ?? title)
                     .font(Theme.serif(20, .medium))
                     .lineSpacing(-1)
-                    .foregroundStyle(hovered ? Color.white : Theme.ink)
+                    .foregroundStyle(hovered ? Theme.inkStrong : Theme.ink)
                     .lineLimit(4)
                     .fixedSize(horizontal: false, vertical: true)
                 if let note = bookmark.note?.trimmed, !note.isEmpty {
@@ -850,7 +881,7 @@ private struct BookmarkCard: View {
                 .aspectRatio(contentMode: .fill)
                 .frame(width: width, height: coverHeight, alignment: .top)
                 .clipped()
-                .overlay(Theme.ground.opacity(hovered ? 0 : 0.14))
+                .overlay(hovered ? Color.clear : Theme.imageVeil)
         } else {
             TypeCover(site: tab.sourceName, icon: icon, loading: preview == nil && tab.readableURL != nil)
         }
@@ -890,8 +921,9 @@ private struct BookmarkCard: View {
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
         }
         .padding(2)
-        .background(Capsule().fill(Theme.ground.opacity(0.82)))
-        .overlay(Capsule().strokeBorder(Color.white.opacity(0.1)))
+        .background(Capsule().fill(Theme.floating.opacity(0.92)))
+        .overlay(Capsule().strokeBorder(Theme.borderFloating))
+        .shadow(color: Theme.shadow, radius: 10, y: 3)
     }
 }
 
@@ -937,7 +969,6 @@ private struct BookmarkEditorPopover: View {
         .frame(width: 340)
         .background(Theme.ground)
         .foregroundStyle(Theme.ink)
-        .preferredColorScheme(.dark)
     }
 }
 
@@ -1032,14 +1063,16 @@ private struct TypeCover: View {
     let site: String
     let icon: NSImage?
     let loading: Bool
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             Rectangle().fill(Theme.surface)
             Canvas { context, size in
+                let _ = colorScheme
                 var y: CGFloat = 18
                 while y < size.height {
-                    context.fill(Path(CGRect(x: 0, y: y, width: size.width, height: 0.5)), with: .color(Color.white.opacity(0.025)))
+                    context.fill(Path(CGRect(x: 0, y: y, width: size.width, height: 0.5)), with: .color(Theme.paperLine))
                     y += 18
                 }
             }
@@ -1160,7 +1193,6 @@ struct ShelvesEditor: View {
         .frame(width: 780, height: 580)
         .background(Theme.ground)
         .foregroundStyle(Theme.ink)
-        .preferredColorScheme(.dark)
         .onAppear { selection = selection ?? library.categories.first?.id }
     }
 

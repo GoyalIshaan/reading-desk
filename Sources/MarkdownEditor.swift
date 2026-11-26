@@ -10,6 +10,7 @@ struct MarkdownEditor: NSViewRepresentable {
     /// Saves pasted files and returns the Markdown that embeds them.
     let attach: ([PastedAttachment]) -> String?
     let onChange: (String) -> Void
+    @Environment(\.colorScheme) private var colorScheme
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -28,11 +29,12 @@ struct MarkdownEditor: NSViewRepresentable {
         textView.isAutomaticTextReplacementEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.textContainerInset = NSSize(width: 30, height: 30)
-        textView.insertionPointColor = NSColor(Theme.accent)
-        textView.selectedTextAttributes = [.backgroundColor: NSColor(red: 0.65, green: 0.54, blue: 0.98, alpha: 0.3)]
+        textView.insertionPointColor = Theme.nsAccent
+        textView.selectedTextAttributes = [.backgroundColor: MarkdownStyle.selectionBg]
         textView.typingAttributes = MarkdownStyle.base
         textView.string = text
         context.coordinator.lastVersion = version
+        context.coordinator.lastColorScheme = colorScheme
         MarkdownStyle.apply(to: textView.textStorage!)
         return scroll
     }
@@ -41,6 +43,17 @@ struct MarkdownEditor: NSViewRepresentable {
         context.coordinator.parent = self
         let textView = scroll.documentView as! MarkdownTextView
         textView.attach = attach
+        if context.coordinator.lastColorScheme != colorScheme {
+            context.coordinator.lastColorScheme = colorScheme
+            textView.insertionPointColor = Theme.nsAccent
+            textView.selectedTextAttributes = [.backgroundColor: MarkdownStyle.selectionBg]
+            textView.typingAttributes = MarkdownStyle.base
+            let length = (textView.string as NSString).length
+            if length > 0 {
+                textView.layoutManager?.invalidateDisplay(forCharacterRange: NSRange(location: 0, length: length))
+            }
+            textView.needsDisplay = true
+        }
         guard context.coordinator.lastVersion != version else { return }
         context.coordinator.lastVersion = version
         if textView.string != text {
@@ -54,6 +67,7 @@ struct MarkdownEditor: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: MarkdownEditor
         var lastVersion = -1
+        var lastColorScheme: ColorScheme?
         private var styleWork: DispatchWorkItem?
         init(_ parent: MarkdownEditor) { self.parent = parent }
 
@@ -103,12 +117,20 @@ final class MarkdownTextView: NSTextView, FormattingEditor {
 }
 
 enum MarkdownStyle {
-    static let text = NSColor(red: 0.86, green: 0.84, blue: 0.80, alpha: 1)
-    static let faint = NSColor(red: 0.43, green: 0.42, blue: 0.38, alpha: 1)
-    static let muted = NSColor(red: 0.64, green: 0.62, blue: 0.58, alpha: 1)
-    static let accent = NSColor(red: 0.65, green: 0.54, blue: 0.98, alpha: 1)
-    static let code = NSColor(red: 0.90, green: 0.63, blue: 0.74, alpha: 1)
-    static let math = NSColor(red: 0.88, green: 0.72, blue: 0.48, alpha: 1)
+    private static func dynamic(light: UInt32, dark: UInt32, lightAlpha: CGFloat = 1, darkAlpha: CGFloat = 1) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return NSColor(hex: isDark ? dark : light, alpha: isDark ? darkAlpha : lightAlpha)
+        }
+    }
+
+    static let text = dynamic(light: 0x24211C, dark: 0xDCD7CD)
+    static let faint = dynamic(light: 0x968F82, dark: 0x6E6A62)
+    static let muted = dynamic(light: 0x666056, dark: 0xA29D93)
+    static let accent = dynamic(light: 0x6C47D9, dark: 0xA68AF9)
+    static let code = dynamic(light: 0xB03060, dark: 0xE6A0BD)
+    static let math = dynamic(light: 0x9E6312, dark: 0xE0B87A)
+    static let selectionBg = dynamic(light: 0x6C47D9, dark: 0xA68AF9, lightAlpha: 0.20, darkAlpha: 0.30)
 
     static func font(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
         let base = NSFont(name: "Geist", size: size) ?? .systemFont(ofSize: size)
@@ -122,9 +144,9 @@ enum MarkdownStyle {
         font(18.5, .semibold), font(17, .semibold), font(15.5, .semibold),
     ]
     private static let semiboldFont = font(15.5, .semibold)
-    private static let highlightColor = NSColor(red: 1, green: 0.82, blue: 0, alpha: 0.22)
-    private static let calloutColor = NSColor(red: 0.35, green: 0.6, blue: 0.95, alpha: 1)
-    private static let inlineCodeBg = NSColor(white: 1, alpha: 0.05)
+    private static let highlightColor = dynamic(light: 0xFFD43B, dark: 0xFFD100, lightAlpha: 0.42, darkAlpha: 0.22)
+    private static let calloutColor = dynamic(light: 0x1459B8, dark: 0x5999F2)
+    private static let inlineCodeBg = dynamic(light: 0x1D1B17, dark: 0xFFFFFF, lightAlpha: 0.06, darkAlpha: 0.05)
 
     static let monoFont = NSFont(name: "JetBrainsMonoNLNFM-Regular", size: 13.5)
         ?? NSFont(name: "MonaspaceArgon-Regular", size: 13.5)

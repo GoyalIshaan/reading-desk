@@ -1,6 +1,41 @@
 # Reading Desk
 
-Reading Desk is a macOS app for working through your open Helium tabs. It groups them into shelves such as **Papers & research** and **Code & engineering**. Open a card to read the page on the left and use **ChatGPT, Claude, Gemini, or your Obsidian notes** on the right. Both panes are inside Reading Desk.
+Reading Desk is a native macOS app for working through your open Helium tabs. It groups them into editorial shelves such as **Papers & research** and **Code & engineering**. Open any card to read the page or PDF on the left and use **ChatGPT, Claude, Gemini, or your Obsidian notes** on the right — in warm rag-paper light mode or print-black dark mode.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/library-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/library-light.png">
+    <img alt="Reading Desk library view showing editorial shelves and tab preview cards" src="docs/screenshots/library-dark.png" width="100%">
+  </picture>
+</p>
+
+### Read papers, web pages, and Obsidian notes side by side
+
+Open any tab or arXiv PDF to read in a distraction-free split view. Capture passages straight into Obsidian `[!quote]` callouts with links back to the exact paragraph or PDF page, render KaTeX & LaTeX math live, copy BibTeX, or switch right over to ChatGPT, Claude, or Gemini without leaving the window.
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/reading-room-light.png" alt="Reading room in light mode with arXiv PDF and Obsidian live preview notes" width="100%">
+      <p align="center"><sub><strong>Reading Room (Light)</strong> — Native PDF reader, floating dock, and Obsidian live preview with KaTeX math &amp; callouts</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/reading-room-dark.png" alt="Reading room in dark mode with FlashAttention PDF and Obsidian notes" width="100%">
+      <p align="center"><sub><strong>Reading Room (Dark)</strong> — Editorial print-black canvas with synced note count badges and source links</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/library-light.png" alt="Library view in warm paper light mode" width="100%">
+      <p align="center"><sub><strong>Editorial Light &amp; Dark Modes</strong> — Follows macOS automatically, or switch anytime with <code>⇧⌘T</code></sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/command-palette.png" alt="Command palette searching tabs, bookmarks, shelves, and commands" width="100%">
+      <p align="center"><sub><strong>Command Palette (<code>⇧⌘P</code>)</strong> — Fuzzy search across every tab, bookmark, shelf, and command</sub></p>
+    </td>
+  </tr>
+</table>
 
 ## Install
 
@@ -117,6 +152,7 @@ Quit while reading and Reading Desk reopens the same page at the same scroll pos
 | Shortcut | Action |
 | --- | --- |
 | ⇧⌘P | Search tabs, bookmarks, and shelves or run a command |
+| ⇧⌘T | Switch between light and dark mode |
 | ⌘D | Bookmark or remove bookmark for the page you’re viewing |
 | ⌥⌘B | Open Bookmarks |
 | ⇧⌘L | Save the current tab to Read later |

@@ -245,7 +245,6 @@ struct NotesPane: View {
         }
         .padding(26).frame(width: 420)
         .background(Theme.ground)
-        .preferredColorScheme(.dark)
         .onAppear { titleFocused = true }
     }
 

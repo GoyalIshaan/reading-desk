@@ -59,7 +59,7 @@ final class WebPage: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
         view.uiDelegate = self
         view.allowsBackForwardNavigationGestures = true
         view.allowsMagnification = true
-        view.underPageBackgroundColor = NSColor(Theme.ground)
+        view.underPageBackgroundColor = Theme.nsGround
         view.isInspectable = ProcessInfo.processInfo.arguments.contains("--inspect")
         @MainActor func watch<Value>(_ path: KeyPath<DeskWebView, Value>) {
             observations.append(view.observe(path, options: [.new]) { [weak self] _, _ in
@@ -298,9 +298,13 @@ private final class CaptureHandler: NSObject, WKScriptMessageHandler {
 
 struct WebSurface: NSViewRepresentable {
     let page: WebPage
+    @Environment(\.colorScheme) private var colorScheme
 
     func makeNSView(context: Context) -> WKWebView { page.view }
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        _ = colorScheme
+        nsView.underPageBackgroundColor = Theme.nsGround
+    }
 }
 
 /// A web page with no toolbar at all. The only chrome is a small floating pill
@@ -413,11 +417,10 @@ private struct PageChrome: View {
                 .foregroundStyle(copied ? Theme.accent : Theme.ink)
             }
             .padding(2)
-            .background(Capsule().fill(Theme.ground.opacity(0.88)))
-            .overlay(Capsule().strokeBorder(Color.white.opacity(0.10)))
-            .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+            .background(Capsule().fill(Theme.floating.opacity(0.92)))
+            .overlay(Capsule().strokeBorder(Theme.borderFloating))
+            .shadow(color: Theme.shadow, radius: 12, y: 4)
             .opacity(hovered || copied ? 1 : page.state.back ? 0.85 : 0.5)
-            .environment(\.colorScheme, .dark)
             .onHover { inside in withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) { hovered = inside } }
         }
     }

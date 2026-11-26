@@ -104,6 +104,31 @@ A shelf can hold sub-shelves, for example **AI research** containing **Pre-train
 - **Sort new tabs automatically:** in **Edit shelves**, select a shelf that has sub-shelves and turn on **Sort new tabs into sub-shelves automatically**. After each refresh, only the tabs newly landed directly on that shelf go to Claude, which files each one into a sub-shelf by what it's about. It prefers your sub-shelves and adds at most 2 new ones per run. Turn on **Move new tabs to the shelf that fits** on **Unsorted** to triage new unmatched tabs the same way, so you don't have to add a rule for every blog. Each run sends at most 25 tabs, and a tab Claude leaves where it is isn't sent again, even after a restart. If Claude Code fails on a shelf, for example because you're signed out, that shelf pauses for 10 minutes, then 20, and stops after 3 failures until you reopen the app. Sample data (`--sample`) is never auto-sorted.
 - **From scripts:** `hooks/reading-desk ensure-shelf "Post-training" --parent "AI research"`. Anywhere the CLI takes a shelf, you can give a path such as `"AI research › Post-training"`. See the [bridge README](hooks/README.md).
 
+## Connect your AI agent (browser context & automatic shelves)
+
+Reading Desk includes a local file bridge so any AI agent you already use — **Claude Code, Codex, Antigravity, Cursor, or your own scripts** — can read your live browser context and organize shelves for you automatically, with no browser extensions or cloud sync.
+
+While Reading Desk is running, it continuously exports a live snapshot of your open tabs (across Helium, Chrome, and Safari), shelves, and bookmarks to `~/Library/Application Support/dev.readingdesk.mac/state.json`, and applies commands dropped into `commands/` within ~1 second.
+
+### What your agent can do
+
+- **Read your browser context:** `hooks/reading-desk tabs --json` (or reading `state.json` directly) gives your agent every open tab's title, URL, site, browser, active flag, and shelf — handy for *"summarize the papers I have open"* or *"pull the docs tab I was just looking at"*.
+- **Create shelves and sub-shelves automatically:** `hooks/reading-desk ensure-shelf "Trip planning" --icon airplane` or `hooks/reading-desk ensure-shelf "Post-training" --parent "AI research"`. Agent-created shelves show a subtle `✦` mark and clean themselves up once all their tabs are read, unless you click **Keep this shelf** in **Edit shelves**.
+- **File tabs & pin sites in batches:** `hooks/reading-desk assign <url> <shelf>`, `hooks/reading-desk assign-site <site> <shelf>`, or `hooks/reading-desk apply plan.json` to reorganize dozens of tabs in one shot.
+
+### Quick setup for your agent
+
+Add a short note like this to your agent's instructions (`CLAUDE.md`, `AGENTS.md`, or system prompt):
+
+```markdown
+You have access to my open browser tabs and reading shelves via Reading Desk:
+- Read open tabs & shelves: `/path/to/reading-desk/hooks/reading-desk tabs --json`
+- Create a shelf or sub-shelf: `/path/to/reading-desk/hooks/reading-desk ensure-shelf "<name>" [--parent "<parent>"]`
+- File a tab or apply a batch: `/path/to/reading-desk/hooks/reading-desk assign "<url>" "<shelf>"` or `apply -`
+```
+
+See the [bridge README](hooks/README.md) for the full CLI reference and raw JSON command protocol.
+
 ## Sign in to websites and assistants
 
 Reading Desk has its own persistent browser profile. Sign in inside its pane when a site asks, including the first time you open an assistant that requires an account. The app keeps site data between launches. Websites can still expire sessions or limit sign-in from an embedded browser. Use **Open in browser** from the page controls if you need your full browser for a site.

@@ -7,7 +7,7 @@ struct LibraryView: View {
     @ObservedObject var notes: NoteIndex
     @ObservedObject var appearance: AppearanceStore
     @Binding var selectedCategory: String?
-    let closeInHelium: Bool
+    let closeInBrowser: Bool
     let titleBarHeight: CGFloat
     /// Shelf, tab to start on, and where the tapped card sits on screen (for the hero transition).
     let open: (String, BrowserTab?, CGRect?) -> Void
@@ -151,7 +151,7 @@ struct LibraryView: View {
         select(selectedCategory.flatMap { library.category(withID: $0)?.parentID })
     }
 
-    /// Where the library came from, so it's never a mystery.
+    /// Where the library came from, so it's never a mystery. Click to choose which browser(s) to read from.
     private var sourceStatus: some View {
         HStack(spacing: 7) {
             if library.sample {
@@ -159,24 +159,54 @@ struct LibraryView: View {
                     .padding(.horizontal, 7).padding(.vertical, 3)
                     .overlay(Capsule().strokeBorder(Theme.accent.opacity(0.5)))
             } else {
-                Circle().fill(library.error == nil && library.lastUpdated != nil ? Theme.connected : Theme.ink4)
-                    .frame(width: 6, height: 6)
-                Group {
-                    if library.updating && library.lastUpdated == nil {
-                        Text("Reading Helium…")
-                    } else if let updated = library.lastUpdated {
-                        Text("Helium · \(library.rawCount) tabs · \(updated.formatted(date: .omitted, time: .shortened))")
-                    } else {
-                        Text("Helium not connected")
+                Menu {
+                    ForEach(BrowserSource.allCases) { option in
+                        Button {
+                            library.browserSource = option
+                        } label: {
+                            let label: String = {
+                                if option == .all { return option.title }
+                                let browser = option.browsers[0]
+                                return browser.isRunning ? "\(option.title) · Running" : option.title
+                            }()
+                            if library.browserSource == option {
+                                Label(label, systemImage: "checkmark")
+                            } else {
+                                Text(label)
+                            }
+                        }
                     }
+                    Divider()
+                    Button("Refresh tabs") { library.refresh() }
+                } label: {
+                    HStack(spacing: 7) {
+                        Circle().fill(!library.connectedBrowsers.isEmpty && library.lastUpdated != nil ? Theme.connected : Theme.ink4)
+                            .frame(width: 6, height: 6)
+                        Group {
+                            if library.updating && library.lastUpdated == nil {
+                                Text("Reading \(library.activeSourceLabel)…")
+                            } else if let updated = library.lastUpdated, !library.connectedBrowsers.isEmpty {
+                                Text("\(library.activeSourceLabel) · \(library.rawCount) tabs · \(updated.formatted(date: .omitted, time: .shortened))")
+                            } else {
+                                Text(library.browserSource == .all ? "No browser connected" : "\(library.browserSource.title) not connected")
+                            }
+                        }
+                        .font(Theme.mono(10.5)).foregroundStyle(Theme.ink3)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .foregroundStyle(Theme.ink4)
+                    }
+                    .contentShape(Rectangle())
                 }
-                .font(Theme.mono(10.5)).foregroundStyle(Theme.ink3)
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
                 if library.updating { ProgressView().controlSize(.mini).scaleEffect(0.8) }
             }
         }
         .help(library.lastUpdated != nil && library.rawCount != library.tabs.count
-              ? "\(library.rawCount) Helium tabs, \(library.tabs.count) after merging duplicates and skipping new-tab pages"
-              : "")
+              ? "\(library.rawCount) tabs from \(library.activeSourceLabel), \(library.tabs.count) after merging duplicates and skipping new-tab pages. Click to switch browsers."
+              : "Click to choose between All browsers, Helium, Chrome, and Safari")
     }
 
     /// The shelf index: big Garamond words with superscript counts, plus a smaller
@@ -318,12 +348,14 @@ struct LibraryView: View {
                        icon: previews.icons[tab.host], width: width,
                        shelfName: shelfLabel,
                        shelves: library.tree, currentCategory: category.id,
-                       readIn: readIn, closeInHelium: closeInHelium,
+                       readIn: readIn, closeInBrowser: closeInBrowser,
+                       showBrowserBadge: library.connectedBrowsers.count > 1,
+                       fallbackBrowser: library.preferredOpenBrowser,
                        noteCount: notes.count(for: tab.address), saved: library.isSaved(tab),
                        bookmarked: library.isBookmarked(tab),
                        open: { _ in open(readIn ?? category.id, tab, nil) },
-                       done: { library.finish(tab, closeInHelium: closeInHelium) },
-                       readLater: { library.saveForLater(tab, closeInHelium: closeInHelium) },
+                       done: { library.finish(tab, closeInBrowser: closeInBrowser) },
+                       readLater: { library.saveForLater(tab, closeInBrowser: closeInBrowser) },
                        removeFromLater: { library.removeFromLater(tab.address) },
                        toggleBookmark: { onToggleBookmark(tab) },
                        assign: { library.assign(tab, to: $0) },
@@ -409,11 +441,12 @@ struct LibraryView: View {
         if let summary = preview?.summary, shared.summaries.contains(summary) { preview?.summary = nil }
         return BookmarkCard(bookmark: bookmark, preview: preview, image: image,
                             icon: previews.icons[tab.host], width: width,
+                            fallbackBrowser: library.preferredOpenBrowser,
                             noteCount: notes.count(for: tab.address),
                             onReadLater: library.isSaved(tab),
                             open: { open(Library.bookmarksID, tab, nil) },
                             remove: { onRemoveBookmark(bookmark) },
-                            readLater: { library.saveForLater(tab, closeInHelium: false) },
+                            readLater: { library.saveForLater(tab, closeInBrowser: false) },
                             update: { title, note in library.updateBookmark(address: bookmark.address, title: title, note: note) })
             .onAppear { previews.request(tab) }
     }
@@ -426,7 +459,9 @@ struct LibraryView: View {
             } else {
                 Text("The desk is clear.").font(Theme.serif(44)).foregroundStyle(Theme.ink)
                 if library.error == nil {
-                    Text("Every tab has been read. Open more in Helium and they’ll appear here.")
+                    Text(library.browserSource == .all
+                         ? "Every tab has been read. Open more in Helium, Chrome, or Safari and they’ll appear here."
+                         : "Every tab has been read. Open more in \(library.browserSource.title) and they’ll appear here.")
                         .font(Theme.sans(13.5)).foregroundStyle(Theme.ink3)
                 }
             }
@@ -528,7 +563,9 @@ struct TabCard: View, Equatable {
     let shelves: ShelfTree
     let currentCategory: String
     var readIn: String? = nil
-    var closeInHelium = true
+    var closeInBrowser = true
+    var showBrowserBadge = false
+    var fallbackBrowser: Browser? = nil
     var noteCount = 0
     var saved = false
     var bookmarked = false
@@ -546,7 +583,9 @@ struct TabCard: View, Equatable {
             && lhs.image === rhs.image && lhs.icon === rhs.icon
             && lhs.width == rhs.width && lhs.shelfName == rhs.shelfName
             && lhs.currentCategory == rhs.currentCategory && lhs.readIn == rhs.readIn
-            && lhs.closeInHelium == rhs.closeInHelium
+            && lhs.closeInBrowser == rhs.closeInBrowser
+            && lhs.showBrowserBadge == rhs.showBrowserBadge
+            && lhs.fallbackBrowser == rhs.fallbackBrowser
             && lhs.noteCount == rhs.noteCount && lhs.saved == rhs.saved
             && lhs.bookmarked == rhs.bookmarked
             && lhs.shelves == rhs.shelves
@@ -582,11 +621,14 @@ struct TabCard: View, Equatable {
                         .font(Theme.mono(10.5)).foregroundStyle(Theme.ink3).lineLimit(1)
                     if tab.active {
                         Circle().fill(Theme.accent).frame(width: 5, height: 5)
-                            .help("The tab you’re on in this Helium window")
+                            .help("The tab you’re on in this \(tab.browser?.name ?? "browser") window")
+                    }
+                    if showBrowserBadge, let browser = tab.browser {
+                        Text(browser.name).font(Theme.mono(9.5)).foregroundStyle(Theme.ink4)
                     }
                     if !tab.duplicates.isEmpty {
                         Text("×\(tab.copies.count)").font(Theme.mono(10)).foregroundStyle(Theme.ink4)
-                            .help("Open \(tab.copies.count) times in Helium. Done closes every copy.")
+                            .help("Open \(tab.copies.count) times in \(tab.browserLabel). Done closes every copy.")
                     }
                     Spacer(minLength: 6)
                     if bookmarked {
@@ -632,7 +674,7 @@ struct TabCard: View, Equatable {
         .contentShape(Rectangle())
         .onTapGesture { open(.zero) }
         .onHover { inside in withAnimation(.easeOut(duration: 0.16)) { hovered = inside } }
-        .help(tab.readableURL == nil ? "Switch to this tab in Helium" : tab.address)
+        .help(tab.readableURL == nil ? "Switch to this tab in \(tab.browser?.name ?? "browser")" : tab.address)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { open(.zero) }
@@ -687,7 +729,8 @@ struct TabCard: View, Equatable {
                 }
                 Divider()
                 if let url = tab.readableURL {
-                    Button("Open in Helium") { Helium.open(url) }
+                    let target = tab.browser ?? fallbackBrowser
+                    Button("Open in \(target?.name ?? "browser")") { Browsers.open(url, in: target) }
                     Button("Copy link") {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(url.absoluteString, forType: .string)
@@ -772,6 +815,7 @@ private struct BookmarkCard: View {
     let image: NSImage?
     let icon: NSImage?
     let width: CGFloat
+    var fallbackBrowser: Browser? = nil
     var noteCount = 0
     var onReadLater = false
     let open: () -> Void
@@ -906,7 +950,8 @@ private struct BookmarkCard: View {
                 }
                 Divider()
                 if let url = tab.readableURL {
-                    Button("Open in Helium") { Helium.open(url) }
+                    let target = tab.browser ?? fallbackBrowser
+                    Button("Open in \(target?.name ?? "browser")") { Browsers.open(url, in: target) }
                     Button("Copy link") {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(url.absoluteString, forType: .string)
@@ -1319,7 +1364,7 @@ private struct ShelfForm: View {
                         Button("Keep this shelf") { library.keep(category.id) }.buttonStyle(DeskButtonStyle(.outline))
                     }
                 case .readLater:
-                    Text("Pages you save with Read later (the clock on a card or in the reader, or right-click a page). They stay here after their Helium tab closes, until you mark them done.")
+                    Text("Pages you save with Read later (the clock on a card or in the reader, or right-click a page). They stay here after their browser tab closes, until you mark them done.")
                         .font(Theme.sans(13)).foregroundStyle(Theme.ink3).fixedSize(horizontal: false, vertical: true)
                 case .user:
                     field("Inside", hint: "Sub-shelves are checked before the shelf they sit in, so a tab lands on the deepest shelf that matches.") {

@@ -403,7 +403,7 @@ private struct PageChrome: View {
                     ChromeButton(page.state.loading ? "xmark" : "arrow.clockwise", help: page.state.loading ? "Stop" : "Reload") {
                         if page.state.loading { page.view.stopLoading() } else { page.retry() }
                     }
-                    ChromeButton("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
+                    ChromeButton("arrow.up.right", help: "Open in browser") { Browsers.open(url) }
                     Rectangle().fill(Theme.rule).frame(width: 1, height: 14).padding(.horizontal, 3)
                 }
                 ChromeButton(copied ? "checkmark" : "link", help: "Copy link") {
@@ -438,7 +438,7 @@ struct ChatControls: View {
                 if page.state.loading { page.view.stopLoading() } else { page.retry() }
             }
             if let url = page.state.url {
-                DeskIcon("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
+                DeskIcon("arrow.up.right", help: "Open in browser") { Browsers.open(url) }
             }
         }
     }
@@ -499,7 +499,7 @@ private struct FailureView: View {
             HStack(spacing: 10) {
                 Button("Try again") { page.retry() }.buttonStyle(DeskButtonStyle(.primary))
                 if let url = page.state.url {
-                    Button("Open in Helium") { Helium.open(url) }.buttonStyle(DeskButtonStyle(.outline))
+                    Button("Open in browser") { Browsers.open(url) }.buttonStyle(DeskButtonStyle(.outline))
                 }
             }
             .padding(.top, 4)

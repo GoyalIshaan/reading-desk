@@ -34,7 +34,7 @@ hooks/reading-desk ensure-shelf "Read later" --icon bookmark
 hooks/reading-desk ensure-shelf "Post-training" --parent "AI research"
 hooks/reading-desk organize --shelf "AI research" --dry-run  # Claude proposes sub-shelves
 hooks/reading-desk organize --shelf "AI research"            # ...and files the tabs
-hooks/reading-desk refresh                     # re-read tabs from Helium
+hooks/reading-desk refresh                     # re-read open browser tabs
 hooks/reading-desk apply plan.json             # a batch (see below)
 ```
 
@@ -129,7 +129,7 @@ then rename into place, so the app never reads a half-written file. Supported
 | `assignSite`    | `site`, `category`            | always file that site on a shelf         |
 | `auto`          | `url`                         | clear the override, file automatically   |
 | `ensureCategory`| `name`, `icon?`, `parent?`    | create a shelf if it's missing           |
-| `refresh`       | —                             | re-read tabs from Helium                 |
+| `refresh`       | —                             | re-read open browser tabs                |
 
 `category` and `parent` each name one shelf in any of these forms:
 
@@ -166,7 +166,7 @@ Each tab in `tabs` also has `categoryPath`, the readable path of its shelf.
 
 `ensureCategory` makes a shelf marked `madeByAgent` in `state.json`. It goes after the
 user's own shelves, shows a small ✦ in the library index, and is **temporary**: once
-none of its tabs are open any more (they were read, or closed in Helium), the app
+none of its tabs are open any more (they were read, or closed in your browser), the app
 removes it, after a 10-minute grace period so an agent can create a shelf and fill it in
 separate steps. The user can choose **Keep this shelf** in the shelf editor to make it
 permanent. So an agent can sort the *Unsorted* pile into topic shelves freely: the

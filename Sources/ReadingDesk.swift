@@ -407,7 +407,7 @@ struct DeskView: View {
     let previews: Previews
     let renderer: NoteRenderer
     @AppStorage("fullscreenOnOpen") private var fullscreenOnOpen = false
-    @AppStorage("closeInHelium") private var closeInHelium = true
+    @AppStorage("closeInHelium") private var closeInBrowser = true
     @AppStorage("readerFraction") private var readerFraction = 0.62
     @AppStorage("resumeOnLaunch") private var resumeOnLaunch = true
     @State private var resumed = false
@@ -473,7 +473,7 @@ struct DeskView: View {
         ZStack(alignment: .bottom) {
             // The library stays alive underneath so coming back is instant and keeps its scroll position.
             LibraryView(library: library, previews: previews, notes: vault.index, appearance: appearance, selectedCategory: $selectedCategory,
-                        closeInHelium: closeInHelium, titleBarHeight: titleBarHeight, open: open,
+                        closeInBrowser: closeInBrowser, titleBarHeight: titleBarHeight, open: open,
                         onToggleBookmark: toggleBookmark(for:), onRemoveBookmark: removeBookmark(_:))
                 .opacity(reading && revealed ? 0 : 1)
                 .allowsHitTesting(!reading && !paletteOpen)
@@ -485,7 +485,7 @@ struct DeskView: View {
             }
             if paletteOpen {
                 CommandPalette(library: library, previews: previews,
-                               fullscreenOnOpen: fullscreenOnOpen, closeInHelium: closeInHelium,
+                               fullscreenOnOpen: fullscreenOnOpen, closeInBrowser: closeInBrowser,
                                resumeOnLaunch: resumeOnLaunch,
                                appearance: appearance.mode, isDark: appearance.isDark,
                                reading: reading,
@@ -634,13 +634,14 @@ struct DeskView: View {
         case .showBookmarks: showShelf(Library.bookmarksID)
         case .allShelves: showShelf(nil)
         case .refresh: library.refresh()
+        case .cycleBrowserSource: library.browserSource = library.browserSource.next
         case .editShelves: editingShelves = true
         case .organize: organizeShelf()
         case .toggleAppearance: appearance.toggle()
         case .useSystemAppearance:
             appearance.mode = appearance.mode == .system ? (appearance.isDark ? .dark : .light) : .system
         case .toggleFullscreen: fullscreenOnOpen.toggle()
-        case .toggleCloseInHelium: closeInHelium.toggle()
+        case .toggleCloseInBrowser: closeInBrowser.toggle()
         case .toggleResume: resumeOnLaunch.toggle()
         case .continueReading: resume(ReadingMemory.session)
         }
@@ -671,7 +672,7 @@ struct DeskView: View {
             target = nil
         }
         guard let target else {
-            showToast("“\(session.title)” isn’t open in Helium any more")
+            showToast("“\(session.title)” isn’t open in your browser any more")
             if !library.sample && library.lastUpdated != nil { ReadingMemory.session = nil }
             return
         }
@@ -772,8 +773,8 @@ struct DeskView: View {
             showToast("Already on Read later")
             return
         }
-        library.saveForLater(tab, closeInHelium: closeInHelium)
-        showToast(closeInHelium && tab.windowID != SavedSource.windowID ? "Saved to Read later · closed in Helium" : "Saved to Read later")
+        library.saveForLater(tab, closeInBrowser: closeInBrowser)
+        showToast(closeInBrowser && tab.windowID != SavedSource.windowID ? "Saved to Read later · closed in \(tab.browserLabel)" : "Saved to Read later")
     }
 
     private func copyBibTeX() {
@@ -872,7 +873,7 @@ struct DeskView: View {
         guard first.readableURL != nil else {
             if !library.sample {
                 Task {
-                    do { _ = try await Helium.run(["focus", first.windowID, first.id]) }
+                    do { try await Browsers.focus(first) }
                     catch { library.error = error.localizedDescription }
                 }
             }
@@ -950,7 +951,7 @@ struct DeskView: View {
             showToast("Bookmarks stay saved · press ⌘D to remove")
             return
         }
-        library.finish(tab, closeInHelium: closeInHelium)
+        library.finish(tab, closeInBrowser: closeInBrowser)
         if room.remove(tab) {
             showToast("Done · \(room.queue.count) left on this shelf")
         } else {
@@ -1150,9 +1151,14 @@ struct DeskView: View {
         // Fall back to the saved name if the shelf was deleted while reading.
         let shelf = room.isBookmarks ? "Bookmarks"
             : library.category(withID: room.categoryID) == nil ? room.shelfName : library.pathName(of: room.categoryID)
+        let openBrowser = room.current?.browser ?? library.preferredOpenBrowser
+        let closeBrowserLabel = room.current?.browserLabel ?? openBrowser?.name ?? "browser"
         return ReaderDock(page: room.reader, paper: room.paper, url: room.currentURL, shelf: shelf,
                    index: room.index, count: room.queue.count,
-                   closeInHelium: closeInHelium, isPaper: room.isPaper,
+                   closeInBrowser: closeInBrowser,
+                   openBrowserName: openBrowser?.name ?? "browser",
+                   closeBrowserName: closeBrowserLabel,
+                   isPaper: room.isPaper,
                    isBookmarks: room.isBookmarks,
                    saved: room.current.map(library.isSaved) ?? false,
                    bookmarked: library.isBookmarked(room.activePage?.url),
@@ -1162,6 +1168,7 @@ struct DeskView: View {
                    previous: { room.go(to: room.index - 1) },
                    next: { room.go(to: room.index + 1) },
                    done: { finish() },
+                   openInBrowser: { url in Browsers.open(url, in: openBrowser) },
                    copyLink: {
                        room.copyLink()
                        showToast("Link copied")
@@ -1267,7 +1274,9 @@ private struct ReaderDock: View {
     let shelf: String
     let index: Int
     let count: Int
-    let closeInHelium: Bool
+    let closeInBrowser: Bool
+    let openBrowserName: String
+    let closeBrowserName: String
     let isPaper: Bool
     let isBookmarks: Bool
     let saved: Bool
@@ -1280,6 +1289,7 @@ private struct ReaderDock: View {
     let previous: () -> Void
     let next: () -> Void
     let done: () -> Void
+    let openInBrowser: (URL) -> Void
     let copyLink: () -> Void
     let toggleBookmark: () -> Void
     let readLater: () -> Void
@@ -1356,7 +1366,7 @@ private struct ReaderDock: View {
             if full {
                 DeskIcon("link", help: "Copy link (⇧⌘C)", action: copyLink)
                 if let url {
-                    DeskIcon("arrow.up.right", help: "Open in Helium") { Helium.open(url) }
+                    DeskIcon("arrow.up.right", help: "Open in \(openBrowserName)") { openInBrowser(url) }
                 }
             }
             if !isBookmarks {
@@ -1366,7 +1376,7 @@ private struct ReaderDock: View {
                 .buttonStyle(DeskButtonStyle(.primary))
                 .fixedSize()
                 .padding(.leading, 6)
-                .help(closeInHelium ? "Close this tab in Helium and open the next (⇧⌘D)" : "Mark read and open the next (⇧⌘D)")
+                .help(closeInBrowser ? "Close this tab in \(closeBrowserName) and open the next (⇧⌘D)" : "Mark read and open the next (⇧⌘D)")
             }
         }
         .padding(.leading, 5).padding(.trailing, 5).padding(.vertical, 5)
@@ -1682,7 +1692,20 @@ struct ReadingDeskApp: App {
                 Button("Bookmark Current Page") { NotificationCenter.default.post(name: .toggleBookmark, object: nil) }
                     .keyboardShortcut("d", modifiers: .command)
                 Divider()
-                Button("Refresh Helium Tabs") { library.refresh() }.keyboardShortcut("r", modifiers: [.command, .shift])
+                Menu("Browser") {
+                    ForEach(BrowserSource.allCases) { option in
+                        Button {
+                            library.browserSource = option
+                        } label: {
+                            if library.browserSource == option {
+                                Label(option.title, systemImage: "checkmark")
+                            } else {
+                                Text(option.title)
+                            }
+                        }
+                    }
+                }
+                Button("Refresh Browser Tabs") { library.refresh() }.keyboardShortcut("r", modifiers: [.command, .shift])
             }
             // Sent down the responder chain, so they act on whichever note editor has focus.
             CommandMenu("Format") {

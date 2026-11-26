@@ -287,32 +287,121 @@ struct ShelfTree: Equatable {
     }
 }
 
+enum Browser: String, CaseIterable, Codable, Identifiable, Hashable {
+    case helium
+    case chrome
+    case safari
+
+    var id: Self { self }
+
+    var name: String {
+        switch self {
+        case .helium: "Helium"
+        case .chrome: "Chrome"
+        case .safari: "Safari"
+        }
+    }
+
+    var fullName: String {
+        switch self {
+        case .helium: "Helium"
+        case .chrome: "Google Chrome"
+        case .safari: "Safari"
+        }
+    }
+
+    var bundleID: String {
+        switch self {
+        case .helium: "net.imput.helium"
+        case .chrome: "com.google.Chrome"
+        case .safari: "com.apple.Safari"
+        }
+    }
+
+    var isRunning: Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+    }
+
+    var isInstalled: Bool {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil
+    }
+}
+
+enum BrowserSource: String, CaseIterable, Identifiable, Hashable {
+    case all
+    case helium
+    case chrome
+    case safari
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .all: "All browsers"
+        case .helium: "Helium"
+        case .chrome: "Chrome"
+        case .safari: "Safari"
+        }
+    }
+
+    var browsers: [Browser] {
+        switch self {
+        case .all: Browser.allCases
+        case .helium: [.helium]
+        case .chrome: [.chrome]
+        case .safari: [.safari]
+        }
+    }
+
+    var next: BrowserSource {
+        let all = Self.allCases
+        guard let i = all.firstIndex(of: self) else { return .all }
+        return all[(i + 1) % all.count]
+    }
+}
+
 struct BrowserTab: Decodable, Identifiable, Hashable {
-    struct Copy: Hashable { let windowID: String; let id: String }
+    struct Copy: Hashable {
+        let browser: Browser
+        let windowID: String
+        let id: String
+        let address: String
+
+        var key: String { "\(browser.rawValue):\(windowID):\(id)" }
+    }
 
     let id: String
+    let rawID: String
     let windowID: String
+    let browser: Browser?
     let title: String
     let address: String
     var windowOrder = 0
     var tabOrder = 0
     var active = false
-    /// Other Helium tabs showing the same address. Closed together on Done.
+    /// Other browser tabs showing the same address. Closed together on Done.
     var duplicates: [Copy] = []
 
-    private enum CodingKeys: String, CodingKey { case id, windowID, title, address, windowOrder, tabOrder, active }
+    private enum CodingKeys: String, CodingKey { case id, windowID, browser, title, address, windowOrder, tabOrder, active }
 
-    init(id: String, windowID: String, title: String, address: String) {
-        self.id = id
+    init(id: String, windowID: String, title: String, address: String, browser: Browser? = nil) {
+        self.rawID = id
         self.windowID = windowID
+        self.browser = browser
+        self.id = browser.map { "\($0.rawValue):\(windowID):\(id)" } ?? id
         self.title = title
         self.address = address
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(String.self, forKey: .id)
-        windowID = try container.decode(String.self, forKey: .windowID)
+        let decodedID = try container.decode(String.self, forKey: .id)
+        let decodedWindow = try container.decode(String.self, forKey: .windowID)
+        let decodedBrowser = try container.decodeIfPresent(Browser.self, forKey: .browser)
+        rawID = decodedID
+        windowID = decodedWindow
+        browser = decodedBrowser
+        id = decodedBrowser.map { "\($0.rawValue):\(decodedWindow):\(decodedID)" } ?? decodedID
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
         address = try container.decodeIfPresent(String.self, forKey: .address) ?? ""
         windowOrder = try container.decodeIfPresent(Int.self, forKey: .windowOrder) ?? 0
@@ -320,12 +409,29 @@ struct BrowserTab: Decodable, Identifiable, Hashable {
         active = try container.decodeIfPresent(Bool.self, forKey: .active) ?? false
     }
 
-    var copies: [Copy] { [Copy(windowID: windowID, id: id)] + duplicates }
+    var copies: [Copy] {
+        let own = browser.map { [Copy(browser: $0, windowID: windowID, id: rawID, address: address)] } ?? []
+        return own + duplicates
+    }
+
+    var copyKey: String { browser.map { "\($0.rawValue):\(windowID):\(rawID)" } ?? id }
+
+    /// Distinct browser names where this tab is currently open.
+    var browserLabel: String {
+        var names: [String] = []
+        for copy in copies where !names.contains(copy.browser.name) {
+            names.append(copy.browser.name)
+        }
+        return names.isEmpty ? "browser" : names.joined(separator: " & ")
+    }
 
     /// New-tab pages, settings and other browser internals aren't reading material.
     var isInternal: Bool {
         guard let scheme = url?.scheme?.lowercased() else { return address.isEmpty }
-        return ["chrome", "helium", "about", "chrome-extension", "devtools", "view-source", "edge"].contains(scheme)
+        return [
+            "chrome", "helium", "about", "chrome-extension", "devtools", "view-source", "edge",
+            "favorites", "safari-resource", "safari-extension", "safari-web-extension", "topsites", "bookmarks", "history",
+        ].contains(scheme)
     }
 
     var url: URL? { URL(string: address) }
@@ -334,7 +440,7 @@ struct BrowserTab: Decodable, Identifiable, Hashable {
     var sourceName: String {
         if !host.isEmpty { return site }
         if url?.isFileURL == true { return "Local file" }
-        return url?.scheme ?? "Helium"
+        return url?.scheme ?? browser?.name ?? "Web"
     }
 
     var displayTitle: String { title.isEmpty ? (address.isEmpty ? "New tab" : address) : title }
@@ -344,26 +450,22 @@ struct BrowserTab: Decodable, Identifiable, Hashable {
     }
 }
 
-enum Helium {
-    static let bundleID = "net.imput.helium"
-
+enum Browsers {
     struct ImportError: LocalizedError {
         let message: String
         var errorDescription: String? { message }
     }
 
-    static var running: Bool {
-        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
-    }
-
-    static func run(_ arguments: [String] = []) async throws -> Data {
-        guard let script = Bundle.main.url(forResource: "helium", withExtension: "js") else {
-            throw ImportError(message: "The Helium script is missing. Rebuild Reading Desk.")
+    static func run(_ browser: Browser, arguments: [String] = []) async throws -> Data {
+        guard let script = Bundle.main.url(forResource: "browsers", withExtension: "js") else {
+            throw ImportError(message: "The browser script is missing. Rebuild Reading Desk.")
         }
+        let browserArg = browser.rawValue
+        let fullName = browser.fullName
         return try await Task.detached(priority: .userInitiated) {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-l", "JavaScript", script.path] + arguments
+            process.arguments = ["-l", "JavaScript", script.path, browserArg] + arguments
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = pipe
@@ -376,10 +478,10 @@ enum Helium {
             guard process.terminationStatus == 0 else {
                 let details = String(decoding: data, as: UTF8.self)
                 if details.contains("-1743") || details.contains("Apple events") {
-                    throw ImportError(message: "Allow Reading Desk to control Helium in System Settings → Privacy & Security → Automation.")
+                    throw ImportError(message: "Allow Reading Desk to control \(fullName) in System Settings → Privacy & Security → Automation.")
                 }
                 if process.terminationReason == .uncaughtSignal {
-                    throw ImportError(message: "Helium didn’t respond. If macOS is asking for permission, allow it, then refresh.")
+                    throw ImportError(message: "\(fullName) didn’t respond. If macOS is asking for permission, allow it, then refresh.")
                 }
                 throw ImportError(message: details.trimmingCharacters(in: .whitespacesAndNewlines))
             }
@@ -387,8 +489,24 @@ enum Helium {
         }.value
     }
 
-    static func open(_ url: URL) {
-        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+    static func focus(_ tab: BrowserTab) async throws {
+        guard let browser = tab.browser else { return }
+        _ = try await run(browser, arguments: ["focus", tab.windowID, tab.rawID, tab.address])
+    }
+
+    static func close(_ copies: [BrowserTab.Copy]) async throws {
+        let grouped = Dictionary(grouping: copies, by: \.browser)
+        for browser in Browser.allCases {
+            guard let group = grouped[browser], !group.isEmpty else { continue }
+            _ = try await run(browser, arguments: ["close"] + group.flatMap { [$0.windowID, $0.id, $0.address] })
+        }
+    }
+
+    static func open(_ url: URL, in browser: Browser? = nil) {
+        let target = browser
+            ?? Browser.allCases.first(where: \.isRunning)
+            ?? Browser.allCases.first(where: \.isInstalled)
+        guard let target, let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: target.bundleID) else {
             NSWorkspace.shared.open(url)
             return
         }
@@ -411,7 +529,28 @@ final class Library: ObservableObject {
     @Published private(set) var loaded = false
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var rawCount = 0
+    @Published var browserSource: BrowserSource {
+        didSet {
+            defaults.set(browserSource.rawValue, forKey: "browserSource.v1")
+            refreshTask?.cancel()
+            refreshTask = nil
+            refresh()
+        }
+    }
+    /// Browsers that contributed tabs on the latest refresh.
+    @Published private(set) var connectedBrowsers: [Browser] = []
     @Published var sample = ProcessInfo.processInfo.arguments.contains("--sample")
+
+    var activeSourceLabel: String {
+        if !connectedBrowsers.isEmpty { return connectedBrowsers.map(\.name).joined(separator: ", ") }
+        return browserSource == .all ? "Browser" : browserSource.title
+    }
+
+    /// Preferred browser when opening a link that isn't tied to a specific tab (bookmarks, notes, chats).
+    var preferredOpenBrowser: Browser? {
+        if browserSource != .all { return browserSource.browsers.first }
+        return connectedBrowsers.first ?? Browser.allCases.first(where: \.isRunning)
+    }
     /// Pages saved to Read later, newest first. They outlive their Helium tabs.
     @Published private(set) var later: [SavedSource] { didSet { laterAddresses = Set(later.map(\.address)); filingCache = nil } }
     /// Cached: `category(for:)` checks it for every tab on every render.
@@ -479,6 +618,7 @@ final class Library: ObservableObject {
 
         let today = Self.dayStamp()
         finishedToday = store.string(forKey: "finished.day") == today ? store.integer(forKey: "finished.count") : 0
+        browserSource = store.string(forKey: "browserSource.v1").flatMap(BrowserSource.init(rawValue:)) ?? .all
 
         // Older builds could point a rule at Read later, which then showed pages there that weren't saved.
         let ruleless = Set(sanitized.filter { !$0.acceptsRules }.map(\.id))
@@ -491,43 +631,89 @@ final class Library: ObservableObject {
     func refresh() {
         guard refreshTask == nil else { return }
         if sample {
-            tabs = withSaved(Self.sampleTabs.filter { !finished.contains($0.id) })
+            tabs = withSaved(Self.sampleTabs.filter { !finished.contains($0.copyKey) })
             loaded = true
             return
         }
         updating = true
         error = nil
+        let source = browserSource
         refreshTask = Task {
             defer {
                 updating = false
                 loaded = true
                 refreshTask = nil
             }
-            guard Helium.running else {
-                // Saved Read later pages outlive Helium, so keep them visible even when Helium is closed.
+            let targets = source.browsers.filter(\.isRunning)
+            guard !targets.isEmpty else {
+                // Saved Read later pages outlive browser tabs, so keep them visible even when closed.
+                connectedBrowsers = []
                 tabs = withSaved([])
-                error = "Open Helium to import its tabs."
+                error = source == .all
+                    ? "Open Helium, Chrome, or Safari to import open tabs."
+                    : "Open \(source.title) to import its tabs."
                 return
             }
-            do {
-                let imported = try JSONDecoder().decode([BrowserTab].self, from: try await Helium.run())
+
+            var results: [Browser: [BrowserTab]] = [:]
+            var failures: [String] = []
+
+            await withTaskGroup(of: (Browser, Result<[BrowserTab], Error>).self) { group in
+                for browser in targets {
+                    group.addTask {
+                        do {
+                            let data = try await Browsers.run(browser)
+                            let decoded = try JSONDecoder().decode([BrowserTab].self, from: data)
+                            return (browser, .success(decoded))
+                        } catch {
+                            return (browser, .failure(error))
+                        }
+                    }
+                }
+                for await (browser, result) in group {
+                    switch result {
+                    case .success(let list): results[browser] = list
+                    case .failure(let err): failures.append(err.localizedDescription)
+                    }
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+
+            let succeeded = Browser.allCases.filter { results[$0] != nil }
+            if !succeeded.isEmpty {
+                let imported = succeeded.flatMap { results[$0] ?? [] }
+                connectedBrowsers = succeeded
                 rawCount = imported.count
-                tabs = withSaved(Self.merge(imported.filter { !finished.contains($0.id) }))
+                tabs = withSaved(Self.merge(imported.filter { !finished.contains($0.copyKey) }))
                 lastUpdated = .now
                 pruneAgentShelves()
-            } catch {
-                self.error = error.localizedDescription
+                if !failures.isEmpty {
+                    self.error = failures.joined(separator: " ")
+                }
+            } else {
+                connectedBrowsers = []
+                if tabs.isEmpty { tabs = withSaved([]) }
+                self.error = failures.joined(separator: " ")
             }
         }
     }
 
-    /// One card per address, in Helium's order (front window first, left to right).
+    /// One card per address, ordered by browser then front window first, left to right.
     static func merge(_ imported: [BrowserTab]) -> [BrowserTab] {
         var order: [String] = []
         var byAddress: [String: BrowserTab] = [:]
-        for tab in imported.sorted(by: { ($0.windowOrder, $0.tabOrder) < ($1.windowOrder, $1.tabOrder) }) where !tab.isInternal {
+        let browserRank: (Browser?) -> Int = { browser in
+            browser.flatMap { Browser.allCases.firstIndex(of: $0) } ?? Browser.allCases.count
+        }
+        let sorted = imported.sorted {
+            (browserRank($0.browser), $0.windowOrder, $0.tabOrder) < (browserRank($1.browser), $1.windowOrder, $1.tabOrder)
+        }
+        for tab in sorted where !tab.isInternal {
             if var existing = byAddress[tab.address] {
-                existing.duplicates.append(BrowserTab.Copy(windowID: tab.windowID, id: tab.id))
+                if let browser = tab.browser {
+                    existing.duplicates.append(BrowserTab.Copy(browser: browser, windowID: tab.windowID, id: tab.rawID, address: tab.address))
+                }
                 byAddress[tab.address] = existing
             } else {
                 byAddress[tab.address] = tab
@@ -537,7 +723,7 @@ final class Library: ObservableObject {
         return order.compactMap { byAddress[$0] }
     }
 
-    /// Saved pages whose Helium tab is gone still get a card, after the open tabs.
+    /// Saved pages whose browser tab is gone still get a card, after the open tabs.
     private func withSaved(_ open: [BrowserTab]) -> [BrowserTab] {
         let present = Set(open.map(\.address))
         return open + later.filter { !present.contains($0.address) }.map(\.tab)
@@ -545,23 +731,24 @@ final class Library: ObservableObject {
 
     func isSaved(_ tab: BrowserTab) -> Bool { laterAddresses.contains(tab.address) }
 
-    /// Puts a page on the Read later shelf and, optionally, closes its Helium tab.
-    func saveForLater(_ tab: BrowserTab, closeInHelium: Bool) {
+    /// Puts a page on the Read later shelf and, optionally, closes its browser tab(s).
+    func saveForLater(_ tab: BrowserTab, closeInBrowser: Bool) {
         guard tab.readableURL != nil else { return }
         if !isSaved(tab) {
             later.insert(SavedSource(address: tab.address, title: tab.displayTitle, saved: .now), at: 0)
             saveLater()
         }
-        let copies = tab.copies.filter { $0.windowID != SavedSource.windowID && !closed.contains($0.id) }
-        guard closeInHelium, !sample, !copies.isEmpty else { return }
-        copies.forEach { finished.insert($0.id); closed.insert($0.id) }
+        let copies = tab.copies.filter { $0.windowID != SavedSource.windowID && !closed.contains($0.key) }
+        guard closeInBrowser, !sample, !copies.isEmpty else { return }
+        copies.forEach { finished.insert($0.key); closed.insert($0.key) }
         if let index = tabs.firstIndex(where: { $0.address == tab.address }),
            let saved = later.first(where: { $0.address == tab.address }) {
             tabs[index] = saved.tab
         }
+        let label = tab.browserLabel
         Task {
-            do { _ = try await Helium.run(["close"] + copies.flatMap { [$0.windowID, $0.id] }) }
-            catch { self.error = "Couldn’t close the tab in Helium: \(error.localizedDescription)" }
+            do { try await Browsers.close(copies) }
+            catch { self.error = "Couldn’t close the tab in \(label): \(error.localizedDescription)" }
         }
     }
 
@@ -654,9 +841,10 @@ final class Library: ObservableObject {
         if let data = try? JSONEncoder().encode(bookmarks) { defaults.set(data, forKey: "bookmarks.v1") }
     }
 
-    /// Marks a tab as read: hides it here and, optionally, closes it in Helium.
-    func finish(_ tab: BrowserTab, closeInHelium: Bool) {
-        tab.copies.forEach { finished.insert($0.id) }
+    /// Marks a tab as read: hides it here and, optionally, closes it in the browser.
+    func finish(_ tab: BrowserTab, closeInBrowser: Bool) {
+        tab.copies.forEach { finished.insert($0.key) }
+        finished.insert(tab.copyKey)
         tabs.removeAll { $0.id == tab.id || $0.address == tab.address }
         if isSaved(tab) {
             later.removeAll { $0.address == tab.address }
@@ -666,12 +854,13 @@ final class Library: ObservableObject {
         finishedToday = (defaults.string(forKey: "finished.day") == today ? finishedToday : 0) + 1
         defaults.set(today, forKey: "finished.day")
         defaults.set(finishedToday, forKey: "finished.count")
-        let copies = tab.copies.filter { $0.windowID != SavedSource.windowID && !closed.contains($0.id) }
-        guard closeInHelium, !sample, !copies.isEmpty else { return }
-        copies.forEach { closed.insert($0.id) }
+        let copies = tab.copies.filter { $0.windowID != SavedSource.windowID && !closed.contains($0.key) }
+        guard closeInBrowser, !sample, !copies.isEmpty else { return }
+        copies.forEach { closed.insert($0.key) }
+        let label = tab.browserLabel
         Task {
-            do { _ = try await Helium.run(["close"] + copies.flatMap { [$0.windowID, $0.id] }) }
-            catch { self.error = "Couldn’t close the tab in Helium: \(error.localizedDescription)" }
+            do { try await Browsers.close(copies) }
+            catch { self.error = "Couldn’t close the tab in \(label): \(error.localizedDescription)" }
         }
     }
 
@@ -711,7 +900,7 @@ final class Library: ObservableObject {
     func assign(address: String, to id: String?) -> Bool {
         if let id, category(withID: id)?.acceptsRules == false {
             guard id == Category.laterID, let tab = tabs.first(where: { $0.address == address }) else { return false }
-            saveForLater(tab, closeInHelium: false)
+            saveForLater(tab, closeInBrowser: false)
             return true
         }
         assignments[address] = id
@@ -841,8 +1030,8 @@ final class Library: ObservableObject {
     }
 
     func assign(_ tab: BrowserTab, to id: String?) {
-        if id == Category.laterID { return saveForLater(tab, closeInHelium: false) }
-        // A saved page with no Helium tab only exists on Read later, so it stays there.
+        if id == Category.laterID { return saveForLater(tab, closeInBrowser: false) }
+        // A saved page with no open browser tab only exists on Read later, so it stays there.
         guard tab.windowID != SavedSource.windowID else { return }
         if isSaved(tab) {
             later.removeAll { $0.address == tab.address }

@@ -13,7 +13,7 @@ struct CommandPalette: View {
     @ObservedObject var library: Library
     @ObservedObject var previews: Previews
     let fullscreenOnOpen: Bool
-    let closeInHelium: Bool
+    let closeInBrowser: Bool
     var resumeOnLaunch = true
     var appearance: AppAppearance = .system
     var isDark = true
@@ -44,7 +44,7 @@ struct CommandPalette: View {
     }
 
     enum Command: String, CaseIterable {
-        case toggleBookmark, showBookmarks, continueReading, allShelves, refresh, editShelves, organize, toggleAppearance, useSystemAppearance, toggleFullscreen, toggleCloseInHelium, toggleResume
+        case toggleBookmark, showBookmarks, continueReading, allShelves, refresh, cycleBrowserSource, editShelves, organize, toggleAppearance, useSystemAppearance, toggleFullscreen, toggleCloseInBrowser, toggleResume
 
         func label(currentBookmarked: Bool, isDark: Bool) -> (title: String, symbol: String, keywords: String) {
             switch self {
@@ -54,7 +54,8 @@ struct CommandPalette: View {
                  "bookmark save favorite star keep")
             case .showBookmarks: ("Show Bookmarks", "bookmark.fill", "bookmarks saved favorites kept")
             case .allShelves: ("Show all shelves", "square.grid.2x2", "everything back library")
-            case .refresh: ("Refresh Helium tabs", "arrow.clockwise", "reload import update")
+            case .refresh: ("Refresh browser tabs", "arrow.clockwise", "reload import update helium chrome safari")
+            case .cycleBrowserSource: ("Import tabs from", "globe", "browser source helium chrome safari all switch")
             case .editShelves: ("Edit shelves and filing rules", "books.vertical", "manage categories autofiling")
             case .organize: ("Sort this shelf with Claude", "wand.and.stars",
                              "agent ai organize file categorize subshelves nested auto triage")
@@ -66,7 +67,7 @@ struct CommandPalette: View {
                 ("Match system appearance", "circle.lefthalf.filled",
                  "appearance theme color scheme system automatic light dark mode")
             case .toggleFullscreen: ("Enter full screen when reading", "arrow.up.left.and.arrow.down.right", "fullscreen settings reading options")
-            case .toggleCloseInHelium: ("Close Helium tabs when marked done", "xmark.circle", "keep tabs open settings reading options")
+            case .toggleCloseInBrowser: ("Close browser tabs when marked done", "xmark.circle", "keep tabs open settings reading options helium chrome safari")
             case .continueReading: ("Continue where I left off", "book", "resume last session reopen")
             case .toggleResume: ("Reopen where I left off on launch", "clock.arrow.circlepath", "resume continue session settings reading options")
             }
@@ -183,10 +184,11 @@ struct CommandPalette: View {
             let detail: String? = switch command {
             case .toggleBookmark: "⌘D"
             case .showBookmarks: library.bookmarks.isEmpty ? "⌥⌘B" : "\(library.bookmarks.count) · ⌥⌘B"
+            case .cycleBrowserSource: library.browserSource.title
             case .toggleAppearance: "⇧⌘T"
             case .useSystemAppearance: appearance == .system ? "On" : "Off"
             case .toggleFullscreen: fullscreenOnOpen ? "On" : "Off"
-            case .toggleCloseInHelium: closeInHelium ? "On" : "Off"
+            case .toggleCloseInBrowser: closeInBrowser ? "On" : "Off"
             case .toggleResume: resumeOnLaunch ? "On" : "Off"
             case .continueReading: ReadingMemory.session?.title
             default: nil
@@ -303,7 +305,7 @@ struct CommandPalette: View {
             case 35 where control: move(-1); return nil         // ⌃P
             case 121: move(8); return nil                       // page down
             case 116: move(-8); return nil                      // page up
-            case 36, 76: activate(inHelium: event.modifierFlags.contains(.command)); return nil // ↩
+            case 36, 76: activate(inBrowser: event.modifierFlags.contains(.command)); return nil // ↩
             case 53: close(); return nil                        // esc
             default: return event
             }
@@ -357,10 +359,10 @@ struct CommandPalette: View {
                                     mouseLocation = location
                                     selection = offset
                                 }
-                                .onTapGesture { selection = offset; activate(inHelium: false) }
+                                .onTapGesture { selection = offset; activate(inBrowser: false) }
                                 .accessibilityElement(children: .combine)
                                 .accessibilityAddTraits(.isButton)
-                                .accessibilityAction { selection = offset; activate(inHelium: false) }
+                                .accessibilityAction { selection = offset; activate(inBrowser: false) }
                         }
                     }
                     .padding(.horizontal, 6)
@@ -401,7 +403,7 @@ struct CommandPalette: View {
                 case .shelves: hint("↩", "Open shelf")
                 case .bookmarks, .tabs:
                     hint("↩", "Read")
-                    hint("⌘↩", "Open in Helium")
+                    hint("⌘↩", "Open in browser")
                 }
             }
             Spacer()
@@ -442,7 +444,7 @@ struct CommandPalette: View {
         scrollTarget = selection
     }
 
-    private func activate(inHelium: Bool) {
+    private func activate(inBrowser: Bool) {
         guard results.indices.contains(selection) else { return }
         switch results[selection].kind {
         case .command(let command, _, _):
@@ -452,9 +454,17 @@ struct CommandPalette: View {
         case .shelf(let id, _, _, _):
             openShelf(id)
         case .bookmark(let bookmark):
-            if inHelium, let url = bookmark.tab.readableURL { Helium.open(url) } else { openBookmark(bookmark) }
+            if inBrowser, let url = bookmark.tab.readableURL {
+                Browsers.open(url, in: library.preferredOpenBrowser)
+            } else {
+                openBookmark(bookmark)
+            }
         case .tab(let tab, _, _):
-            if inHelium, let url = tab.readableURL { Helium.open(url) } else { openTab(tab) }
+            if inBrowser, let url = tab.readableURL {
+                Browsers.open(url, in: tab.browser ?? library.preferredOpenBrowser)
+            } else {
+                openTab(tab)
+            }
         }
         close()
     }
@@ -525,7 +535,7 @@ private struct PaletteRow: View, Equatable {
                         .help("Bookmarked")
                 }
                 if tab.active {
-                    Circle().fill(Theme.accent).frame(width: 5, height: 5).help("Active in Helium")
+                    Circle().fill(Theme.accent).frame(width: 5, height: 5).help("Active in \(tab.browser?.name ?? "browser")")
                 }
                 Text(shelf).font(Theme.sans(11.5)).foregroundStyle(Theme.ink4).lineLimit(1).fixedSize()
             }

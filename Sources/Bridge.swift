@@ -95,6 +95,7 @@ final class DeskBridge {
             let bySite = library.siteRules[tab.site] != nil
             return [
                 "id": tab.id, "title": tab.displayTitle, "url": tab.address, "site": tab.site,
+                "browser": tab.browser?.rawValue ?? "saved",
                 "category": category.id, "categoryName": category.name,
                 "categoryPath": library.pathName(of: category.id),
                 "assignedBy": library.isSaved(tab) ? "later" : manual ? "tab" : bySite ? "site" : "auto",
@@ -110,10 +111,18 @@ final class DeskBridge {
             if let note = bookmark.note { entry["note"] = note }
             return entry
         }
+        let sourceValue: String = if library.sample {
+            "sample"
+        } else if !library.connectedBrowsers.isEmpty {
+            library.connectedBrowsers.map(\.rawValue).joined(separator: ",")
+        } else {
+            library.browserSource.rawValue
+        }
         let state: [String: Any] = [
             "updated": Self.iso.string(from: .now),
             "appRunning": true,
-            "source": library.sample ? "sample" : "helium",
+            "source": sourceValue,
+            "browsers": library.connectedBrowsers.map(\.rawValue),
             "tabCount": library.tabs.count,
             "commandsDir": commandsDir.path,
             "categories": categories,

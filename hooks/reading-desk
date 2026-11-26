@@ -19,7 +19,7 @@ Examples:
   reading-desk auto https://example.com  # back to automatic filing
   reading-desk organize --shelf "AI research" --dry-run   # Claude proposes sub-shelves
   reading-desk organize --shelf "AI research"             # ...and files the tabs
-  reading-desk refresh                   # re-read Helium
+  reading-desk refresh                   # re-read open browser tabs
   reading-desk apply plan.json           # a JSON array of commands at once
   echo '[{"op":"assign","url":"...","category":"ai"}]' | reading-desk apply -
 """
@@ -156,7 +156,7 @@ def cmd_tabs(a):
         print(f"{mark}{pin} {where(t):<{width}}  {t['title'][:70]}")
         print(f"     {' ':<{width}}  {t['url']}")
     print(f"\n{len(tabs)} tab(s). Source: {s.get('source')} · updated {s.get('updated')}")
-    print("Legend: * active in Helium · ·=filed by tab · #=filed by site · +=saved to Read later")
+    print("Legend: * active in browser · ·=filed by tab · #=filed by site · +=saved to Read later")
 
 
 def cmd_shelves(a):
@@ -556,7 +556,7 @@ def main():
     org.add_argument("--model", help="Claude model alias, e.g. sonnet or opus (default: Claude Code's)")
     org.set_defaults(func=cmd_organize)
 
-    rf = sub.add_parser("refresh", help="re-read tabs from Helium")
+    rf = sub.add_parser("refresh", help="re-read open browser tabs")
     rf.set_defaults(func=cmd_refresh)
 
     ap = sub.add_parser("apply", help="queue a JSON array of commands (file or - for stdin)")

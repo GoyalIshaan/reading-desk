@@ -194,7 +194,7 @@ final class NoteRenderer: NSObject, ObservableObject, WKScriptMessageHandler, WK
             if url.scheme == "desk", url.host == "vault", let root = vault?.root {
                 NSWorkspace.shared.open(root.appendingPathComponent(url.path.removingPercentEncoding ?? url.path))
             } else if ["http", "https"].contains(url.scheme) {
-                Helium.open(url)
+                Browsers.open(url)
             } else if url.scheme == "obsidian" || url.scheme == "mailto" {
                 NSWorkspace.shared.open(url)
             }
